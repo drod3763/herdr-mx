@@ -14,7 +14,7 @@ on:
       - "nix/**"
       - "vendor/**"
   push:
-    branches: [mx]
+    branches: [master, mx]
     paths:
       - ".github/workflows/nix.yml"
       - "assets/**"

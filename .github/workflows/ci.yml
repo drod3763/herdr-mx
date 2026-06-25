@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [mx, windows]
+    branches: [master, mx, windows]
     paths-ignore:
       - "website/**"
       - ".github/APPROVED_CONTRIBUTORS"
@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   conventional-commits:
-    if: github.event_name != 'push' || github.ref_name == 'mx'
+    if: github.event_name != 'push' || github.ref_name == 'master' || github.ref_name == 'mx'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
