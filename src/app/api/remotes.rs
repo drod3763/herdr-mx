@@ -154,7 +154,6 @@ mod tests {
             &app.terminal_runtimes,
             app.state.active,
             app.state.selected,
-            app.state.agent_panel_scope,
             app.state.sidebar_width,
             app.state.sidebar_section_split,
             app.state.collapsed_space_keys.clone(),

@@ -391,7 +391,9 @@ pub(crate) fn events_require_host_surface_redraw(
             .any(|event| matches!(event, RawInputEvent::OuterFocusGained))
 }
 
+// Call site dropped by the v0.7.1 merge; retained pending rewiring (see drod3763/herdr-mx#1).
 #[cfg(any(not(windows), test))]
+#[allow(dead_code)]
 pub(crate) fn events_require_host_terminal_theme_query(events: &[RawInputEvent]) -> bool {
     events
         .iter()

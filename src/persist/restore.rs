@@ -1339,6 +1339,8 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            remote_registry: Default::default(),
+            pane_id_aliases: Default::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1444,6 +1446,8 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            remote_registry: Default::default(),
+            pane_id_aliases: Default::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 

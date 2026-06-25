@@ -596,7 +596,9 @@ mod tests {
 
     use super::super::{app_for_mouse_test, capture_snapshot, mouse, unique_temp_path};
     use crate::{
-        app::state::{AgentPanelScope, AgentPanelSort, AppState, DragTarget, Mode, SidebarAgentItem},
+        app::state::{
+            AgentPanelScope, AgentPanelSort, AppState, DragTarget, Mode, SidebarAgentItem,
+        },
         detect::Agent,
         workspace::Workspace,
     };

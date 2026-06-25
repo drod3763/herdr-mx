@@ -181,6 +181,8 @@ impl App {
         false
     }
 
+    // Call site dropped by the v0.7.1 merge; retained pending rewiring (see drod3763/herdr-mx#1).
+    #[allow(dead_code)]
     pub(super) fn save_agent_panel_scope(&mut self, scope: crate::app::state::AgentPanelScope) {
         let value = match scope {
             crate::app::state::AgentPanelScope::CurrentWorkspace => {

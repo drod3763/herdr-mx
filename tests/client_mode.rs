@@ -3,7 +3,7 @@
 mod support;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -16,7 +16,7 @@ use serde_json::Value;
 use support::{
     cleanup_test_base, client_handshake, encode_varint_u16, encode_varint_u32, frame_message,
     read_server_message, register_runtime_dir, register_spawned_herdr_pid,
-    unregister_spawned_herdr_pid, wait_for_message_variant, wait_for_socket, wait_until,
+    unregister_spawned_herdr_pid, wait_for_socket, wait_until,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -76,6 +76,8 @@ fn test_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+// Used only by tests dropped in the v0.7.1 merge; retained pending rewiring (see drod3763/herdr-mx#1).
+#[allow(dead_code)]
 fn spawn_client_process(
     config_home: &PathBuf,
     runtime_dir: &PathBuf,

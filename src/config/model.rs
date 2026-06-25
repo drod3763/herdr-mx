@@ -114,6 +114,8 @@ pub enum AgentPanelScopeConfig {
 }
 
 impl AgentPanelScopeConfig {
+    // Only caller (save_agent_panel_scope) was orphaned by the v0.7.1 merge; see drod3763/herdr-mx#1.
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Current => "current",

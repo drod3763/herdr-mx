@@ -4,6 +4,7 @@ pub mod agents;
 pub mod common;
 pub mod events;
 pub mod integrations;
+pub mod mx;
 pub mod panes;
 pub mod plugins;
 pub mod response;
@@ -11,12 +12,12 @@ pub mod server;
 pub mod tabs;
 pub mod workspaces;
 pub mod worktrees;
-pub mod mx;
 
 pub use agents::*;
 pub use common::*;
 pub use events::*;
 pub use integrations::*;
+pub use mx::*;
 pub use panes::*;
 pub use plugins::*;
 pub use response::*;
@@ -24,7 +25,6 @@ pub use server::*;
 pub use tabs::*;
 pub use workspaces::*;
 pub use worktrees::*;
-pub use mx::*;
 
 fn is_false(value: &bool) -> bool {
     !*value

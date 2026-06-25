@@ -76,6 +76,9 @@ const ADD_REMOTE_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 // Client state
 // ---------------------------------------------------------------------------
 
+// Constructed only by code paths dropped in the v0.7.1 merge; retained pending rewiring
+// (see drod3763/herdr-mx#1).
+#[allow(dead_code)]
 struct ClientLoopConfig {
     sound_config: crate::config::SoundConfig,
     mouse_scroll_lines: usize,
@@ -110,7 +113,9 @@ struct ClientState {
     #[cfg(unix)]
     mouse_scroll_lines: usize,
     /// Local-client shortcut that sends a clipboard image to a remote Herdr session.
+    /// Reader was dropped in the v0.7.1 merge; retained pending rewiring (see drod3763/herdr-mx#1).
     #[cfg(unix)]
+    #[allow(dead_code)]
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     /// Whether outer focus gain should force a full host-terminal redraw.
     redraw_on_focus_gained: bool,
@@ -6991,6 +6996,7 @@ mod tests {
 
     fn test_client_state_with_model(model: supervisor::ClientSupervisorModel) -> ClientState {
         ClientState {
+            remote_image_paste_key: None,
             blit_encoder: render_ansi::BlitEncoder::new(),
             frame_stats: ClientFrameStats::default(),
             mouse_capture_active: false,
@@ -9739,6 +9745,7 @@ mod tests {
                     method: crate::api::schema::Method::WorkspaceCreate(
                         crate::api::schema::WorkspaceCreateParams {
                             cwd: None,
+                            env: Default::default(),
                             focus: true,
                             label: None,
                         },
@@ -9805,6 +9812,7 @@ mod tests {
                     method: crate::api::schema::Method::WorkspaceCreate(
                         crate::api::schema::WorkspaceCreateParams {
                             cwd: None,
+                            env: Default::default(),
                             focus: true,
                             label: None,
                         },
@@ -9841,6 +9849,7 @@ mod tests {
                     method: crate::api::schema::Method::WorkspaceCreate(
                         crate::api::schema::WorkspaceCreateParams {
                             cwd: None,
+                            env: Default::default(),
                             focus: true,
                             label: None,
                         },
