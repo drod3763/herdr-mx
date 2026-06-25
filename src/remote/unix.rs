@@ -1989,14 +1989,21 @@ fn verify_optional_sha256(path: &Path, asset: &RemoteAsset) -> io::Result<()> {
 }
 
 fn private_download_dir(asset_key: &str) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
     let base = std::env::temp_dir();
+    // Owner-only (0700) regardless of the process umask: the download lands in a shared temp dir,
+    // and the verified binary is reopened by path before being streamed to the remote. A
+    // world/group-writable dir would let a local user swap the file between verification and use
+    // (TOCTOU). 0700 keeps everyone else out of the directory entirely.
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
     for attempt in 0..100 {
         let dir = base.join(format!(
             "herdr-remote-{}-{}-{attempt}",
             std::process::id(),
             asset_key
         ));
-        match fs::create_dir(&dir) {
+        match builder.create(&dir) {
             Ok(()) => return Ok(dir),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
