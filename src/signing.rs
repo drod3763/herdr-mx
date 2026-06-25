@@ -24,7 +24,7 @@ use minisign_verify::{PublicKey, Signature};
 /// here, ship a release, then drop the old key a release later.
 const ACCEPTED_PUBKEYS: &[&str] = &[
     // herdr-mx release signing key 31670D1E13849B12
-    "RWQSm4QTHg1nMVxO9FHLHJ3jDPeZm/QFsdz3UB2DvBblvMx6H9OxqalN",
+    "RWQupm2xx/vDQ2YjRHgy/84xAkdgzIgwIN/4CyOy5n1rQRQnHW34r3D2",
 ];
 
 /// Verify a detached minisign signature over the contents of `file`.
