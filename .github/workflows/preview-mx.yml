@@ -173,7 +173,7 @@ jobs:
       - name: Sign fat bundles
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-          MINISIGN_PUBKEY: RWQSm4QTHg1nMVxO9FHLHJ3jDPeZm/QFsdz3UB2DvBblvMx6H9OxqalN
+          MINISIGN_PUBKEY: RWQupm2xx/vDQ2YjRHgy/84xAkdgzIgwIN/4CyOy5n1rQRQnHW34r3D2
         run: |
           set -euo pipefail
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
