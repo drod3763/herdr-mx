@@ -167,6 +167,28 @@ jobs:
             "$PACKER" bundle list "fat/$name"
           done
 
+      # Sign preview assets with the same release key so `herdr update` on the preview channel
+      # verifies authenticity before running a downloaded binary. Fails closed if the secret is
+      # missing so an unsigned preview never ships.
+      - name: Sign fat bundles
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PUBKEY: RWQSm4QTHg1nMVxO9FHLHJ3jDPeZm/QFsdz3UB2DvBblvMx6H9OxqalN
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set; refusing to publish an unsigned preview" >&2
+            exit 1
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          trap 'rm -f minisign.key' EXIT
+          for name in herdr-linux-x86_64 herdr-linux-aarch64 herdr-macos-x86_64 herdr-macos-aarch64; do
+            minisign -S -s minisign.key -m "fat/$name"
+            minisign -Vm "fat/$name" -P "$MINISIGN_PUBKEY"
+          done
+
       - name: Generate preview notes
         shell: bash
         run: |
@@ -202,6 +224,10 @@ jobs:
             fat/herdr-linux-aarch64
             fat/herdr-macos-x86_64
             fat/herdr-macos-aarch64
+            fat/herdr-linux-x86_64.minisig
+            fat/herdr-linux-aarch64.minisig
+            fat/herdr-macos-x86_64.minisig
+            fat/herdr-macos-aarch64.minisig
 
       - name: Prune old mx previews (keep 3)
         env:

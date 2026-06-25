@@ -214,6 +214,31 @@ jobs:
             "$PACKER" bundle list "fat/$name"
           done
 
+      # herdr-mx: sign every published asset with the release minisign key so `herdr update` and
+      # remote auto-seed verify authenticity (the embedded public key is in src/signing.rs) before
+      # running a downloaded binary. The signature also covers integrity. Fails the release if the
+      # signing secret is missing, so an unsigned release can never ship.
+      - name: Sign fat bundles
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          # Must match ACCEPTED_PUBKEYS in src/signing.rs (self-check below catches drift).
+          MINISIGN_PUBKEY: RWQSm4QTHg1nMVxO9FHLHJ3jDPeZm/QFsdz3UB2DvBblvMx6H9OxqalN
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set; refusing to publish an unsigned release" >&2
+            exit 1
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          trap 'rm -f minisign.key' EXIT
+          for name in herdr-linux-x86_64 herdr-linux-aarch64 herdr-macos-x86_64 herdr-macos-aarch64; do
+            minisign -S -s minisign.key -m "fat/$name"
+            # Fail fast if the signature does not verify under the public key the binary embeds.
+            minisign -Vm "fat/$name" -P "$MINISIGN_PUBKEY"
+          done
+
       - name: Extract release notes from changelog
         run: python3 scripts/changelog.py extract --version "${GITHUB_REF_NAME#v}" --output RELEASE_NOTES.md
 
@@ -225,6 +250,10 @@ jobs:
             fat/herdr-linux-aarch64
             fat/herdr-macos-x86_64
             fat/herdr-macos-aarch64
+            fat/herdr-linux-x86_64.minisig
+            fat/herdr-linux-aarch64.minisig
+            fat/herdr-macos-x86_64.minisig
+            fat/herdr-macos-aarch64.minisig
           body_path: RELEASE_NOTES.md
 
   close-released-issues:

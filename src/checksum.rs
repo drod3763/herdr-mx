@@ -25,6 +25,13 @@ pub(crate) fn verify_sha256(path: &Path, expected: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Lowercase-hex SHA-256 of in-memory bytes (e.g. a decompressed bundle payload).
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    to_lower_hex(&hasher.finalize())
+}
+
 fn file_sha256(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();

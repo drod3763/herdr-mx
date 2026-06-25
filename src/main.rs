@@ -90,6 +90,7 @@ mod render_prof;
 mod selection;
 mod server;
 mod session;
+mod signing;
 mod sound;
 mod terminal;
 mod terminal_notify;

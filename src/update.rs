@@ -135,6 +135,17 @@ impl UpdateChannel {
 struct AssetRef {
     url: String,
     sha256: Option<String>,
+    sig: Option<String>,
+}
+
+impl AssetRef {
+    /// URL of the detached minisign signature. Manifests may carry an explicit `sig`; otherwise
+    /// it is the conventional `<asset>.minisig` sidecar CI publishes next to the binary.
+    fn sig_url(&self) -> String {
+        self.sig
+            .clone()
+            .unwrap_or_else(|| format!("{}.minisig", self.url))
+    }
 }
 
 impl<'de> Deserialize<'de> for AssetRef {
@@ -147,6 +158,7 @@ impl<'de> Deserialize<'de> for AssetRef {
             serde_json::Value::String(url) if !url.trim().is_empty() => Ok(Self {
                 url: url.trim().to_string(),
                 sha256: None,
+                sig: None,
             }),
             serde_json::Value::Object(mut object) => {
                 let url = object
@@ -156,12 +168,16 @@ impl<'de> Deserialize<'de> for AssetRef {
                 let sha256 = object
                     .remove("sha256")
                     .and_then(|value| value.as_str().map(str::to_string));
+                let sig = object
+                    .remove("sig")
+                    .and_then(|value| value.as_str().map(str::to_string));
                 if url.trim().is_empty() {
                     return Err(serde::de::Error::custom("asset url must not be empty"));
                 }
                 Ok(Self {
                     url: url.trim().to_string(),
                     sha256: sha256.filter(|value| !value.trim().is_empty()),
+                    sig: sig.filter(|value| !value.trim().is_empty()),
                 })
             }
             _ => Err(serde::de::Error::custom(
@@ -283,6 +299,7 @@ struct ReleaseInfo {
     target_protocol: Option<u32>,
     download_url: String,
     sha256: Option<String>,
+    sig_url: String,
     notes_body: String,
 }
 
@@ -383,6 +400,7 @@ fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<Releas
         target_protocol: manifest.protocol,
         download_url,
         sha256: asset.sha256.clone(),
+        sig_url: asset.sig_url(),
         notes_body,
     }))
 }
@@ -468,6 +486,7 @@ fn release_info_from_preview_manifest(
         target_protocol: Some(manifest.protocol),
         download_url,
         sha256: asset.sha256.clone(),
+        sig_url: asset.sig_url(),
         notes_body,
     }))
 }
@@ -593,6 +612,19 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         return Err("download failed".into());
     }
 
+    // Authenticity AND integrity: the detached minisign signature is mandatory. A valid ed25519
+    // signature over the file also proves it was not corrupted or tampered, and — unlike a hash —
+    // survives a compromised release host. This is the load-bearing check.
+    if let Err(e) = verify_release_signature(&tmp_path, &release.sig_url) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "downloaded update signature verification failed: {e}"
+        ));
+    }
+    tracing::info!(sig_url = %release.sig_url, "downloaded update signature verified");
+
+    // SHA-256 is an additional fast corruption check when the manifest advertises it. It is not
+    // load-bearing (the signature already covers integrity), so a manifest without a hash is fine.
     if let Some(expected) = &release.sha256 {
         if let Err(e) = crate::checksum::verify_sha256(&tmp_path, expected) {
             let _ = fs::remove_file(&tmp_path);
@@ -617,6 +649,30 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         current_exe,
         tmp_path: Some(tmp_path),
     })
+}
+
+/// Download the detached minisign signature from `sig_url` and verify it over `file` against the
+/// embedded release key(s). Any failure (download, parse, key mismatch) is fatal — the caller
+/// deletes the staged binary.
+#[cfg(not(windows))]
+fn verify_release_signature(file: &std::path::Path, sig_url: &str) -> Result<(), String> {
+    let output = Command::new("curl")
+        .args([
+            "-sfL",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
+            sig_url,
+        ])
+        .output()
+        .map_err(|e| format!("failed to fetch signature: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("failed to download signature from {sig_url}"));
+    }
+    crate::signing::verify_signature(file, &output.stdout).map_err(|e| e.to_string())
 }
 
 #[cfg(not(windows))]
@@ -2340,6 +2396,7 @@ mod tests {
             target_protocol,
             download_url: "https://example.com/herdr".to_string(),
             sha256: None,
+            sig_url: "https://example.com/herdr.minisig".to_string(),
             notes_body: "### Changed\n- One".to_string(),
         }
     }
@@ -2728,6 +2785,7 @@ mod tests {
             target_protocol: Some(2),
             download_url: "https://example.com/herdr".to_string(),
             sha256: None,
+            sig_url: "https://example.com/herdr.minisig".to_string(),
             notes_body: "### Changed\n- One".to_string(),
         };
         let incompatible_release = ReleaseInfo {
@@ -2967,6 +3025,7 @@ mod tests {
             target_protocol: Some(3),
             download_url: "https://example.com/herdr".to_string(),
             sha256: None,
+            sig_url: "https://example.com/herdr.minisig".to_string(),
             notes_body: "### Changed\n- One".to_string(),
         };
         let plan = RunningServerUpdatePlan {
@@ -3102,6 +3161,7 @@ mod tests {
             target_protocol: Some(77),
             download_url: "https://example.com/herdr".to_string(),
             sha256: None,
+            sig_url: "https://example.com/herdr.minisig".to_string(),
             notes_body: "### Changed\n- One".to_string(),
         };
 
