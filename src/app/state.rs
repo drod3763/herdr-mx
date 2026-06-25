@@ -742,7 +742,7 @@ pub(crate) enum SidebarHoverTarget {
     },
     New,
     Menu,
-    ScopeToggle,
+    SortToggle,
     Filter,
     NewWorkspaceDestination {
         row: u16,
@@ -1016,15 +1016,6 @@ pub enum AgentPanelSort {
     #[default]
     Spaces,
     Priority,
-}
-
-/// herdr-mx: agent panel scope filter — which workspaces' agents the multi-remote
-/// client panel shows. Orthogonal to upstream's `AgentPanelSort` (ordering).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum AgentPanelScope {
-    CurrentWorkspace,
-    #[default]
-    AllWorkspaces,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2020,7 +2011,6 @@ pub struct AppState {
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
     pub agent_panel_sort: AgentPanelSort,
-    pub agent_panel_scope: AgentPanelScope,
     pub next_agent_state_change_seq: u64,
     /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
     /// captures mouse while the focused pane app requests mouse reporting.
@@ -2407,7 +2397,6 @@ impl AppState {
             sidebar_collapsed: false,
             sidebar_section_split: 0.5,
             agent_panel_sort: AgentPanelSort::Spaces,
-            agent_panel_scope: AgentPanelScope::AllWorkspaces,
             next_agent_state_change_seq: 0,
             mouse_capture: true,
             right_click_passthrough_modifiers: None,
@@ -2860,7 +2849,7 @@ mod tests {
             SidebarHoverTarget::AgentRoute { route_idx: 0 },
             SidebarHoverTarget::New,
             SidebarHoverTarget::Menu,
-            SidebarHoverTarget::ScopeToggle,
+            SidebarHoverTarget::SortToggle,
             SidebarHoverTarget::Filter,
             SidebarHoverTarget::NewWorkspaceDestination { row: 0 },
             SidebarHoverTarget::HostBanner { banner_idx: 0 },

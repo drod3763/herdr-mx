@@ -1416,12 +1416,15 @@ fn dispatch_composited_mouse_input(
     if let Some(target) =
         compositor.hit_test(model, mouse.column, mouse.row, host_size.0, host_size.1)
     {
-        // #20: the scope toggle mutates client-local compositor state (no server round-trip), so it
-        // is handled here where `&mut compositor` is in scope rather than in the model-only
-        // `dispatch_sidebar_hit_target`.
-        if matches!(target, compositor::SidebarHitTarget::AgentScopeToggle) {
+        // The sort toggle mutates client-local compositor state (the composited multi-remote client
+        // renders its OWN aggregated sidebar, so the agent ordering is per-client presentation — see
+        // the boundary guardrail in CLAUDE.md), so it is handled here where `&mut compositor` is in
+        // scope rather than in the model-only `dispatch_sidebar_hit_target`. (The single-server
+        // direct-attach path is unaffected: there the client shows the server's own frame and just
+        // forwards the click, which the server's `on_agent_panel_sort_toggle` handles.)
+        if matches!(target, compositor::SidebarHitTarget::AgentSortToggle) {
             return if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                compositor.toggle_agent_panel_scope();
+                compositor.toggle_agent_panel_sort();
                 ClientInputDispatch::Redraw
             } else {
                 ClientInputDispatch::Consumed
@@ -1649,9 +1652,9 @@ fn dispatch_sidebar_hit_target(
             model.open_client_global_menu(mouse.column, mouse.row);
             ClientInputDispatch::Redraw
         }
-        // #20: handled earlier in `dispatch_composited_mouse_input` (needs `&mut compositor`); this
-        // arm only keeps the match exhaustive and is not reached in practice.
-        compositor::SidebarHitTarget::AgentScopeToggle => ClientInputDispatch::Consumed,
+        // Handled earlier in `dispatch_composited_mouse_input` (needs `&mut compositor`); this arm
+        // only keeps the match exhaustive and is not reached in practice.
+        compositor::SidebarHitTarget::AgentSortToggle => ClientInputDispatch::Consumed,
         // #25: handled earlier in `dispatch_composited_mouse_input` (needs `&mut compositor`); this
         // arm only keeps the match exhaustive and is not reached in practice.
         compositor::SidebarHitTarget::CollapsedSidebarToggle => ClientInputDispatch::Consumed,

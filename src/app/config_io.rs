@@ -181,29 +181,6 @@ impl App {
         false
     }
 
-    // Call site dropped by the v0.7.1 merge; retained pending rewiring (see drod3763/herdr-mx#1).
-    #[allow(dead_code)]
-    pub(super) fn save_agent_panel_scope(&mut self, scope: crate::app::state::AgentPanelScope) {
-        let value = match scope {
-            crate::app::state::AgentPanelScope::CurrentWorkspace => {
-                crate::config::AgentPanelScopeConfig::Current.as_str()
-            }
-            crate::app::state::AgentPanelScope::AllWorkspaces => {
-                crate::config::AgentPanelScopeConfig::All.as_str()
-            }
-        };
-        if self.update_config_file("agent panel scope", |content| {
-            crate::config::upsert_section_value(
-                content,
-                "ui",
-                "agent_panel_scope",
-                &format!("\"{value}\""),
-            )
-        }) {
-            self.apply_config_from_disk(false);
-        }
-    }
-
     pub(super) fn save_agent_panel_sort(&mut self, sort: crate::app::state::AgentPanelSort) {
         let value = match sort {
             crate::app::state::AgentPanelSort::Spaces => {
