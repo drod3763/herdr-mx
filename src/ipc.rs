@@ -42,6 +42,11 @@ pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
         use interprocess::local_socket::{prelude::*, GenericFilePath, ListenerOptions};
 
         let name = path.to_fs_name::<GenericFilePath>()?;
+        // Force a restrictive umask so the socket inode is born owner-only (0o600) rather
+        // than being created with the process default umask and chmod'd afterward. The
+        // post-bind `restrict_socket_permissions` call remains the authoritative mode, but
+        // this closes the brief TOCTOU window where another local user could connect.
+        let _umask = UmaskGuard::restrictive();
         ListenerOptions::new()
             .name(name)
             .reclaim_name(false)
@@ -159,11 +164,90 @@ pub(crate) fn restrict_socket_permissions(_path: &Path, _mode: u32) -> io::Resul
     Ok(())
 }
 
+/// RAII guard that installs a restrictive `umask` for its lifetime so files and sockets
+/// created while it is held are born without group/other access (`mode & 0o177 == 0`).
+///
+/// `umask(2)` is process-global, so a guard must be held only across the individual
+/// create/bind call it protects — never around unrelated work that might create files
+/// expected to be group/other readable. Socket binds happen at startup and on
+/// remote-connect, so contention with other threads is negligible.
+#[cfg(unix)]
+pub(crate) struct UmaskGuard {
+    previous: libc::mode_t,
+}
+
+#[cfg(unix)]
+impl UmaskGuard {
+    pub(crate) fn restrictive() -> Self {
+        // SAFETY: `umask` cannot fail and always returns the previous mask. We restore it on drop.
+        let previous = unsafe { libc::umask(0o177) };
+        Self { previous }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: restore the mask captured at construction.
+        unsafe {
+            libc::umask(self.previous);
+        }
+    }
+}
+
+/// Windows has no `umask`; socket permissions are handled by `restrict_socket_permissions`
+/// (also a no-op there). The guard exists so callers stay platform-agnostic.
+#[cfg(windows)]
+pub(crate) struct UmaskGuard;
+
+#[cfg(windows)]
+impl UmaskGuard {
+    pub(crate) fn restrictive() -> Self {
+        Self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(windows)]
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_local_listener_creates_owner_only_socket() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Force a fully-permissive process umask so a socket created without the guard
+        // WOULD show group/other bits — isolating the guard as the thing under test.
+        // SAFETY: nextest runs each test in its own process; we restore the mask below.
+        let previous = unsafe { libc::umask(0) };
+
+        let dir = std::env::temp_dir().join(format!("herdr-ipc-umask-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.sock");
+        let _ = fs::remove_file(&path);
+
+        let listener = bind_local_listener(&path).expect("bind listener");
+        let mode = fs::metadata(&path)
+            .expect("stat socket")
+            .permissions()
+            .mode();
+
+        // SAFETY: restore the umask captured above.
+        unsafe {
+            libc::umask(previous);
+        }
+        drop(listener);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            mode & 0o177,
+            0,
+            "socket must be born owner-only, got mode {mode:o}"
+        );
+    }
 
     #[test]
     fn stale_socket_connect_errors_keep_unix_would_block_strict() {

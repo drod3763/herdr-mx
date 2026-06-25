@@ -2202,7 +2202,12 @@ impl SshStdioBridge {
         kind: RemoteBridgeKind,
     ) -> io::Result<Self> {
         let _ = std::fs::remove_file(&local_socket);
-        let listener = UnixListener::bind(&local_socket)?;
+        // Born owner-only via the umask guard; the chmod below stays authoritative. Closes the
+        // TOCTOU window where another local user could connect to the bridge socket.
+        let listener = {
+            let _umask = crate::ipc::UmaskGuard::restrictive();
+            UnixListener::bind(&local_socket)?
+        };
         crate::ipc::restrict_socket_permissions(&local_socket, BRIDGE_SOCKET_PERMISSION_MODE)?;
         listener.set_nonblocking(true)?;
 
