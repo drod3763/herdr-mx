@@ -694,7 +694,7 @@ fn frame_from_message(
             *baseline = Some(frame.clone());
             Some(frame)
         }
-        9 => {
+        10 => {
             let delta = decode_frame_delta_payload(payload).ok()?;
             let base = baseline
                 .take()
@@ -703,7 +703,7 @@ fn frame_from_message(
             *baseline = Some(frame.clone());
             Some(frame)
         }
-        11 => {
+        12 => {
             let (compressed, _): (Vec<u8>, usize) =
                 bincode::serde::decode_from_slice(payload, bincode::config::standard()).ok()?;
             let raw = miniz_oxide::inflate::decompress_to_vec(&compressed).ok()?;
@@ -719,7 +719,7 @@ fn wait_for_frame_matching(
     timeout: Duration,
     predicate: impl Fn(&FrameWire) -> bool,
 ) -> io::Result<bool> {
-    // issue #13: frames arrive as Frame (1), FrameDelta (9), or deflate-wrapped Compressed (11).
+    // issue #13: frames arrive as Frame (1), FrameDelta (10), or deflate-wrapped Compressed (12).
     // Track a baseline and reconstruct full frames before testing the predicate, like the client.
     let mut baseline: Option<FrameWire> = None;
     let deadline = Instant::now() + timeout;
@@ -750,8 +750,8 @@ fn wait_for_frame(stream: &mut UnixStream, timeout: Duration) -> bool {
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(80));
         match read_server_variant(stream, slice) {
-            // Frame (1), FrameDelta (9), or Compressed frame (11) — issue #13.
-            Ok(1) | Ok(9) | Ok(11) => return true,
+            // Frame (1), FrameDelta (10), or Compressed frame (12) — issue #13.
+            Ok(1) | Ok(10) | Ok(12) => return true,
             Ok(_) => {}
             Err(err) if is_timeout(&err) => {}
             Err(_) => return false,
