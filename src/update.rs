@@ -463,20 +463,31 @@ fn build_id_date(build_id: &str) -> Option<&str> {
     shaped.then_some(date)
 }
 
-/// Whether a preview manifest build is fresh enough to install over the running preview, by the
-/// orderable `YYYY-MM-DD` date prefix of the build id. Refuses an OLDER-dated build (replay of a
-/// stale signed `preview.json`). Allows (returns true) when the running build is not a preview
-/// (first preview install) or when either date is unparseable — best effort; the build-id equality
-/// check still blocks reinstalling the exact current build, and the staged-binary identity check
-/// still applies. Same-date builds are allowed (the sha is not orderable) — a narrow residual.
+/// Whether a preview manifest build is fresh enough to install over the running preview. Prefers the
+/// full-precision `built_at` timestamp (monotonic UTC ISO-8601, lexicographically comparable) so
+/// same-day rollback is caught; falls back to the `YYYY-MM-DD` date prefix of the build id for older
+/// builds that predate the embedded timestamp. Refuses a stale (replayed) signed `preview.json` that
+/// advertises an older build. Allows (returns true) when the running build is not a preview (first
+/// preview install) or when neither ordering signal is available — best effort; the build-id
+/// equality check still blocks reinstalling the exact current build, and the staged-binary identity
+/// check still applies.
 fn preview_manifest_is_fresh(
+    manifest_built_at: &str,
     manifest_build_id: &str,
+    current_built_at: Option<&str>,
     current_build_id: Option<&str>,
     current_is_preview: bool,
 ) -> bool {
     if !current_is_preview {
         return true;
     }
+    // Full-precision built_at ordering (closes the same-day window).
+    if let Some(current_built_at) = current_built_at {
+        if !current_built_at.is_empty() && !manifest_built_at.is_empty() {
+            return manifest_built_at > current_built_at;
+        }
+    }
+    // Fallback: day-granularity ordering by the build-id date prefix.
     let Some(current_build_id) = current_build_id else {
         return true;
     };
@@ -511,7 +522,9 @@ fn release_info_from_preview_manifest(
     // build as an "update". The later signature/identity checks only prove the binary matches the
     // manifest-controlled identity, so freshness cannot rely on them.
     if !preview_manifest_is_fresh(
+        manifest.built_at.trim(),
         build_id,
+        crate::build_info::built_at(),
         crate::build_info::build_id(),
         crate::build_info::is_preview(),
     ) {
@@ -2565,27 +2578,62 @@ mod tests {
     #[test]
     fn preview_manifest_is_fresh_refuses_rollback() {
         // Real preview build id shape from preview.yml: YYYY-MM-DD-<sha>.
-        let older = "2026-06-11-aaaaaaaaaaaa";
-        let newer = "2026-06-12-bbbbbbbbbbbb";
+        let older_id = "2026-06-11-aaaaaaaaaaaa";
+        let newer_id = "2026-06-12-bbbbbbbbbbbb";
+        let no_at = ""; // built_at unavailable -> exercise the build-id date fallback
 
         // Not currently on preview (e.g. stable -> preview): always allow.
-        assert!(super::preview_manifest_is_fresh(older, Some(newer), false));
-        // No current build id: allow.
-        assert!(super::preview_manifest_is_fresh(older, None, true));
-        // Manifest build is newer-dated than the running preview: allow.
-        assert!(super::preview_manifest_is_fresh(newer, Some(older), true));
-        // Regression (codex iter 7/9): manifest advertises an OLDER-dated signed preview -> refuse.
-        assert!(!super::preview_manifest_is_fresh(older, Some(newer), true));
-        // Same date (sha not orderable) -> allowed (documented narrow residual).
         assert!(super::preview_manifest_is_fresh(
+            no_at,
+            older_id,
+            None,
+            Some(newer_id),
+            false
+        ));
+
+        // Fallback path (no current built_at): order by the YYYY-MM-DD build-id date prefix.
+        assert!(super::preview_manifest_is_fresh(
+            no_at, older_id, None, None, true
+        )); // no current id
+        assert!(super::preview_manifest_is_fresh(
+            no_at,
+            newer_id,
+            None,
+            Some(older_id),
+            true
+        )); // newer day
+        assert!(!super::preview_manifest_is_fresh(
+            no_at,
+            older_id,
+            None,
+            Some(newer_id),
+            true
+        )); // older day
+
+        // Full-precision built_at path closes the same-day window (codex iter 10):
+        let cur_at = "2026-06-12T10:00:00Z";
+        // older same-day build -> refuse (the date prefix alone would have allowed this).
+        assert!(!super::preview_manifest_is_fresh(
+            "2026-06-12T09:00:00Z",
             "2026-06-12-cccccccccccc",
-            Some(newer),
+            Some(cur_at),
+            Some(newer_id),
             true
         ));
-        // Unparseable build id -> best-effort allow (build-id equality + identity check still guard).
+        // equal built_at -> refuse (not strictly newer).
+        assert!(!super::preview_manifest_is_fresh(
+            cur_at,
+            newer_id,
+            Some(cur_at),
+            Some(newer_id),
+            true
+        ));
+        // newer same-day build -> allow.
         assert!(super::preview_manifest_is_fresh(
-            "not-a-date",
-            Some(newer),
+            "2026-06-12T11:00:00Z",
+            "2026-06-12-dddddddddddd",
+            Some(cur_at),
+            Some(newer_id),
             true
         ));
     }

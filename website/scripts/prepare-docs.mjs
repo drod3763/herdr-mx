@@ -1,4 +1,5 @@
 import { cp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
@@ -47,6 +48,27 @@ async function preparePublicAssets() {
       await cp(source, resolve(publicDir, file));
     } catch (error) {
       if (!optional.has(file) || error.code !== 'ENOENT') throw error;
+    }
+  }
+
+  // The updater fails closed when <manifest>.minisig is missing, so a production/release deploy must
+  // never publish a manifest without its signature. Enforce that when REQUIRE_MANIFEST_SIGNATURES=1
+  // (set in the production/release deploy). Local and docs builds leave it unset, keeping the
+  // sidecars optional so they don't need the signing key.
+  if (process.env.REQUIRE_MANIFEST_SIGNATURES === '1') {
+    for (const [manifest, signature] of [
+      ['latest.json', 'latest.json.minisig'],
+      ['preview.json', 'preview.json.minisig'],
+    ]) {
+      if (
+        existsSync(resolve(publicDir, manifest)) &&
+        !existsSync(resolve(publicDir, signature))
+      ) {
+        throw new Error(
+          `${manifest} is being published without ${signature}; herdr clients require a signed ` +
+            `manifest. Run the signing workflow (or restore the .minisig) before deploying.`,
+        );
+      }
     }
   }
 

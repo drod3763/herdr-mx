@@ -16,6 +16,13 @@ pub fn build_id() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_ID"))
 }
 
+/// Full-precision build timestamp (`YYYY-MM-DDTHH:MM:SSZ`), set by the preview/release workflows so
+/// the updater can order builds beyond day granularity (preview rollback protection). `None` for
+/// stable/local builds that do not set it.
+pub fn built_at() -> Option<&'static str> {
+    non_empty(option_env!("HERDR_BUILT_AT"))
+}
+
 pub fn version() -> String {
     FULL_VERSION.to_string()
 }
