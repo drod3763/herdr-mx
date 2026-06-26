@@ -421,6 +421,31 @@ fn preview_display_version(base_version: &str, build_id: &str) -> String {
     )
 }
 
+/// Whether a preview manifest build is strictly newer than the running build, by the monotonic
+/// `YYYY.MM.DD.HHMM` stamp [`build_info::build_stamp`] extracts from the build id. Refuses preview
+/// rollback. Allows (returns true) when the running build is not a preview (first preview install)
+/// or when either stamp is unparseable — best effort; the build-id equality check still blocks
+/// reinstalling the exact current build, and the staged-binary identity check still applies.
+fn preview_manifest_is_fresh(
+    manifest_build_id: &str,
+    current_build_id: Option<&str>,
+    current_is_preview: bool,
+) -> bool {
+    if !current_is_preview {
+        return true;
+    }
+    let Some(current_build_id) = current_build_id else {
+        return true;
+    };
+    match (
+        crate::build_info::build_stamp(current_build_id),
+        crate::build_info::build_stamp(manifest_build_id),
+    ) {
+        (Some(current_stamp), Some(manifest_stamp)) => manifest_stamp > current_stamp,
+        _ => true,
+    }
+}
+
 fn release_info_from_preview_manifest(
     manifest: &PreviewManifest,
 ) -> Result<Option<ReleaseInfo>, String> {
@@ -437,6 +462,16 @@ fn release_info_from_preview_manifest(
     if crate::build_info::is_preview()
         && crate::build_info::build_id().is_some_and(|current| current == build_id)
     {
+        return Ok(None);
+    }
+    // Refuse preview rollback: a stale or tampered preview.json must not advertise an OLDER signed
+    // build as an "update". The later signature/identity checks only prove the binary matches the
+    // manifest-controlled identity, so freshness cannot rely on them.
+    if !preview_manifest_is_fresh(
+        build_id,
+        crate::build_info::build_id(),
+        crate::build_info::is_preview(),
+    ) {
         return Ok(None);
     }
 
@@ -2496,6 +2531,29 @@ mod tests {
         assert!(!super::staged_version_matches(
             "9.9.8-preview.new",
             &preview
+        ));
+    }
+
+    #[test]
+    fn preview_manifest_is_fresh_refuses_rollback() {
+        let older = "preview-2026-06-11-2357-aaaa"; // stamp 2026.06.11.2357
+        let newer = "preview-2026-06-12-0000-bbbb"; // stamp 2026.06.12.0000
+
+        // Not currently on preview (e.g. stable -> preview): always allow.
+        assert!(super::preview_manifest_is_fresh(older, Some(newer), false));
+        // No current build id: allow.
+        assert!(super::preview_manifest_is_fresh(older, None, true));
+        // Manifest build is newer than the running preview: allow.
+        assert!(super::preview_manifest_is_fresh(newer, Some(older), true));
+        // Regression (codex iter 7): manifest advertises an OLDER signed preview -> refuse.
+        assert!(!super::preview_manifest_is_fresh(older, Some(newer), true));
+        // Equal stamp is not strictly newer -> refuse.
+        assert!(!super::preview_manifest_is_fresh(older, Some(older), true));
+        // Unparseable stamps -> best-effort allow (build-id equality check still guards reinstall).
+        assert!(super::preview_manifest_is_fresh(
+            "no-stamp",
+            Some("also-none"),
+            true
         ));
     }
 
