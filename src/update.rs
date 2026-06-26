@@ -1927,17 +1927,42 @@ fn print_running_session_update_outcomes(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn update_install_command() -> &'static str {
-    if crate::build_info::channel() == MX_BUILD_CHANNEL {
-        if is_homebrew_managed_install() {
+    select_update_command(
+        crate::build_info::channel(),
+        is_homebrew_managed_install(),
+        is_mise_managed_install(),
+        is_nix_managed_install(),
+    )
+}
+
+/// Pure mapping from build channel + detected install manager to the command we tell
+/// the user to run. Split out from [`update_install_command`] so the mx routing can be
+/// tested: `build_info::channel()` is compile-time, so the live `mx` branch is otherwise
+/// unreachable from a stable-channel test build.
+///
+/// mx self-update is disabled, so mx installs are routed to the owning package manager
+/// (Homebrew or mise — both advertised in the README install section) and only fall back
+/// to a manual GitHub releases install when no managed install is detected.
+fn select_update_command(
+    channel: &str,
+    is_homebrew: bool,
+    is_mise: bool,
+    is_nix: bool,
+) -> &'static str {
+    if channel == MX_BUILD_CHANNEL {
+        if is_homebrew {
             return MX_HOMEBREW_UPDATE_COMMAND;
+        }
+        if is_mise {
+            return MISE_UPDATE_COMMAND;
         }
         return MX_RELEASES_UPDATE_COMMAND;
     }
-    if is_homebrew_managed_install() {
+    if is_homebrew {
         HOMEBREW_UPDATE_COMMAND
-    } else if is_mise_managed_install() {
+    } else if is_mise {
         MISE_UPDATE_COMMAND
-    } else if is_nix_managed_install() {
+    } else if is_nix {
         NIX_UPDATE_COMMAND
     } else {
         HERDR_UPDATE_COMMAND
@@ -2155,7 +2180,7 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     if crate::build_info::channel() == MX_BUILD_CHANNEL {
         return Err(format!(
-            "self-update is disabled for herdr-mx builds; run `{MX_HOMEBREW_UPDATE_COMMAND}` for Homebrew installs, or {MX_RELEASES_UPDATE_COMMAND}"
+            "self-update is disabled for herdr-mx builds; run `{MX_HOMEBREW_UPDATE_COMMAND}` for Homebrew installs or `{MISE_UPDATE_COMMAND}` for mise installs, or {MX_RELEASES_UPDATE_COMMAND}"
         ));
     }
     let channel = UpdateChannel::configured();
@@ -2468,6 +2493,55 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn mx_install_command_routes_to_each_package_manager() {
+        // Homebrew-managed mx install → mx Homebrew upgrade.
+        assert_eq!(
+            select_update_command(MX_BUILD_CHANNEL, true, false, false),
+            MX_HOMEBREW_UPDATE_COMMAND
+        );
+        // mise-managed mx install → mise upgrade, not a manual releases install.
+        assert_eq!(
+            select_update_command(MX_BUILD_CHANNEL, false, true, false),
+            MISE_UPDATE_COMMAND
+        );
+        // Homebrew wins when both managers somehow match.
+        assert_eq!(
+            select_update_command(MX_BUILD_CHANNEL, true, true, false),
+            MX_HOMEBREW_UPDATE_COMMAND
+        );
+        // mx is not distributed through Nix, so a direct/unmanaged mx install falls
+        // back to the GitHub releases install.
+        assert_eq!(
+            select_update_command(MX_BUILD_CHANNEL, false, false, true),
+            MX_RELEASES_UPDATE_COMMAND
+        );
+        assert_eq!(
+            select_update_command(MX_BUILD_CHANNEL, false, false, false),
+            MX_RELEASES_UPDATE_COMMAND
+        );
+    }
+
+    #[test]
+    fn stable_install_command_unchanged_by_mx_routing() {
+        assert_eq!(
+            select_update_command("stable", true, false, false),
+            HOMEBREW_UPDATE_COMMAND
+        );
+        assert_eq!(
+            select_update_command("stable", false, true, false),
+            MISE_UPDATE_COMMAND
+        );
+        assert_eq!(
+            select_update_command("stable", false, false, true),
+            NIX_UPDATE_COMMAND
+        );
+        assert_eq!(
+            select_update_command("stable", false, false, false),
+            HERDR_UPDATE_COMMAND
+        );
     }
 
     fn unique_test_socket_path(name: &str) -> std::path::PathBuf {
