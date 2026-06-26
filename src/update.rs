@@ -487,7 +487,9 @@ fn preview_manifest_is_fresh(
             return manifest_built_at > current_built_at;
         }
     }
-    // Fallback: day-granularity ordering by the build-id date prefix.
+    // Fallback (legacy preview builds with no embedded built_at): order by the build-id date
+    // prefix. Same-date builds are unorderable by date (the sha is not monotonic), so fail closed —
+    // require a STRICTLY later date — rather than allow a same-day rollback.
     let Some(current_build_id) = current_build_id else {
         return true;
     };
@@ -495,7 +497,7 @@ fn preview_manifest_is_fresh(
         build_id_date(current_build_id),
         build_id_date(manifest_build_id),
     ) {
-        (Some(current_date), Some(manifest_date)) => manifest_date >= current_date,
+        (Some(current_date), Some(manifest_date)) => manifest_date > current_date,
         _ => true,
     }
 }
@@ -2609,6 +2611,14 @@ mod tests {
             Some(newer_id),
             true
         )); // older day
+            // Legacy build (no built_at), same date but different sha -> fail closed (codex iter 11).
+        assert!(!super::preview_manifest_is_fresh(
+            no_at,
+            "2026-06-12-zzzzzzzzzzzz",
+            None,
+            Some(newer_id),
+            true
+        ));
 
         // Full-precision built_at path closes the same-day window (codex iter 10):
         let cur_at = "2026-06-12T10:00:00Z";
