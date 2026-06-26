@@ -100,9 +100,10 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
     // stable/preview ship as separate Homebrew tap formulae). Short-circuit before writing
     // `[update].channel` or consulting the package-manager detectors so a package-managed or
     // direct mx install is never left with inert channel config followed by a failed update.
+    // Return non-zero so automation does not treat the (deliberate) no-op as an applied switch.
     if let Some(notice) = mx_channel_set_notice(channel, crate::build_info::is_mx()) {
-        println!("{notice}");
-        return Ok(0);
+        eprintln!("{notice}");
+        return Ok(1);
     }
 
     if let Some(reason) = channel_set_rejection(
