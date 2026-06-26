@@ -96,6 +96,15 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
+    // mx builds ignore the herdr.dev update channels entirely (self-update is disabled and
+    // stable/preview ship as separate Homebrew tap formulae). Short-circuit before writing
+    // `[update].channel` or consulting the package-manager detectors so a package-managed or
+    // direct mx install is never left with inert channel config followed by a failed update.
+    if let Some(notice) = mx_channel_set_notice(channel, crate::build_info::is_mx()) {
+        println!("{notice}");
+        return Ok(0);
+    }
+
     if let Some(reason) = channel_set_rejection(
         channel,
         crate::update::preview_channel_rejection_for_current_install(),
@@ -166,6 +175,19 @@ fn parse_channel_set_arg(args: &[String]) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// Notice shown when `herdr channel set` runs on an mx build, or `None` for non-mx builds
+/// (which use the normal channel-set flow). mx ignores the herdr.dev update channels, so the
+/// command does not write `[update].channel`; it points the user at how mx actually updates.
+fn mx_channel_set_notice(channel: &str, is_mx_build: bool) -> Option<&'static str> {
+    if !is_mx_build {
+        return None;
+    }
+    Some(match channel {
+        "preview" => "herdr-mx ignores herdr.dev update channels; preview builds ship through a separate Homebrew tap. Install them with `brew install drod3763/tap/herdr-mx-preview`. The update channel config was not changed.",
+        _ => "herdr-mx ignores herdr.dev update channels; it updates through Homebrew (`brew upgrade herdr-mx`), mise, or GitHub releases. The update channel config was not changed.",
+    })
 }
 
 fn channel_set_rejection(
@@ -959,6 +981,20 @@ mod tests {
             super::parse_channel_set_arg(&["preview".to_string(), "stable".to_string()]),
             None
         );
+    }
+
+    #[test]
+    fn mx_channel_set_short_circuits_for_mx_builds() {
+        // mx builds: any channel target returns a notice (no config write), preview points at
+        // the preview tap.
+        let preview = super::mx_channel_set_notice("preview", true).expect("mx preview notice");
+        assert!(preview.contains("herdr-mx-preview"));
+        assert!(preview.contains("was not changed"));
+        let stable = super::mx_channel_set_notice("stable", true).expect("mx stable notice");
+        assert!(stable.contains("was not changed"));
+        // Non-mx builds are unaffected and fall through to the normal flow.
+        assert_eq!(super::mx_channel_set_notice("preview", false), None);
+        assert_eq!(super::mx_channel_set_notice("stable", false), None);
     }
 
     #[test]
