@@ -23,7 +23,7 @@
 //! ```text
 //! index_offset  u64     absolute offset of the index JSON
 //! index_len     u64     length of the index JSON in bytes
-//! format        u32     bundle format version (currently 1)
+//! format        u32     bundle format version (currently 2)
 //! magic         [u8;8]  b"HERDRBND"
 //! ```
 
