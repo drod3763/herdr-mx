@@ -51,16 +51,25 @@ async function preparePublicAssets() {
     }
   }
 
-  // The updater fails closed when <manifest>.minisig is missing, so publishing a manifest without
-  // its signature would brick `herdr update` / remote-download for every client. Enforce this by
-  // DEFAULT (fail closed) so a deploy can never silently publish an unsigned manifest just because
-  // an env var was forgotten. A local or docs build without the signing key sets
-  // HERDR_DOCS_ALLOW_UNSIGNED=1 to opt out (it still copies a sidecar if one is present).
-  // REQUIRE_MANIFEST_SIGNATURES=1 is still honored as an explicit force-on for callers that set it.
-  const allowUnsigned =
-    process.env.HERDR_DOCS_ALLOW_UNSIGNED === '1' &&
-    process.env.REQUIRE_MANIFEST_SIGNATURES !== '1';
-  if (!allowUnsigned) {
+  // The updater fails closed when <manifest>.minisig is missing, so serving a manifest without its
+  // signature would brick `herdr update` / remote-download for every client. Enforce signed
+  // manifests on the production update deploy — automatically, so a forgotten env var can't open a
+  // hole — while keeping local, CI, and Cloudflare *preview* builds permissive so the docs site
+  // still builds without the signing key.
+  //
+  // Enforcement is on when either:
+  //   - REQUIRE_MANIFEST_SIGNATURES=1 is set explicitly (force-on for any caller), or
+  //   - this is the Cloudflare Pages production deploy (CF_PAGES=1 on a production branch).
+  // HERDR_DOCS_ALLOW_UNSIGNED=1 forces permissive (local docs build without the signing key); an
+  // explicit REQUIRE_MANIFEST_SIGNATURES=1 still wins over it.
+  const PRODUCTION_DEPLOY_BRANCHES = new Set(['mx', 'master']);
+  const isCloudflareProduction =
+    process.env.CF_PAGES === '1' &&
+    PRODUCTION_DEPLOY_BRANCHES.has(process.env.CF_PAGES_BRANCH ?? '');
+  const forceOn = process.env.REQUIRE_MANIFEST_SIGNATURES === '1';
+  const optOut = process.env.HERDR_DOCS_ALLOW_UNSIGNED === '1';
+  const enforceSignatures = forceOn || (isCloudflareProduction && !optOut);
+  if (enforceSignatures) {
     for (const [manifest, signature] of [
       ['latest.json', 'latest.json.minisig'],
       ['preview.json', 'preview.json.minisig'],
