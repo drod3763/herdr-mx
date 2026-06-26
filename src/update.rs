@@ -705,6 +705,20 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         return Err("download failed".into());
     }
 
+    // SHA-256 is a fast corruption pre-check when the manifest advertises it. Run it first so an
+    // obviously corrupt or wrong download fails fast — before the extra network round-trip to fetch
+    // and parse the signature. It is not load-bearing (the signature below covers integrity), so a
+    // manifest without a hash is fine.
+    if let Some(expected) = &release.sha256 {
+        if let Err(e) = crate::checksum::verify_sha256(&tmp_path, expected) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!(
+                "downloaded update checksum verification failed: {e}"
+            ));
+        }
+        tracing::info!(sha256 = %expected, "downloaded update checksum verified");
+    }
+
     // Authenticity AND integrity: the detached minisign signature is mandatory. A valid ed25519
     // signature over the file also proves it was not corrupted or tampered, and — unlike a hash —
     // survives a compromised release host. This is the load-bearing check.
@@ -715,18 +729,6 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         ));
     }
     tracing::info!(sig_url = %release.sig_url, "downloaded update signature verified");
-
-    // SHA-256 is an additional fast corruption check when the manifest advertises it. It is not
-    // load-bearing (the signature already covers integrity), so a manifest without a hash is fine.
-    if let Some(expected) = &release.sha256 {
-        if let Err(e) = crate::checksum::verify_sha256(&tmp_path, expected) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!(
-                "downloaded update checksum verification failed: {e}"
-            ));
-        }
-        tracing::info!(sha256 = %expected, "downloaded update checksum verified");
-    }
 
     // Make executable
     #[cfg(unix)]
