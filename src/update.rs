@@ -446,11 +446,29 @@ fn preview_display_version(base_version: &str, build_id: &str) -> String {
     )
 }
 
-/// Whether a preview manifest build is strictly newer than the running build, by the monotonic
-/// `YYYY.MM.DD.HHMM` stamp [`build_info::build_stamp`] extracts from the build id. Refuses preview
-/// rollback. Allows (returns true) when the running build is not a preview (first preview install)
-/// or when either stamp is unparseable — best effort; the build-id equality check still blocks
-/// reinstalling the exact current build, and the staged-binary identity check still applies.
+/// The orderable `YYYY-MM-DD` date prefix of a preview build id (`YYYY-MM-DD-<sha>`, set by
+/// preview.yml from the commit date). Lexicographically comparable. `None` if absent/malformed.
+fn build_id_date(build_id: &str) -> Option<&str> {
+    let date = build_id.get(0..10)?;
+    let bytes = date.as_bytes();
+    let shaped = bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && date.char_indices().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                c == '-'
+            } else {
+                c.is_ascii_digit()
+            }
+        });
+    shaped.then_some(date)
+}
+
+/// Whether a preview manifest build is fresh enough to install over the running preview, by the
+/// orderable `YYYY-MM-DD` date prefix of the build id. Refuses an OLDER-dated build (replay of a
+/// stale signed `preview.json`). Allows (returns true) when the running build is not a preview
+/// (first preview install) or when either date is unparseable — best effort; the build-id equality
+/// check still blocks reinstalling the exact current build, and the staged-binary identity check
+/// still applies. Same-date builds are allowed (the sha is not orderable) — a narrow residual.
 fn preview_manifest_is_fresh(
     manifest_build_id: &str,
     current_build_id: Option<&str>,
@@ -463,10 +481,10 @@ fn preview_manifest_is_fresh(
         return true;
     };
     match (
-        crate::build_info::build_stamp(current_build_id),
-        crate::build_info::build_stamp(manifest_build_id),
+        build_id_date(current_build_id),
+        build_id_date(manifest_build_id),
     ) {
-        (Some(current_stamp), Some(manifest_stamp)) => manifest_stamp > current_stamp,
+        (Some(current_date), Some(manifest_date)) => manifest_date >= current_date,
         _ => true,
     }
 }
@@ -738,32 +756,19 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
     })
 }
 
-/// Whether the staged binary's reported `--version` `token` is exactly the release we resolved.
-/// A valid signature proves authenticity, not identity; this binds the artifact to the manifest's
-/// version, channel, and — for preview — exact build id, so a compromised manifest cannot
-/// substitute another validly-signed build (cross-channel, an older version, or an older preview).
+/// Whether the staged binary's reported `--version` `token` is EXACTLY the release we resolved.
+/// A valid signature proves authenticity, not identity; binding to the exact identity stops a
+/// compromised host from substituting another validly-signed build (cross-channel, an older
+/// version, or an older preview) at the asset URL.
 ///
-/// `Version::parse` strips channel/build suffixes, so the numeric core alone is insufficient. The
-/// channel is inferred from the "preview" marker (stable builds never carry it, preview builds
-/// always do — build_info::FULL_VERSION). For preview, the manifest build id is embedded verbatim
-/// in the reported version (`{base}-preview.{build_id}`, see build.rs), so requiring it blocks
-/// rollback to an older same-base signed preview.
+/// Exact equality is correct because `release.identity` is precisely what `build_info::FULL_VERSION`
+/// (what `--version` prints) reports for that build: stable is the bare base version (build.rs), and
+/// preview is `{base}-preview.{build_id}` (== `preview_display_version`). So an mx/preview build
+/// (`0.6.10-mx.1`, `0.6.10-preview.…`) is rejected for a stable `0.6.10` update, and any version or
+/// build-id mismatch is rejected — without brittle suffix/`contains` heuristics.
 #[cfg(not(windows))]
 fn staged_version_matches(token: &str, release: &ReleaseInfo) -> bool {
-    if Version::parse(token).as_ref() != Some(&release.version) {
-        return false;
-    }
-    let token_is_preview = token.contains("preview");
-    match release.channel {
-        UpdateChannel::Stable => !token_is_preview,
-        UpdateChannel::Preview => {
-            token_is_preview
-                && release
-                    .build_id
-                    .as_deref()
-                    .is_some_and(|build_id| token.contains(build_id))
-        }
-    }
+    token == release.identity
 }
 
 /// Download the detached minisign signature from `sig_url` and verify it over `file` against the
@@ -2532,52 +2537,55 @@ mod tests {
     }
 
     #[test]
-    fn staged_version_matches_binds_version_channel_and_build() {
-        // Stable: exact base, no preview marker.
-        let stable = fake_release("9.9.9", Some(2));
+    fn staged_version_matches_requires_exact_identity() {
+        // Stable identity is the bare base version; the binary must report exactly that.
+        let stable = fake_release("9.9.9", Some(2)); // identity "9.9.9"
         assert!(super::staged_version_matches("9.9.9", &stable));
-        // Downgrade to an older signed stable is rejected (numeric core differs).
+        // Older signed stable (downgrade) -> reject.
         assert!(!super::staged_version_matches("9.9.8", &stable));
-        // A signed preview artifact cannot be substituted for a stable update.
+        // Signed preview/mx artifacts for the same base must NOT pass as a stable update.
         assert!(!super::staged_version_matches("9.9.9-preview.123", &stable));
+        assert!(!super::staged_version_matches("9.9.9-mx.1", &stable));
 
-        // Preview: build.rs reports `{base}-preview.{build_id}`.
-        let preview = fake_preview_release("9.9.9", "new");
-        assert!(super::staged_version_matches("9.9.9-preview.new", &preview));
-        // Regression (codex iter 5): an older same-base signed preview must NOT satisfy a manifest
-        // advertising a newer build id.
+        // Preview identity == preview_display_version == build.rs FULL_VERSION.
+        let preview = fake_preview_release("9.9.9", "2026-06-12-bbbb");
+        assert!(super::staged_version_matches(
+            "9.9.9-preview.2026-06-12-bbbb",
+            &preview
+        ));
+        // An older signed preview build (different build id) -> reject.
         assert!(!super::staged_version_matches(
-            "9.9.9-preview.old",
+            "9.9.9-preview.2026-06-11-aaaa",
             &preview
         ));
         // A stable artifact cannot be substituted for a preview update.
         assert!(!super::staged_version_matches("9.9.9", &preview));
-        // Wrong base version is rejected even with the right channel/build marker.
-        assert!(!super::staged_version_matches(
-            "9.9.8-preview.new",
-            &preview
-        ));
     }
 
     #[test]
     fn preview_manifest_is_fresh_refuses_rollback() {
-        let older = "preview-2026-06-11-2357-aaaa"; // stamp 2026.06.11.2357
-        let newer = "preview-2026-06-12-0000-bbbb"; // stamp 2026.06.12.0000
+        // Real preview build id shape from preview.yml: YYYY-MM-DD-<sha>.
+        let older = "2026-06-11-aaaaaaaaaaaa";
+        let newer = "2026-06-12-bbbbbbbbbbbb";
 
         // Not currently on preview (e.g. stable -> preview): always allow.
         assert!(super::preview_manifest_is_fresh(older, Some(newer), false));
         // No current build id: allow.
         assert!(super::preview_manifest_is_fresh(older, None, true));
-        // Manifest build is newer than the running preview: allow.
+        // Manifest build is newer-dated than the running preview: allow.
         assert!(super::preview_manifest_is_fresh(newer, Some(older), true));
-        // Regression (codex iter 7): manifest advertises an OLDER signed preview -> refuse.
+        // Regression (codex iter 7/9): manifest advertises an OLDER-dated signed preview -> refuse.
         assert!(!super::preview_manifest_is_fresh(older, Some(newer), true));
-        // Equal stamp is not strictly newer -> refuse.
-        assert!(!super::preview_manifest_is_fresh(older, Some(older), true));
-        // Unparseable stamps -> best-effort allow (build-id equality check still guards reinstall).
+        // Same date (sha not orderable) -> allowed (documented narrow residual).
         assert!(super::preview_manifest_is_fresh(
-            "no-stamp",
-            Some("also-none"),
+            "2026-06-12-cccccccccccc",
+            Some(newer),
+            true
+        ));
+        // Unparseable build id -> best-effort allow (build-id equality + identity check still guard).
+        assert!(super::preview_manifest_is_fresh(
+            "not-a-date",
+            Some(newer),
             true
         ));
     }
