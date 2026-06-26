@@ -113,8 +113,16 @@ f/eZIK9QFwcdBVJC+bN/QWbdQQbv2C11XYExgJ/7VHh0tW24B9kXt0kwHLR/JCrfEct7y9Z0Otwl/GPd
 
     #[test]
     fn rejects_wrong_key() {
-        // A different valid minisign public key — correct format, wrong identity.
-        const OTHER_PUBKEY: &str = "RWTgr3uPbVfDfFw5N8z4o6lQ8e8nN0q0a8m9s8KQ0+test+key+notreal=";
+        // A second, independently generated minisign public key: a real `minisign -G` key that
+        // decodes cleanly but has a different identity than the one that signed TEST_SIGNATURE.
+        // Using a decodable key forces the failure to come from the signature-verification path
+        // (key-identity mismatch) rather than from PublicKey::from_base64 rejecting a malformed
+        // key, so the test actually exercises wrong-key rejection.
+        const OTHER_PUBKEY: &str = "RWQnIMk+pdjJa4eSAEITESCXvOCY2OJwA816B1pjMHpFo+UePEaOO177";
+        // Sanity-check that the key decodes, so a future typo can't silently revert this to a
+        // parse-failure test.
+        PublicKey::from_base64(OTHER_PUBKEY)
+            .expect("test wrong-key must be a decodable minisign key");
         let err = verify_with_keys(TEST_PAYLOAD, TEST_SIGNATURE.as_bytes(), &[OTHER_PUBKEY])
             .expect_err("wrong key must fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
