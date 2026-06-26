@@ -2,7 +2,7 @@ name: Close pending-release issues
 
 on:
   push:
-    branches: [master, mx]
+    branches: [master]
 
 permissions:
   contents: read
