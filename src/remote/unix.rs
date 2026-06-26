@@ -26,6 +26,9 @@ const CURRENT_VERSION: &str = crate::build_info::FULL_VERSION;
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
 const UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
+// When set to "1", an override binary (`HERDR_REMOTE_BINARY`) with no sibling `.minisig` is refused
+// instead of seeded with a warning — for operators who want every seeded binary signature-verified.
+const REMOTE_BINARY_REQUIRE_SIG_ENV_VAR: &str = "HERDR_REMOTE_BINARY_REQUIRE_SIGNATURE";
 const REMOTE_BRIDGE_PROBE_ENV_VAR: &str = "HERDR_REMOTE_BRIDGE_PROBE";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const MAIN_DISPLAY_NAME_ENV_VAR: &str = "HERDR_MAIN_DISPLAY_NAME";
@@ -1249,8 +1252,10 @@ fn resolve_install_source(
 }
 
 /// Verify an operator-provided override binary (`HERDR_REMOTE_BINARY`). If a sibling
-/// `<path>.minisig` exists it MUST verify (fail closed); if absent, the operator explicitly chose
-/// this path, so we proceed with a warning rather than block a from-source or air-gapped workflow.
+/// `<path>.minisig` exists it MUST verify (fail closed). If absent, the operator explicitly chose
+/// this path, so by default we proceed with a warning rather than block a from-source or air-gapped
+/// workflow — unless `HERDR_REMOTE_BINARY_REQUIRE_SIGNATURE=1`, in which case a missing sidecar is a
+/// hard failure so every seeded binary is signature-verified.
 fn verify_override_binary(path: &Path) -> io::Result<()> {
     let mut sig_os = path.as_os_str().to_owned();
     sig_os.push(".minisig");
@@ -1258,6 +1263,19 @@ fn verify_override_binary(path: &Path) -> io::Result<()> {
     match fs::read(&sig_path) {
         Ok(signature) => crate::signing::verify_signature(path, &signature),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if matches!(
+                std::env::var(REMOTE_BINARY_REQUIRE_SIG_ENV_VAR).as_deref(),
+                Ok("1")
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{REMOTE_BINARY_ENV_VAR} binary {} has no sibling .minisig and \
+                         {REMOTE_BINARY_REQUIRE_SIG_ENV_VAR}=1; refusing to seed an unverified binary",
+                        path.display()
+                    ),
+                ));
+            }
             tracing::warn!(
                 path = %path.display(),
                 "{REMOTE_BINARY_ENV_VAR} binary has no sibling .minisig; seeding it unverified (operator-provided)"
@@ -2088,14 +2106,20 @@ fn install_remote_herdr(
     remote_herdr: &RemoteHerdr,
     source_path: &Path,
 ) -> io::Result<()> {
+    // mktemp the staging file rather than a predictable "$dest.tmp.$$": `cat >` follows symlinks, so
+    // a guessable name in $HOME could be pre-planted (symlink redirect / pre-created file). mktemp
+    // creates an exclusive, unpredictable, owner-only file (no symlink follow), then we chmod+mv it
+    // into place.
     let script = format!(
         r#"dest="$HOME/{install_suffix}"
 dir="${{dest%/*}}"
 mkdir -p "$dir"
-tmp="${{dest}}.tmp.$$"
+tmp="$(mktemp "${{dest}}.tmp.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
 cat > "$tmp"
 chmod 755 "$tmp"
 mv "$tmp" "$dest"
+trap - EXIT
 "#,
         install_suffix = remote_herdr.install_suffix
     );
@@ -3383,6 +3407,59 @@ mod tests {
         };
         let err = verify_optional_sha256(&path, &asset).expect_err("bad sha256 must fail");
         assert!(err.to_string().contains("sha256 mismatch"), "got: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    #[test]
+    fn verify_override_binary_warns_but_allows_missing_sidecar_by_default() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let _restore = RestoreEnv(
+            REMOTE_BINARY_REQUIRE_SIG_ENV_VAR,
+            std::env::var_os(REMOTE_BINARY_REQUIRE_SIG_ENV_VAR),
+        );
+        std::env::remove_var(REMOTE_BINARY_REQUIRE_SIG_ENV_VAR);
+
+        let dir =
+            std::env::temp_dir().join(format!("herdr-override-default-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("herdr");
+        fs::write(&path, b"binary").unwrap();
+        // No sibling .minisig and no strict env: operator-provided override is seeded with a warning.
+        verify_override_binary(&path).expect("missing sidecar is allowed by default");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_override_binary_requires_signature_when_env_set() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let _restore = RestoreEnv(
+            REMOTE_BINARY_REQUIRE_SIG_ENV_VAR,
+            std::env::var_os(REMOTE_BINARY_REQUIRE_SIG_ENV_VAR),
+        );
+        std::env::set_var(REMOTE_BINARY_REQUIRE_SIG_ENV_VAR, "1");
+
+        let dir =
+            std::env::temp_dir().join(format!("herdr-override-strict-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("herdr");
+        fs::write(&path, b"binary").unwrap();
+        // With the strict env set, a missing sidecar fails closed instead of warning.
+        let err = verify_override_binary(&path).expect_err("missing sidecar must fail closed");
+        assert!(
+            err.to_string()
+                .contains("refusing to seed an unverified binary"),
+            "got: {err}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
