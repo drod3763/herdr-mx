@@ -35,11 +35,11 @@ const NIX_UPDATE_COMMAND: &str = "update through Nix";
 // herdr that lacks the multi-remote client.
 const MX_BUILD_CHANNEL: &str = "mx";
 const MX_HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr-mx";
+const MX_HOMEBREW_PREVIEW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr-mx-preview";
 // mx is installed via a ubi backend (`mise use -g "ubi:drod3763/herdr-mx[exe=herdr]"`),
 // so the mise tool name is not `herdr` and `mise upgrade herdr` would target the wrong
-// tool. Bare `mise upgrade` (the command documented in the README) upgrades the install
-// regardless of its backend-derived tool name.
-const MX_MISE_UPDATE_COMMAND: &str = "mise upgrade";
+// tool. Scope the upgrade to the mx tool id so it does not upgrade every mise-managed tool.
+const MX_MISE_UPDATE_COMMAND: &str = "mise upgrade ubi:drod3763/herdr-mx";
 const MX_RELEASES_UPDATE_COMMAND: &str =
     "install a newer herdr-mx from https://github.com/drod3763/herdr-mx/releases";
 const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
@@ -1932,44 +1932,39 @@ fn print_running_session_update_outcomes(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn update_install_command() -> &'static str {
-    let channel = crate::build_info::channel();
     // mx installs under the `herdr-mx` Homebrew formula and a ubi-backend mise tool
-    // directory, neither named `herdr`, so the strict detectors miss them; use the
-    // relaxed mx detectors for mx builds.
-    let (is_homebrew, is_mise) = if channel == MX_BUILD_CHANNEL {
-        (
-            is_mx_homebrew_managed_install(),
+    // directory, neither named `herdr`, so the strict detectors miss them; mx uses its
+    // own relaxed, formula-aware routing.
+    if crate::build_info::channel() == MX_BUILD_CHANNEL {
+        return select_mx_update_command(
+            mx_homebrew_formula_for_current_install().as_deref(),
             is_mx_mise_managed_install(),
-        )
-    } else {
-        (is_homebrew_managed_install(), is_mise_managed_install())
-    };
-    select_update_command(channel, is_homebrew, is_mise, is_nix_managed_install())
+        );
+    }
+    select_update_command(
+        is_homebrew_managed_install(),
+        is_mise_managed_install(),
+        is_nix_managed_install(),
+    )
 }
 
-/// Pure mapping from build channel + detected install manager to the command we tell
-/// the user to run. Split out from [`update_install_command`] so the mx routing can be
-/// tested: `build_info::channel()` is compile-time, so the live `mx` branch is otherwise
-/// unreachable from a stable-channel test build.
+/// mx self-update is disabled, so route mx installs to the package manager that owns the
+/// running binary. `homebrew_formula` is the Cellar formula directory name when the binary
+/// is a Homebrew keg, so preview installs (`herdr-mx-preview`) upgrade their own formula
+/// rather than the stable one. Falls back to mise, then a manual GitHub releases install.
 ///
-/// mx self-update is disabled, so mx installs are routed to the owning package manager
-/// (Homebrew or mise — both advertised in the README install section) and only fall back
-/// to a manual GitHub releases install when no managed install is detected.
-fn select_update_command(
-    channel: &str,
-    is_homebrew: bool,
-    is_mise: bool,
-    is_nix: bool,
-) -> &'static str {
-    if channel == MX_BUILD_CHANNEL {
-        if is_homebrew {
-            return MX_HOMEBREW_UPDATE_COMMAND;
-        }
-        if is_mise {
-            return MX_MISE_UPDATE_COMMAND;
-        }
-        return MX_RELEASES_UPDATE_COMMAND;
+/// Split out from [`update_install_command`] so it can be tested: `build_info::channel()`
+/// is compile-time, so the live `mx` path is otherwise unreachable from a stable test build.
+fn select_mx_update_command(homebrew_formula: Option<&str>, is_mise: bool) -> &'static str {
+    match homebrew_formula {
+        Some("herdr-mx-preview") => MX_HOMEBREW_PREVIEW_UPDATE_COMMAND,
+        Some(_) => MX_HOMEBREW_UPDATE_COMMAND,
+        None if is_mise => MX_MISE_UPDATE_COMMAND,
+        None => MX_RELEASES_UPDATE_COMMAND,
     }
+}
+
+fn select_update_command(is_homebrew: bool, is_mise: bool, is_nix: bool) -> &'static str {
     if is_homebrew {
         HOMEBREW_UPDATE_COMMAND
     } else if is_mise {
@@ -2008,28 +2003,27 @@ fn is_homebrew_managed_install() -> bool {
     is_homebrew_managed_exe_path_following_links(&current_exe)
 }
 
-/// Relaxed Homebrew detection for mx builds, which install under the `herdr-mx` /
-/// `herdr-mx-preview` Cellar formula rather than `herdr`. See [`is_mx_mise_managed_install`]
-/// for the analogous mise case.
-fn is_mx_homebrew_managed_install() -> bool {
-    let Ok(current_exe) = env::current_exe() else {
-        return false;
-    };
-
-    is_mx_homebrew_managed_exe_path_following_links(&current_exe)
+/// The mx Homebrew formula (`herdr-mx` or `herdr-mx-preview`) that owns the running binary,
+/// or `None` when it is not a Homebrew keg. mx installs under those formulae rather than
+/// `herdr`, and preview vs stable must route to different `brew upgrade` targets — so this
+/// returns the formula name, not a bool. See [`is_mx_mise_managed_install`] for the mise case.
+fn mx_homebrew_formula_for_current_install() -> Option<String> {
+    let current_exe = env::current_exe().ok()?;
+    mx_homebrew_formula_name(&current_exe).or_else(|| {
+        let canonical = current_exe.canonicalize().ok()?;
+        mx_homebrew_formula_name(&canonical)
+    })
 }
 
-fn is_mx_homebrew_managed_exe_path_following_links(path: &Path) -> bool {
-    if is_mx_homebrew_managed_exe_path(path) {
-        return true;
-    }
-
-    path.canonicalize()
-        .is_ok_and(|path| is_mx_homebrew_managed_exe_path(&path))
-}
-
-fn is_mx_homebrew_managed_exe_path(path: &Path) -> bool {
-    homebrew_cellar_keg_root_impl(path, true).is_some()
+fn mx_homebrew_formula_name(path: &Path) -> Option<String> {
+    let version_dir = homebrew_cellar_keg_root_impl(path, true)?;
+    Some(
+        version_dir
+            .parent()?
+            .file_name()?
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn is_nix_managed_install() -> bool {
@@ -2584,30 +2578,27 @@ mod tests {
     }
 
     #[test]
-    fn mx_install_command_routes_to_each_package_manager() {
-        // Homebrew-managed mx install → mx Homebrew upgrade.
+    fn mx_update_command_routes_by_install_manager() {
+        // Stable Homebrew formula → stable mx Homebrew upgrade.
         assert_eq!(
-            select_update_command(MX_BUILD_CHANNEL, true, false, false),
+            select_mx_update_command(Some("herdr-mx"), false),
             MX_HOMEBREW_UPDATE_COMMAND
         );
-        // mise-managed mx install → mx mise upgrade, not a manual releases install.
+        // Preview Homebrew formula → its own formula, not the stable one.
         assert_eq!(
-            select_update_command(MX_BUILD_CHANNEL, false, true, false),
-            MX_MISE_UPDATE_COMMAND
+            select_mx_update_command(Some("herdr-mx-preview"), false),
+            MX_HOMEBREW_PREVIEW_UPDATE_COMMAND
         );
-        // Homebrew wins when both managers somehow match.
+        // Homebrew wins over a mise match.
         assert_eq!(
-            select_update_command(MX_BUILD_CHANNEL, true, true, false),
+            select_mx_update_command(Some("herdr-mx"), true),
             MX_HOMEBREW_UPDATE_COMMAND
         );
-        // mx is not distributed through Nix, so a direct/unmanaged mx install falls
-        // back to the GitHub releases install.
+        // mise-managed mx install → scoped mise upgrade, not a manual releases install.
+        assert_eq!(select_mx_update_command(None, true), MX_MISE_UPDATE_COMMAND);
+        // No managed install → manual GitHub releases install.
         assert_eq!(
-            select_update_command(MX_BUILD_CHANNEL, false, false, true),
-            MX_RELEASES_UPDATE_COMMAND
-        );
-        assert_eq!(
-            select_update_command(MX_BUILD_CHANNEL, false, false, false),
+            select_mx_update_command(None, false),
             MX_RELEASES_UPDATE_COMMAND
         );
     }
@@ -2615,19 +2606,19 @@ mod tests {
     #[test]
     fn stable_install_command_unchanged_by_mx_routing() {
         assert_eq!(
-            select_update_command("stable", true, false, false),
+            select_update_command(true, false, false),
             HOMEBREW_UPDATE_COMMAND
         );
         assert_eq!(
-            select_update_command("stable", false, true, false),
+            select_update_command(false, true, false),
             MISE_UPDATE_COMMAND
         );
         assert_eq!(
-            select_update_command("stable", false, false, true),
+            select_update_command(false, false, true),
             NIX_UPDATE_COMMAND
         );
         assert_eq!(
-            select_update_command("stable", false, false, false),
+            select_update_command(false, false, false),
             HERDR_UPDATE_COMMAND
         );
     }
@@ -2889,7 +2880,7 @@ mod tests {
     }
 
     #[test]
-    fn mx_homebrew_cellar_path_is_detected() {
+    fn mx_homebrew_cellar_path_resolves_formula() {
         // `brew install drod3763/tap/herdr-mx` installs under the `herdr-mx` formula
         // (preview under `herdr-mx-preview`); the binary is still `herdr`.
         let stable = Path::new("/opt/homebrew/Cellar/herdr-mx/0.7.1/bin/herdr");
@@ -2897,20 +2888,24 @@ mod tests {
         // The strict (upstream-formula) detector requires a `herdr` formula and misses these.
         assert!(!is_homebrew_managed_exe_path(stable));
         assert!(!is_homebrew_managed_exe_path(preview));
-        // The relaxed mx detector recognizes the mx formulae.
-        assert!(is_mx_homebrew_managed_exe_path(stable));
-        assert!(is_mx_homebrew_managed_exe_path(preview));
+        // The relaxed mx resolver returns the exact formula so routing stays formula-specific.
+        assert_eq!(
+            mx_homebrew_formula_name(stable).as_deref(),
+            Some("herdr-mx")
+        );
+        assert_eq!(
+            mx_homebrew_formula_name(preview).as_deref(),
+            Some("herdr-mx-preview")
+        );
     }
 
     #[test]
-    fn mx_homebrew_detection_rejects_non_cellar() {
-        assert!(!is_mx_homebrew_managed_exe_path(Path::new(
-            "/usr/local/bin/herdr"
-        )));
+    fn mx_homebrew_formula_rejects_non_cellar() {
+        assert!(mx_homebrew_formula_name(Path::new("/usr/local/bin/herdr")).is_none());
         // An unrelated mx-prefixed formula directory outside Cellar must not match.
-        assert!(!is_mx_homebrew_managed_exe_path(Path::new(
-            "/opt/homebrew/opt/herdr-mx/bin/herdr"
-        )));
+        assert!(
+            mx_homebrew_formula_name(Path::new("/opt/homebrew/opt/herdr-mx/bin/herdr")).is_none()
+        );
     }
 
     #[test]

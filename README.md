@@ -75,7 +75,7 @@ herdr-mx updates ship through your package manager, not the built-in updater:
 
 ```bash
 brew upgrade herdr-mx        # Homebrew
-mise upgrade                 # mise
+mise upgrade ubi:drod3763/herdr-mx   # mise
 ```
 
 or install a newer binary from [releases](https://github.com/drod3763/herdr-mx/releases). `herdr update` and the herdr.dev update channels are intentionally disabled in mx builds — they would replace this binary with a stock herdr that lacks the multi-remote client. After updating, use the same stop-and-run-again flow as upstream if a session is still running the old server.
