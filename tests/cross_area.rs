@@ -1162,7 +1162,10 @@ fn cross_area_server_kill_then_restart_and_reconnect() {
 
     let mut crash_output = String::new();
     let thin_exited = {
-        let deadline = Instant::now() + Duration::from_secs(12);
+        // Loaded CI runners (notably macOS) can take well over the client's local
+        // ~5s exit latency to schedule the connection-loss detection and teardown,
+        // so allow generous headroom to keep this from flaking.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut exited = false;
         let mut buf = [0u8; 1024];
         while Instant::now() < deadline {
