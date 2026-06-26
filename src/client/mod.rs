@@ -77,7 +77,7 @@ const ADD_REMOTE_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 // ---------------------------------------------------------------------------
 
 // Constructed only by code paths dropped in the v0.7.1 merge; retained pending rewiring
-// (see drod3763/herdr-mx#1).
+// (see drod3763/herdr-mx#4).
 #[allow(dead_code)]
 struct ClientLoopConfig {
     sound_config: crate::config::SoundConfig,
@@ -113,7 +113,7 @@ struct ClientState {
     #[cfg(unix)]
     mouse_scroll_lines: usize,
     /// Local-client shortcut that sends a clipboard image to a remote Herdr session.
-    /// Reader was dropped in the v0.7.1 merge; retained pending rewiring (see drod3763/herdr-mx#1).
+    /// Reader was dropped in the v0.7.1 merge; retained pending rewiring (see drod3763/herdr-mx#4).
     #[cfg(unix)]
     #[allow(dead_code)]
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
