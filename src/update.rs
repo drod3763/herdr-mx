@@ -6,6 +6,7 @@
 //! Uses `curl` as a subprocess for HTTP — no additional Rust HTTP dependencies.
 //! JSON parsing uses serde_json (already in deps for persistence).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::env;
 #[cfg(not(windows))]
@@ -36,10 +37,10 @@ const NIX_UPDATE_COMMAND: &str = "update through Nix";
 const MX_BUILD_CHANNEL: &str = "mx";
 const MX_HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr-mx";
 const MX_HOMEBREW_PREVIEW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr-mx-preview";
-// mx is installed via a ubi backend (`mise use -g "ubi:drod3763/herdr-mx[exe=herdr]"`),
-// so the mise tool name is not `herdr` and `mise upgrade herdr` would target the wrong
-// tool. Scope the upgrade to the mx tool id so it does not upgrade every mise-managed tool.
-const MX_MISE_UPDATE_COMMAND: &str = "mise upgrade ubi:drod3763/herdr-mx";
+// mx mise installs use a ubi backend (`mise use -g "ubi:drod3763/herdr-mx[exe=herdr]"`), so
+// the tool id is not `herdr`. The mise upgrade command is built per-install from the detected
+// tool id (see `select_mx_update_command`) so it targets the tool that owns the running
+// binary and does not upgrade every mise-managed tool.
 const MX_RELEASES_UPDATE_COMMAND: &str =
     "install a newer herdr-mx from https://github.com/drod3763/herdr-mx/releases";
 const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
@@ -1931,36 +1932,43 @@ fn print_running_session_update_outcomes(
 // Installation manager detection
 // ---------------------------------------------------------------------------
 
-pub(crate) fn update_install_command() -> &'static str {
+pub(crate) fn update_install_command() -> Cow<'static, str> {
     // mx installs under the `herdr-mx` Homebrew formula and a ubi-backend mise tool
     // directory, neither named `herdr`, so the strict detectors miss them; mx uses its
-    // own relaxed, formula-aware routing.
+    // own relaxed, formula-/tool-aware routing.
     if crate::build_info::channel() == MX_BUILD_CHANNEL {
         return select_mx_update_command(
             mx_homebrew_formula_for_current_install().as_deref(),
-            is_mx_mise_managed_install(),
+            mx_mise_tool_for_current_install().as_deref(),
         );
     }
-    select_update_command(
+    Cow::Borrowed(select_update_command(
         is_homebrew_managed_install(),
         is_mise_managed_install(),
         is_nix_managed_install(),
-    )
+    ))
 }
 
 /// mx self-update is disabled, so route mx installs to the package manager that owns the
 /// running binary. `homebrew_formula` is the Cellar formula directory name when the binary
 /// is a Homebrew keg, so preview installs (`herdr-mx-preview`) upgrade their own formula
-/// rather than the stable one. Falls back to mise, then a manual GitHub releases install.
+/// rather than the stable one. `mise_tool` is the mise tool id that owns the binary, so the
+/// upgrade targets that exact tool rather than a hardcoded id. Falls back to a manual GitHub
+/// releases install when no managed install is detected.
 ///
 /// Split out from [`update_install_command`] so it can be tested: `build_info::channel()`
 /// is compile-time, so the live `mx` path is otherwise unreachable from a stable test build.
-fn select_mx_update_command(homebrew_formula: Option<&str>, is_mise: bool) -> &'static str {
+fn select_mx_update_command(
+    homebrew_formula: Option<&str>,
+    mise_tool: Option<&str>,
+) -> Cow<'static, str> {
     match homebrew_formula {
-        Some("herdr-mx-preview") => MX_HOMEBREW_PREVIEW_UPDATE_COMMAND,
-        Some(_) => MX_HOMEBREW_UPDATE_COMMAND,
-        None if is_mise => MX_MISE_UPDATE_COMMAND,
-        None => MX_RELEASES_UPDATE_COMMAND,
+        Some("herdr-mx-preview") => Cow::Borrowed(MX_HOMEBREW_PREVIEW_UPDATE_COMMAND),
+        Some(_) => Cow::Borrowed(MX_HOMEBREW_UPDATE_COMMAND),
+        None => match mise_tool {
+            Some(tool) => Cow::Owned(format!("mise upgrade {tool}")),
+            None => Cow::Borrowed(MX_RELEASES_UPDATE_COMMAND),
+        },
     }
 }
 
@@ -2042,29 +2050,30 @@ fn is_mise_managed_install() -> bool {
     is_mise_managed_exe_path_following_links(&current_exe)
 }
 
-/// Relaxed mise detection for mx builds. mx is installed via a ubi backend
-/// (`ubi:drod3763/herdr-mx`), which mise stores under a backend-derived tool directory
-/// rather than `herdr`, so [`is_mise_managed_install`] misses it. This variant keys only
-/// on the `installs/<tool>/<version>/bin/herdr` shape and accepts any tool directory.
-fn is_mx_mise_managed_install() -> bool {
-    let Ok(current_exe) = env::current_exe() else {
-        return false;
-    };
-
-    is_mx_mise_managed_exe_path_following_links(&current_exe)
+/// The mise tool id that owns the running binary on an mx build, or `None` when it is not
+/// a mise install. mx is installed via a ubi backend (`ubi:drod3763/herdr-mx`), which mise
+/// stores under a backend-derived tool directory rather than `herdr`, so the strict detector
+/// misses it. Returning the tool directory name (rather than a bool) lets the upgrade command
+/// target the tool that actually owns this binary instead of a hardcoded id — an install
+/// under a different tool (e.g. a legacy `ubi:2lab-ai/herdr-mx`) is upgraded by its own name.
+fn mx_mise_tool_for_current_install() -> Option<String> {
+    let current_exe = env::current_exe().ok()?;
+    mx_mise_tool_name(&current_exe).or_else(|| {
+        let canonical = current_exe.canonicalize().ok()?;
+        mx_mise_tool_name(&canonical)
+    })
 }
 
-fn is_mx_mise_managed_exe_path_following_links(path: &Path) -> bool {
-    if is_mx_mise_managed_exe_path(path) {
-        return true;
-    }
-
-    path.canonicalize()
-        .is_ok_and(|path| is_mx_mise_managed_exe_path(&path))
-}
-
-fn is_mx_mise_managed_exe_path(path: &Path) -> bool {
-    mise_install_root_impl(path, true).is_some()
+fn mx_mise_tool_name(path: &Path) -> Option<String> {
+    // `allow_any_tool` keys only on the `installs/<tool>/<version>/bin/herdr` shape.
+    let version_dir = mise_install_root_impl(path, true)?;
+    Some(
+        version_dir
+            .parent()?
+            .file_name()?
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 pub(crate) fn preview_channel_rejection_for_current_install() -> Option<&'static str> {
@@ -2262,7 +2271,7 @@ fn homebrew_cellar_keg_root_impl(path: &Path, allow_mx_formulae: bool) -> Option
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     if crate::build_info::channel() == MX_BUILD_CHANNEL {
         return Err(format!(
-            "self-update is disabled for herdr-mx builds; run `{MX_HOMEBREW_UPDATE_COMMAND}` for Homebrew installs or `{MX_MISE_UPDATE_COMMAND}` for mise installs, or {MX_RELEASES_UPDATE_COMMAND}"
+            "self-update is disabled for herdr-mx builds; run `{MX_HOMEBREW_UPDATE_COMMAND}` for Homebrew installs or upgrade the herdr-mx tool through mise, or {MX_RELEASES_UPDATE_COMMAND}"
         ));
     }
     let channel = UpdateChannel::configured();
@@ -2581,24 +2590,33 @@ mod tests {
     fn mx_update_command_routes_by_install_manager() {
         // Stable Homebrew formula → stable mx Homebrew upgrade.
         assert_eq!(
-            select_mx_update_command(Some("herdr-mx"), false),
+            select_mx_update_command(Some("herdr-mx"), None),
             MX_HOMEBREW_UPDATE_COMMAND
         );
         // Preview Homebrew formula → its own formula, not the stable one.
         assert_eq!(
-            select_mx_update_command(Some("herdr-mx-preview"), false),
+            select_mx_update_command(Some("herdr-mx-preview"), None),
             MX_HOMEBREW_PREVIEW_UPDATE_COMMAND
         );
         // Homebrew wins over a mise match.
         assert_eq!(
-            select_mx_update_command(Some("herdr-mx"), true),
+            select_mx_update_command(Some("herdr-mx"), Some("ubi:drod3763/herdr-mx")),
             MX_HOMEBREW_UPDATE_COMMAND
         );
-        // mise-managed mx install → scoped mise upgrade, not a manual releases install.
-        assert_eq!(select_mx_update_command(None, true), MX_MISE_UPDATE_COMMAND);
+        // mise-managed mx install → upgrade the detected tool, not a hardcoded id and not
+        // every mise tool.
+        assert_eq!(
+            select_mx_update_command(None, Some("ubi:drod3763/herdr-mx")),
+            "mise upgrade ubi:drod3763/herdr-mx"
+        );
+        // A legacy/foreign mise tool is upgraded by its own id, not rewritten to drod3763.
+        assert_eq!(
+            select_mx_update_command(None, Some("ubi-2lab-ai-herdr-mx")),
+            "mise upgrade ubi-2lab-ai-herdr-mx"
+        );
         // No managed install → manual GitHub releases install.
         assert_eq!(
-            select_mx_update_command(None, false),
+            select_mx_update_command(None, None),
             MX_RELEASES_UPDATE_COMMAND
         );
     }
@@ -2934,7 +2952,7 @@ mod tests {
     }
 
     #[test]
-    fn mx_mise_ubi_backend_install_path_is_detected() {
+    fn mx_mise_ubi_backend_install_resolves_tool() {
         // `mise use -g "ubi:drod3763/herdr-mx[exe=herdr]"` installs under a backend-derived
         // tool directory (not `herdr`); the binary is still `<tool>/<version>/bin/herdr`.
         let path = Path::new(
@@ -2942,16 +2960,17 @@ mod tests {
         );
         // The strict (upstream-registry) detector requires a `herdr` tool dir and misses it.
         assert!(!is_mise_managed_exe_path(path));
-        // The relaxed mx detector recognizes it so mx mise installs get mise update guidance.
-        assert!(is_mx_mise_managed_exe_path(path));
+        // The relaxed mx resolver returns the owning tool id so the upgrade targets it.
+        assert_eq!(
+            mx_mise_tool_name(path).as_deref(),
+            Some("ubi-drod3763-herdr-mx")
+        );
     }
 
     #[test]
     fn mx_mise_relaxed_detection_still_requires_installs_structure() {
         // A bare direct install must not be misread as mise even under the relaxed mx check.
-        assert!(!is_mx_mise_managed_exe_path(Path::new(
-            "/home/user/.local/bin/herdr"
-        )));
+        assert!(mx_mise_tool_name(Path::new("/home/user/.local/bin/herdr")).is_none());
     }
 
     #[test]
