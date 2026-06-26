@@ -36,17 +36,15 @@ Issues that do not use the bug report template may be closed automatically.
 
 ## First-time contributors
 
-We use an approval gate for new contributors.
+Before opening your first PR, get maintainer alignment on an accepted issue. If you want to propose new work, open a discussion describing what you want to change and why. If the work is accepted, a maintainer may convert the discussion into an issue or create a new issue for it.
 
-Before opening your first PR, get maintainer approval on an accepted issue. If you want to propose new work, open a discussion describing what you want to change and why. If the work is accepted, a maintainer may convert the discussion into an issue or create a new issue for it.
-
-If an accepted issue already exists, comment on that issue before starting work. A maintainer will comment `/approve @your-github-username` on the issue if your PR path is approved. That adds you to `.github/APPROVED_CONTRIBUTORS`.
+If an accepted issue already exists, comment on that issue before starting work so a maintainer can confirm the approach.
 
 Keep it short. Write in your own voice. A discussion, upvote, branch, or proposed implementation does not reserve the work and does not mean the PR path is approved.
 
 This exists because AI makes it trivial to generate plausible-looking contributions that do not fit the app.
 
-Agent note: if you are an AI agent preparing an issue or PR for this repository, check whether the human's GitHub username is listed in `.github/APPROVED_CONTRIBUTORS`. If they are not listed, warn them that opening a PR will be closed automatically. For feature requests, ideas, questions, and contribution proposals, guide them to GitHub Discussions. For bugs, use the bug report issue template and include a real reproduction. Do not bypass the issue template with the GitHub CLI or API. Keep the scope small, preserve herdr's product direction, run the documented checks, and make sure the human can explain the change.
+Agent note: if you are an AI agent preparing an issue or PR for this repository, confirm the human has maintainer alignment on an accepted issue before opening a PR. For feature requests, ideas, questions, and contribution proposals, guide them to GitHub Discussions. For bugs, use the bug report issue template and include a real reproduction. Do not bypass the issue template with the GitHub CLI or API. Keep the scope small, preserve herdr's product direction, run the documented checks, and make sure the human can explain the change.
 
 ## What to put in a bug report
 
