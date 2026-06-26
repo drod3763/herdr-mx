@@ -22,6 +22,7 @@ pub(crate) fn run_bundle_command(args: &[String]) -> std::io::Result<i32> {
     match subcommand {
         "list" => run_list(&args[1..]),
         "pack" => run_pack(&args[1..]),
+        "verify" => run_verify(&args[1..]),
         "help" | "--help" | "-h" => {
             print_bundle_help();
             Ok(0)
@@ -39,6 +40,10 @@ fn print_bundle_help() {
     eprintln!("  herdr bundle list [path] [--json]   Show platforms carried by a herdr binary");
     eprintln!("  herdr bundle pack --carrier <path> --output <path> \\");
     eprintln!("      --binary <os>-<arch>=<path> [--binary ...] [--version <v>] [--commit <c>]");
+    eprintln!(
+        "  herdr bundle verify <path> [--sig <path>]   Verify a minisign signature against the"
+    );
+    eprintln!("                                              embedded release key (default sig: <path>.minisig)");
     eprintln!();
     eprintln!("A fat binary still runs natively; it carries sibling-platform binaries as");
     eprintln!("appended data so `herdr --remote <host>` can seed a different OS/arch offline.");
@@ -90,6 +95,81 @@ fn run_list(args: &[String]) -> std::io::Result<i32> {
         print!("{}", list_text(index.as_ref(), native.as_deref()));
     }
     Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// bundle verify
+// ---------------------------------------------------------------------------
+
+fn run_verify(args: &[String]) -> std::io::Result<i32> {
+    let mut path: Option<PathBuf> = None;
+    let mut sig: Option<PathBuf> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--sig" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("--sig requires a path");
+                    return Ok(2);
+                };
+                sig = Some(PathBuf::from(value));
+            }
+            "help" | "--help" | "-h" => {
+                print_bundle_help();
+                return Ok(0);
+            }
+            other if other.starts_with('-') => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+            other => {
+                if path.is_some() {
+                    eprintln!("usage: herdr bundle verify <path> [--sig <path>]");
+                    return Ok(2);
+                }
+                path = Some(PathBuf::from(other));
+            }
+        }
+    }
+
+    let Some(path) = path else {
+        eprintln!("usage: herdr bundle verify <path> [--sig <path>]");
+        return Ok(2);
+    };
+    // Default to the conventional sibling sidecar.
+    let sig_path = sig.unwrap_or_else(|| {
+        let mut os = path.clone().into_os_string();
+        os.push(".minisig");
+        PathBuf::from(os)
+    });
+
+    let signature = match std::fs::read(&sig_path) {
+        Ok(signature) => signature,
+        Err(err) => {
+            // A missing or unreadable sidecar is a common, user-facing failure for this command;
+            // report it like any other verification failure (clear message, exit code 1) rather
+            // than as a generic top-level I/O error.
+            eprintln!(
+                "FAILED: cannot read signature {}: {err}",
+                sig_path.display()
+            );
+            return Ok(1);
+        }
+    };
+    match crate::signing::verify_signature(&path, &signature) {
+        Ok(()) => {
+            println!(
+                "OK: {} verified against {}",
+                path.display(),
+                sig_path.display()
+            );
+            Ok(0)
+        }
+        Err(err) => {
+            eprintln!("FAILED: {} did not verify: {err}", path.display());
+            Ok(1)
+        }
+    }
 }
 
 /// JSON view of a binary's carried platforms (or absence of a bundle).
@@ -435,7 +515,7 @@ mod tests {
 
     fn sample_index() -> BundleIndex {
         BundleIndex {
-            format: 1,
+            format: 2,
             herdr_version: "0.6.4".into(),
             build_commit: Some("abc1234".into()),
             image_len: 1000,
@@ -447,6 +527,7 @@ mod tests {
                     compressed_len: 300,
                     uncompressed_len: 900,
                     crc32: 1,
+                    sha256: String::new(),
                 },
                 bundle::BundleEntry {
                     os: "macos".into(),
@@ -455,6 +536,7 @@ mod tests {
                     compressed_len: 250,
                     uncompressed_len: 800,
                     crc32: 2,
+                    sha256: String::new(),
                 },
             ],
         }

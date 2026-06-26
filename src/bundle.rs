@@ -23,7 +23,7 @@
 //! ```text
 //! index_offset  u64     absolute offset of the index JSON
 //! index_len     u64     length of the index JSON in bytes
-//! format        u32     bundle format version (currently 1)
+//! format        u32     bundle format version (currently 2)
 //! magic         [u8;8]  b"HERDRBND"
 //! ```
 
@@ -32,12 +32,17 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Trailing 8-byte marker identifying a herdr fat bundle.
 const MAGIC: &[u8; 8] = b"HERDRBND";
 /// Current bundle format version. Bumped on incompatible layout changes; readers
 /// that see a newer version fall back cleanly (treat the file as un-bundled).
-const FORMAT_VERSION: u32 = 1;
+///
+/// v2 adds a per-entry SHA-256 over the uncompressed payload: CRC-32 stays as a cheap
+/// corruption guard, while SHA-256 is the integrity-grade check that pairs with the
+/// signature layer (see [`crate::signing`]) before a carried binary is run or seeded.
+const FORMAT_VERSION: u32 = 2;
 /// Fixed footer size: index_offset(8) + index_len(8) + format(4) + magic(8).
 const FOOTER_LEN: u64 = 28;
 /// deflate compression level for appended binaries. Higher than the wire render path (level 1,
@@ -57,8 +62,10 @@ pub(crate) struct BundleEntry {
     pub offset: u64,
     pub compressed_len: u64,
     pub uncompressed_len: u64,
-    /// IEEE CRC-32 of the uncompressed bytes (integrity check on extract).
+    /// IEEE CRC-32 of the uncompressed bytes (cheap corruption check on extract).
     pub crc32: u32,
+    /// Lowercase-hex SHA-256 of the uncompressed bytes (integrity-grade check on extract).
+    pub sha256: String,
 }
 
 impl BundleEntry {
@@ -116,6 +123,22 @@ pub(crate) fn local_os_arch() -> Option<(&'static str, &'static str)> {
         return None;
     };
     Some((os, arch))
+}
+
+/// Lowercase-hex SHA-256 of in-memory bytes. Lives here rather than in `checksum` (which is
+/// gated `#[cfg(not(windows))]`) so the unconditionally-compiled bundle path verifies on every
+/// target, including the Windows preview build.
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let digest = hasher.finalize();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for &byte in digest.iter() {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// IEEE CRC-32 (reflected, polynomial 0xEDB88320) of `data`.
@@ -232,6 +255,12 @@ pub(crate) fn extract_entry(path: &Path, entry: &BundleEntry) -> io::Result<Vec<
             entry.asset_key()
         )));
     }
+    if sha256_hex(&bytes) != entry.sha256 {
+        return Err(io::Error::other(format!(
+            "{} payload failed SHA-256 check",
+            entry.asset_key()
+        )));
+    }
     Ok(bytes)
 }
 
@@ -252,6 +281,7 @@ struct RawPart {
     compressed: Vec<u8>,
     uncompressed_len: u64,
     crc32: u32,
+    sha256: String,
 }
 
 impl RawPart {
@@ -262,6 +292,7 @@ impl RawPart {
             compressed: miniz_oxide::deflate::compress_to_vec(raw, COMPRESSION_LEVEL),
             uncompressed_len: raw.len() as u64,
             crc32: crc32(raw),
+            sha256: sha256_hex(raw),
         }
     }
 }
@@ -287,6 +318,7 @@ fn assemble(
             compressed_len: part.compressed.len() as u64,
             uncompressed_len: part.uncompressed_len,
             crc32: part.crc32,
+            sha256: part.sha256.clone(),
         });
         output.extend_from_slice(&part.compressed);
     }
@@ -370,6 +402,7 @@ pub(crate) fn repack_for_entry(
             compressed,
             uncompressed_len: entry.uncompressed_len,
             crc32: entry.crc32,
+            sha256: entry.sha256.clone(),
         });
     }
 
@@ -482,9 +515,27 @@ mod tests {
         let linux = index.entry_for("linux", "x86_64").expect("linux entry");
         assert_eq!(linux.uncompressed_len, linux_bytes.len() as u64);
         assert_eq!(linux.crc32, crc32(&linux_bytes));
+        assert_eq!(linux.sha256, sha256_hex(&linux_bytes));
         let mac = index.entry_for("macos", "aarch64").expect("mac entry");
         assert_eq!(mac.uncompressed_len, mac_bytes.len() as u64);
         assert_eq!(mac.crc32, crc32(&mac_bytes));
+        assert_eq!(mac.sha256, sha256_hex(&mac_bytes));
+    }
+
+    #[test]
+    fn extract_entry_rejects_wrong_sha256() {
+        let dir = temp_dir();
+        let carrier = write_file(&dir, "herdr", b"CARRIER");
+        let (inputs, _, _) = sample_inputs(&dir);
+        let out = dir.join("herdr-bundle");
+        let index = pack(&carrier, &inputs, "1.0.0", None, &out).unwrap();
+
+        // Corrupt only the SHA-256; the CRC-32 still matches the real payload, so this
+        // exercises the SHA-256 branch specifically.
+        let mut entry = index.entry_for("linux", "x86_64").unwrap().clone();
+        entry.sha256 = "0".repeat(64);
+        let err = extract_entry(&out, &entry).expect_err("wrong sha256 must fail");
+        assert!(err.to_string().contains("SHA-256"), "got: {err}");
     }
 
     #[test]

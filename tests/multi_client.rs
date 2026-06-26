@@ -876,8 +876,8 @@ fn wait_for_frame(stream: &mut UnixStream, timeout: Duration) -> bool {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let slice = remaining.min(Duration::from_millis(75));
         match read_server_variant(stream, slice) {
-            // Frame (1), FrameDelta (9), or Compressed frame (11) — issue #13.
-            Ok(1) | Ok(9) | Ok(11) => return true,
+            // Frame (1), FrameDelta (10), or Compressed frame (12) — issue #13.
+            Ok(1) | Ok(10) | Ok(12) => return true,
             Ok(_) => {}
             Err(err) if is_timeout(&err) => {}
             Err(_) => return false,

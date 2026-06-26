@@ -13,12 +13,8 @@ ASSET_TARGETS = (
     "linux-aarch64",
     "macos-x86_64",
     "macos-aarch64",
-    "windows-x86_64",
 )
-EXPECTED_ASSET_NAMES = {
-    **{target: f"herdr-{target}" for target in ASSET_TARGETS},
-    "windows-x86_64": "herdr-windows-x86_64.exe",
-}
+EXPECTED_ASSET_NAMES = {target: f"herdr-{target}" for target in ASSET_TARGETS}
 HIDDEN_SUBJECTS = (
     "docs: update website manifest",
     "docs: update preview manifest",

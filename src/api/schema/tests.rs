@@ -309,7 +309,7 @@ fn subscribe_request_parses_parameterized_subscriptions() {
         Subscription::PaneAgentStatusChanged {
             pane_id,
             agent_status: Some(AgentStatus::Done),
-        } if pane_id == "p_1_1"
+        } if pane_id.as_deref() == Some("p_1_1")
     ));
 }
 
@@ -383,6 +383,8 @@ fn worktree_request_and_response_round_trip() {
                 tab_count: 1,
                 active_tab_id: "w_1:1".into(),
                 agent_status: AgentStatus::Unknown,
+                branch: None,
+                git: None,
                 worktree: Some(WorkspaceWorktreeInfo {
                     repo_key: "/repo/herdr/.git".into(),
                     repo_name: "herdr".into(),
@@ -465,6 +467,8 @@ fn worktree_lifecycle_events_round_trip() {
         tab_count: 1,
         active_tab_id: "w_2:1".into(),
         agent_status: AgentStatus::Unknown,
+        branch: None,
+        git: None,
         worktree: Some(WorkspaceWorktreeInfo {
             repo_key: "/repo/herdr/.git".into(),
             repo_name: "herdr".into(),

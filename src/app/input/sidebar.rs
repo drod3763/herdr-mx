@@ -501,25 +501,6 @@ impl AppState {
     /// affordance/banner/card/agent entry. The ` new`/`menu` affordances hover only when drawn
     /// (`self.mouse_capture` + `launcher_enabled`, matching the renderer's draw gate). The caller
     /// gates this to `in_sidebar && !sidebar_collapsed` in a navigate-ish mode. No server traffic.
-    /// herdr-mx: hit-test the client-side agent-panel scope toggle (current/all) in the
-    /// monolithic sidebar. The multi-remote client drives the same toggle from the compositor.
-    pub(super) fn on_agent_panel_scope_toggle(&self, col: u16, row: u16) -> bool {
-        if self.sidebar_collapsed {
-            return false;
-        }
-
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            self.view.sidebar_rect,
-            self.sidebar_section_split,
-        );
-        let rect = crate::ui::agent_panel_scope_toggle_rect(detail_area, self.agent_panel_scope);
-        rect.width > 0
-            && col >= rect.x
-            && col < rect.x + rect.width
-            && row >= rect.y
-            && row < rect.y + rect.height
-    }
-
     pub(super) fn resolve_sidebar_hover(
         &self,
         col: u16,
@@ -558,8 +539,8 @@ impl AppState {
             }
         }
 
-        if self.on_agent_panel_scope_toggle(col, row) {
-            return Some(SidebarHoverTarget::ScopeToggle);
+        if self.on_agent_panel_sort_toggle(col, row) {
+            return Some(SidebarHoverTarget::SortToggle);
         }
 
         // host-banner rect (item 2): empty in monolithic, hoverable defensively when present.
@@ -596,7 +577,7 @@ mod tests {
 
     use super::super::{app_for_mouse_test, capture_snapshot, mouse, unique_temp_path};
     use crate::{
-        app::state::{AgentPanelScope, AgentPanelSort, AppState, DragTarget, Mode, SidebarAgentItem},
+        app::state::{AgentPanelSort, AppState, DragTarget, Mode, SidebarAgentItem},
         detect::Agent,
         workspace::Workspace,
     };
@@ -952,7 +933,6 @@ mod tests {
         }
         app.state.active = Some(0);
         app.state.selected = 0;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.state.sidebar_agent.lines = vec![vec![crate::config::SidebarItem::visible(
             SidebarAgentItem::AgentStatus,
         )]];
@@ -999,7 +979,6 @@ mod tests {
         }
         app.state.active = Some(0);
         app.state.selected = 0;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.state.sidebar_agent.lines = vec![
             vec![crate::config::SidebarItem::visible(
                 SidebarAgentItem::AgentStatus,

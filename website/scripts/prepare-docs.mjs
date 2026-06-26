@@ -1,4 +1,5 @@
 import { cp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
@@ -23,12 +24,21 @@ async function preparePublicAssets() {
   await rm(publicDir, { recursive: true, force: true });
   await mkdir(publicDir, { recursive: true });
 
+  // Files that may legitimately be absent (preview.json only after a preview run; the manifest
+  // signatures only after a signed release). Their absence must not fail a local/docs build.
+  const optional = new Set([
+    'preview.json',
+    'latest.json.minisig',
+    'preview.json.minisig',
+  ]);
   for (const file of [
     'install.sh',
     'install.ps1',
     'agent-guide.md',
     'latest.json',
+    'latest.json.minisig',
     'preview.json',
+    'preview.json.minisig',
     'robots.txt',
     '_headers',
     '_redirects',
@@ -37,7 +47,41 @@ async function preparePublicAssets() {
     try {
       await cp(source, resolve(publicDir, file));
     } catch (error) {
-      if (file !== 'preview.json' || error.code !== 'ENOENT') throw error;
+      if (!optional.has(file) || error.code !== 'ENOENT') throw error;
+    }
+  }
+
+  // The updater fetches <manifest>.minisig before parsing the manifest, so an unsigned manifest is
+  // unusable to clients and must never be served. But publishing the docs site must not depend on
+  // the signing key, so a missing sidecar never takes the whole site down. Therefore:
+  //   - manifest + sidecar both present  -> publish both (already copied above);
+  //   - manifest present, sidecar absent -> DROP the manifest from the published output (and warn),
+  //     so the docs site still deploys while no unsigned manifest is ever served — the updater then
+  //     simply finds no manifest (a soft "couldn't check for updates") instead of fetching one whose
+  //     signature 404s;
+  //   - REQUIRE_MANIFEST_SIGNATURES=1 (release/production pipelines that guarantee sidecars) turns a
+  //     missing sidecar into a hard build failure instead of a silent drop, so a broken signing step
+  //     can't quietly ship an empty update channel.
+  const requireSignatures = process.env.REQUIRE_MANIFEST_SIGNATURES === '1';
+  for (const [manifest, signature] of [
+    ['latest.json', 'latest.json.minisig'],
+    ['preview.json', 'preview.json.minisig'],
+  ]) {
+    const manifestPath = resolve(publicDir, manifest);
+    const signaturePath = resolve(publicDir, signature);
+    if (existsSync(manifestPath) && !existsSync(signaturePath)) {
+      if (requireSignatures) {
+        throw new Error(
+          `${manifest} is being published without ${signature}; herdr clients require a signed ` +
+            `manifest. Run the signing workflow (or restore the .minisig) before deploying.`,
+        );
+      }
+      console.warn(
+        `warning: ${manifest} has no ${signature}; dropping it from the published output so no ` +
+          `unsigned manifest is served. Sign it (or set REQUIRE_MANIFEST_SIGNATURES=1 to fail the ` +
+          `build) to publish the update channel.`,
+      );
+      await rm(manifestPath, { force: true });
     }
   }
 

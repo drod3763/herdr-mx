@@ -135,6 +135,17 @@ impl UpdateChannel {
 struct AssetRef {
     url: String,
     sha256: Option<String>,
+    sig: Option<String>,
+}
+
+impl AssetRef {
+    /// URL of the detached minisign signature. Manifests may carry an explicit `sig`; otherwise
+    /// it is the conventional `<asset>.minisig` sidecar CI publishes next to the binary.
+    fn sig_url(&self) -> String {
+        self.sig
+            .clone()
+            .unwrap_or_else(|| format!("{}.minisig", self.url))
+    }
 }
 
 impl<'de> Deserialize<'de> for AssetRef {
@@ -147,6 +158,7 @@ impl<'de> Deserialize<'de> for AssetRef {
             serde_json::Value::String(url) if !url.trim().is_empty() => Ok(Self {
                 url: url.trim().to_string(),
                 sha256: None,
+                sig: None,
             }),
             serde_json::Value::Object(mut object) => {
                 let url = object
@@ -156,12 +168,16 @@ impl<'de> Deserialize<'de> for AssetRef {
                 let sha256 = object
                     .remove("sha256")
                     .and_then(|value| value.as_str().map(str::to_string));
+                let sig = object
+                    .remove("sig")
+                    .and_then(|value| value.as_str().map(str::to_string));
                 if url.trim().is_empty() {
                     return Err(serde::de::Error::custom("asset url must not be empty"));
                 }
                 Ok(Self {
                     url: url.trim().to_string(),
                     sha256: sha256.filter(|value| !value.trim().is_empty()),
+                    sig: sig.filter(|value| !value.trim().is_empty()),
                 })
             }
             _ => Err(serde::de::Error::custom(
@@ -283,6 +299,7 @@ struct ReleaseInfo {
     target_protocol: Option<u32>,
     download_url: String,
     sha256: Option<String>,
+    sig_url: String,
     notes_body: String,
 }
 
@@ -321,6 +338,31 @@ where
     if !output.status.success() {
         return Err("failed to fetch update manifest".into());
     }
+
+    // Authenticate the manifest itself before trusting ANY field. The manifest is the updater's
+    // root of trust — it dictates the version, download URL, signature URL, and hash. Without a
+    // signature over the manifest bytes, a compromised or stale host could advertise any
+    // validly-signed-but-wrong artifact (downgrade, cross-channel, rollback). Verify a detached
+    // minisign signature over the exact bytes against the embedded release key, then parse.
+    let sig_url = format!("{url}.minisig");
+    let sig = Command::new("curl")
+        .args([
+            "-sfL",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "20",
+            &sig_url,
+        ])
+        .output()
+        .map_err(|e| format!("curl failed: {e}"))?;
+    if !sig.status.success() {
+        return Err(format!("failed to fetch manifest signature from {sig_url}"));
+    }
+    crate::signing::verify_signature_bytes(&output.stdout, &sig.stdout)
+        .map_err(|e| format!("manifest signature verification failed: {e}"))?;
 
     serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("failed to parse update manifest JSON: {e}"))
@@ -383,6 +425,7 @@ fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<Releas
         target_protocol: manifest.protocol,
         download_url,
         sha256: asset.sha256.clone(),
+        sig_url: asset.sig_url(),
         notes_body,
     }))
 }
@@ -403,6 +446,62 @@ fn preview_display_version(base_version: &str, build_id: &str) -> String {
     )
 }
 
+/// The orderable `YYYY-MM-DD` date prefix of a preview build id (`YYYY-MM-DD-<sha>`, set by
+/// preview.yml from the commit date). Lexicographically comparable. `None` if absent/malformed.
+fn build_id_date(build_id: &str) -> Option<&str> {
+    let date = build_id.get(0..10)?;
+    let bytes = date.as_bytes();
+    let shaped = bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && date.char_indices().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                c == '-'
+            } else {
+                c.is_ascii_digit()
+            }
+        });
+    shaped.then_some(date)
+}
+
+/// Whether a preview manifest build is fresh enough to install over the running preview. Prefers the
+/// full-precision `built_at` timestamp (monotonic UTC ISO-8601, lexicographically comparable) so
+/// same-day rollback is caught; falls back to the `YYYY-MM-DD` date prefix of the build id for older
+/// builds that predate the embedded timestamp. Refuses a stale (replayed) signed `preview.json` that
+/// advertises an older build. Allows (returns true) when the running build is not a preview (first
+/// preview install) or when neither ordering signal is available — best effort; the build-id
+/// equality check still blocks reinstalling the exact current build, and the staged-binary identity
+/// check still applies.
+fn preview_manifest_is_fresh(
+    manifest_built_at: &str,
+    manifest_build_id: &str,
+    current_built_at: Option<&str>,
+    current_build_id: Option<&str>,
+    current_is_preview: bool,
+) -> bool {
+    if !current_is_preview {
+        return true;
+    }
+    // Full-precision built_at ordering (closes the same-day window).
+    if let Some(current_built_at) = current_built_at {
+        if !current_built_at.is_empty() && !manifest_built_at.is_empty() {
+            return manifest_built_at > current_built_at;
+        }
+    }
+    // Fallback (legacy preview builds with no embedded built_at): order by the build-id date
+    // prefix. Same-date builds are unorderable by date (the sha is not monotonic), so fail closed —
+    // require a STRICTLY later date — rather than allow a same-day rollback.
+    let Some(current_build_id) = current_build_id else {
+        return true;
+    };
+    match (
+        build_id_date(current_build_id),
+        build_id_date(manifest_build_id),
+    ) {
+        (Some(current_date), Some(manifest_date)) => manifest_date > current_date,
+        _ => true,
+    }
+}
+
 fn release_info_from_preview_manifest(
     manifest: &PreviewManifest,
 ) -> Result<Option<ReleaseInfo>, String> {
@@ -419,6 +518,18 @@ fn release_info_from_preview_manifest(
     if crate::build_info::is_preview()
         && crate::build_info::build_id().is_some_and(|current| current == build_id)
     {
+        return Ok(None);
+    }
+    // Refuse preview rollback: a stale or tampered preview.json must not advertise an OLDER signed
+    // build as an "update". The later signature/identity checks only prove the binary matches the
+    // manifest-controlled identity, so freshness cannot rely on them.
+    if !preview_manifest_is_fresh(
+        manifest.built_at.trim(),
+        build_id,
+        crate::build_info::built_at(),
+        crate::build_info::build_id(),
+        crate::build_info::is_preview(),
+    ) {
         return Ok(None);
     }
 
@@ -468,6 +579,7 @@ fn release_info_from_preview_manifest(
         target_protocol: Some(manifest.protocol),
         download_url,
         sha256: asset.sha256.clone(),
+        sig_url: asset.sig_url(),
         notes_body,
     }))
 }
@@ -593,6 +705,10 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         return Err("download failed".into());
     }
 
+    // SHA-256 is a fast corruption pre-check when the manifest advertises it. Run it first so an
+    // obviously corrupt or wrong download fails fast — before the extra network round-trip to fetch
+    // and parse the signature. It is not load-bearing (the signature below covers integrity), so a
+    // manifest without a hash is fine.
     if let Some(expected) = &release.sha256 {
         if let Err(e) = crate::checksum::verify_sha256(&tmp_path, expected) {
             let _ = fs::remove_file(&tmp_path);
@@ -602,6 +718,17 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         }
         tracing::info!(sha256 = %expected, "downloaded update checksum verified");
     }
+
+    // Authenticity AND integrity: the detached minisign signature is mandatory. A valid ed25519
+    // signature over the file also proves it was not corrupted or tampered, and — unlike a hash —
+    // survives a compromised release host. This is the load-bearing check.
+    if let Err(e) = verify_release_signature(&tmp_path, &release.sig_url) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "downloaded update signature verification failed: {e}"
+        ));
+    }
+    tracing::info!(sig_url = %release.sig_url, "downloaded update signature verified");
 
     // Make executable
     #[cfg(unix)]
@@ -613,10 +740,76 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         }
     }
 
+    // Bind the artifact to the advertised release. A valid signature only proves the bytes are
+    // authentic herdr — not that they are the version/channel the manifest claimed. Without this, a
+    // compromised manifest could point download_url/sig_url at another validly-signed release (an
+    // older version, or a same-base build from the other channel) and silently downgrade or
+    // cross-substitute. Run the staged binary (already signature-verified, so safe to exec) and
+    // require its `--version` to match BOTH the resolved numeric version AND the channel: stable
+    // builds never carry a "preview" marker, preview builds always do (build_info::FULL_VERSION).
+    let reported_token = match Command::new(&tmp_path).arg("--version").output() {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .find(|token| Version::parse(token).is_some())
+            .map(str::to_string),
+        _ => None,
+    };
+    let reported_ok = reported_token
+        .as_deref()
+        .is_some_and(|token| staged_version_matches(token, release));
+    if !reported_ok {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "downloaded update did not report the expected {} version {}; refusing to install (possible downgrade, channel substitution, or substituted artifact)",
+            release.channel.as_str(),
+            release.version
+        ));
+    }
+    tracing::info!(version = %release.version, channel = release.channel.as_str(), "downloaded update verified");
+
     Ok(DownloadedUpdate {
         current_exe,
         tmp_path: Some(tmp_path),
     })
+}
+
+/// Whether the staged binary's reported `--version` `token` is EXACTLY the release we resolved.
+/// A valid signature proves authenticity, not identity; binding to the exact identity stops a
+/// compromised host from substituting another validly-signed build (cross-channel, an older
+/// version, or an older preview) at the asset URL.
+///
+/// Exact equality is correct because `release.identity` is precisely what `build_info::FULL_VERSION`
+/// (what `--version` prints) reports for that build: stable is the bare base version (build.rs), and
+/// preview is `{base}-preview.{build_id}` (== `preview_display_version`). So an mx/preview build
+/// (`0.6.10-mx.1`, `0.6.10-preview.…`) is rejected for a stable `0.6.10` update, and any version or
+/// build-id mismatch is rejected — without brittle suffix/`contains` heuristics.
+#[cfg(not(windows))]
+fn staged_version_matches(token: &str, release: &ReleaseInfo) -> bool {
+    token == release.identity
+}
+
+/// Download the detached minisign signature from `sig_url` and verify it over `file` against the
+/// embedded release key(s). Any failure (download, parse, key mismatch) is fatal — the caller
+/// deletes the staged binary.
+#[cfg(not(windows))]
+fn verify_release_signature(file: &std::path::Path, sig_url: &str) -> Result<(), String> {
+    let output = Command::new("curl")
+        .args([
+            "-sfL",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
+            sig_url,
+        ])
+        .output()
+        .map_err(|e| format!("failed to fetch signature: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("failed to download signature from {sig_url}"));
+    }
+    crate::signing::verify_signature(file, &output.stdout).map_err(|e| e.to_string())
 }
 
 #[cfg(not(windows))]
@@ -2340,8 +2533,121 @@ mod tests {
             target_protocol,
             download_url: "https://example.com/herdr".to_string(),
             sha256: None,
+            sig_url: "https://example.com/herdr.minisig".to_string(),
             notes_body: "### Changed\n- One".to_string(),
         }
+    }
+
+    fn fake_preview_release(version: &str, build_id: &str) -> ReleaseInfo {
+        ReleaseInfo {
+            version: Version::parse(version).unwrap(),
+            identity: super::preview_display_version(version, build_id),
+            channel: UpdateChannel::Preview,
+            build_id: Some(build_id.to_string()),
+            commit: None,
+            target_protocol: Some(2),
+            download_url: "https://example.com/herdr".to_string(),
+            sha256: None,
+            sig_url: "https://example.com/herdr.minisig".to_string(),
+            notes_body: "### Changed\n- One".to_string(),
+        }
+    }
+
+    #[test]
+    fn staged_version_matches_requires_exact_identity() {
+        // Stable identity is the bare base version; the binary must report exactly that.
+        let stable = fake_release("9.9.9", Some(2)); // identity "9.9.9"
+        assert!(super::staged_version_matches("9.9.9", &stable));
+        // Older signed stable (downgrade) -> reject.
+        assert!(!super::staged_version_matches("9.9.8", &stable));
+        // Signed preview/mx artifacts for the same base must NOT pass as a stable update.
+        assert!(!super::staged_version_matches("9.9.9-preview.123", &stable));
+        assert!(!super::staged_version_matches("9.9.9-mx.1", &stable));
+
+        // Preview identity == preview_display_version == build.rs FULL_VERSION.
+        let preview = fake_preview_release("9.9.9", "2026-06-12-bbbb");
+        assert!(super::staged_version_matches(
+            "9.9.9-preview.2026-06-12-bbbb",
+            &preview
+        ));
+        // An older signed preview build (different build id) -> reject.
+        assert!(!super::staged_version_matches(
+            "9.9.9-preview.2026-06-11-aaaa",
+            &preview
+        ));
+        // A stable artifact cannot be substituted for a preview update.
+        assert!(!super::staged_version_matches("9.9.9", &preview));
+    }
+
+    #[test]
+    fn preview_manifest_is_fresh_refuses_rollback() {
+        // Real preview build id shape from preview.yml: YYYY-MM-DD-<sha>.
+        let older_id = "2026-06-11-aaaaaaaaaaaa";
+        let newer_id = "2026-06-12-bbbbbbbbbbbb";
+        let no_at = ""; // built_at unavailable -> exercise the build-id date fallback
+
+        // Not currently on preview (e.g. stable -> preview): always allow.
+        assert!(super::preview_manifest_is_fresh(
+            no_at,
+            older_id,
+            None,
+            Some(newer_id),
+            false
+        ));
+
+        // Fallback path (no current built_at): order by the YYYY-MM-DD build-id date prefix.
+        assert!(super::preview_manifest_is_fresh(
+            no_at, older_id, None, None, true
+        )); // no current id
+        assert!(super::preview_manifest_is_fresh(
+            no_at,
+            newer_id,
+            None,
+            Some(older_id),
+            true
+        )); // newer day
+        assert!(!super::preview_manifest_is_fresh(
+            no_at,
+            older_id,
+            None,
+            Some(newer_id),
+            true
+        )); // older day
+            // Legacy build (no built_at), same date but different sha -> fail closed (codex iter 11).
+        assert!(!super::preview_manifest_is_fresh(
+            no_at,
+            "2026-06-12-zzzzzzzzzzzz",
+            None,
+            Some(newer_id),
+            true
+        ));
+
+        // Full-precision built_at path closes the same-day window (codex iter 10):
+        let cur_at = "2026-06-12T10:00:00Z";
+        // older same-day build -> refuse (the date prefix alone would have allowed this).
+        assert!(!super::preview_manifest_is_fresh(
+            "2026-06-12T09:00:00Z",
+            "2026-06-12-cccccccccccc",
+            Some(cur_at),
+            Some(newer_id),
+            true
+        ));
+        // equal built_at -> refuse (not strictly newer).
+        assert!(!super::preview_manifest_is_fresh(
+            cur_at,
+            newer_id,
+            Some(cur_at),
+            Some(newer_id),
+            true
+        ));
+        // newer same-day build -> allow.
+        assert!(super::preview_manifest_is_fresh(
+            "2026-06-12T11:00:00Z",
+            "2026-06-12-dddddddddddd",
+            Some(cur_at),
+            Some(newer_id),
+            true
+        ));
     }
 
     fn set_test_config_home(name: &str) -> PathBuf {
@@ -2728,6 +3034,7 @@ mod tests {
             target_protocol: Some(2),
             download_url: "https://example.com/herdr".to_string(),
             sha256: None,
+            sig_url: "https://example.com/herdr.minisig".to_string(),
             notes_body: "### Changed\n- One".to_string(),
         };
         let incompatible_release = ReleaseInfo {
@@ -2967,6 +3274,7 @@ mod tests {
             target_protocol: Some(3),
             download_url: "https://example.com/herdr".to_string(),
             sha256: None,
+            sig_url: "https://example.com/herdr.minisig".to_string(),
             notes_body: "### Changed\n- One".to_string(),
         };
         let plan = RunningServerUpdatePlan {
@@ -3102,6 +3410,7 @@ mod tests {
             target_protocol: Some(77),
             download_url: "https://example.com/herdr".to_string(),
             sha256: None,
+            sig_url: "https://example.com/herdr.minisig".to_string(),
             notes_body: "### Changed\n- One".to_string(),
         };
 

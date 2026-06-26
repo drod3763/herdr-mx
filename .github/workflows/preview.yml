@@ -137,15 +137,15 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             name: herdr-macos-aarch64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: herdr-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
       LIBGHOSTTY_VT_SIMD: 'true'
       HERDR_BUILD_CHANNEL: preview
       HERDR_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
+      # Embed the same built_at the manifest records so the updater can order preview builds at full
+      # precision (closes same-day rollback).
+      HERDR_BUILT_AT: ${{ needs.preflight.outputs.built_at }}
       HERDR_BUILD_COMMIT: ${{ needs.preflight.outputs.commit }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -189,22 +189,12 @@ jobs:
           key: preview-${{ matrix.target }}
 
       - name: Remove Zig caches
-        if: runner.os != 'Windows'
         run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
-
-      - name: Remove Zig caches
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Remove-Item -Recurse -Force .zig-cache -ErrorAction SilentlyContinue
-          Remove-Item -Recurse -Force vendor/libghostty-vt/.zig-cache -ErrorAction SilentlyContinue
-          Remove-Item -Recurse -Force vendor/libghostty-vt/zig-out -ErrorAction SilentlyContinue
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package artifact
-        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -232,18 +222,6 @@ jobs:
             echo "target=${{ matrix.target }}"
             echo "channel=preview"
           } >> BUILD_INFO.txt
-
-      - name: Package artifact
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Copy-Item target\${{ matrix.target }}\release\herdr.exe ${{ matrix.name }}
-          $hash = (Get-FileHash -Algorithm SHA256 ${{ matrix.name }}).Hash.ToLowerInvariant()
-          "$hash  ${{ matrix.name }}" | Out-File -Encoding ascii ${{ matrix.name }}.sha256
-          "commit=${{ needs.preflight.outputs.commit }}" | Out-File -Encoding utf8 BUILD_INFO.txt
-          "build_id=${{ needs.preflight.outputs.build_id }}" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          "target=${{ matrix.target }}" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          "channel=preview" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -308,6 +286,28 @@ jobs:
           pathlib.Path('preview-sha256.json').write_text(json.dumps(result, indent=2) + '\n')
           PY
 
+      # herdr-mx: the updater requires a detached minisign signature for every asset it installs
+      # (mandatory on the unix self-update path). Sign the unix preview binaries so the preview
+      # channel (herdr.dev/preview.json) does not fail closed.
+      - name: Sign preview artifacts
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PUBKEY: RWQupm2xx/vDQ2YjRHgy/84xAkdgzIgwIN/4CyOy5n1rQRQnHW34r3D2
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set; refusing to publish unsigned preview assets" >&2
+            exit 1
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          trap 'rm -f minisign.key' EXIT
+          for name in herdr-linux-x86_64 herdr-linux-aarch64 herdr-macos-x86_64 herdr-macos-aarch64; do
+            minisign -S -s minisign.key -m "artifacts/$name/$name"
+            minisign -Vm "artifacts/$name/$name" -P "$MINISIGN_PUBKEY"
+          done
+
       - name: Create preview prerelease
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
@@ -323,7 +323,10 @@ jobs:
             artifacts/herdr-linux-aarch64/herdr-linux-aarch64
             artifacts/herdr-macos-x86_64/herdr-macos-x86_64
             artifacts/herdr-macos-aarch64/herdr-macos-aarch64
-            artifacts/herdr-windows-x86_64.exe/herdr-windows-x86_64.exe
+            artifacts/herdr-linux-x86_64/herdr-linux-x86_64.minisig
+            artifacts/herdr-linux-aarch64/herdr-linux-aarch64.minisig
+            artifacts/herdr-macos-x86_64/herdr-macos-x86_64.minisig
+            artifacts/herdr-macos-aarch64/herdr-macos-aarch64.minisig
 
       - name: Update preview manifest
         run: |
@@ -339,13 +342,32 @@ jobs:
             --sha-file preview-sha256.json \
             --retain 30
 
+      # herdr-mx: the updater verifies <manifest>.minisig before trusting the preview manifest, so
+      # publish a detached signature next to it. Fails closed if the signing secret is missing.
+      - name: Sign preview manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PUBKEY: RWQupm2xx/vDQ2YjRHgy/84xAkdgzIgwIN/4CyOy5n1rQRQnHW34r3D2
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set; refusing to publish an unsigned preview manifest" >&2
+            exit 1
+          fi
+          command -v minisign >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y minisign; }
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          trap 'rm -f minisign.key' EXIT
+          minisign -S -s minisign.key -m website/preview.json
+          minisign -Vm website/preview.json -P "$MINISIGN_PUBKEY"
+
       - name: Commit preview manifest
         env:
           KANGAL_GITHUB_TOKEN: ${{ secrets.KANGAL_GITHUB_TOKEN }}
         run: |
           git config user.name "kangal-bot"
           git config user.email "285672167+kangal-bot@users.noreply.github.com"
-          git add website/preview.json
+          git add website/preview.json website/preview.json.minisig
           git diff --cached --quiet || git commit -m "docs: update preview manifest"
           git push "https://x-access-token:${KANGAL_GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:master
 

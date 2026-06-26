@@ -26,6 +26,9 @@ const CURRENT_VERSION: &str = crate::build_info::FULL_VERSION;
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
 const UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
+// When set to "1", an override binary (`HERDR_REMOTE_BINARY`) with no sibling `.minisig` is refused
+// instead of seeded with a warning — for operators who want every seeded binary signature-verified.
+const REMOTE_BINARY_REQUIRE_SIG_ENV_VAR: &str = "HERDR_REMOTE_BINARY_REQUIRE_SIGNATURE";
 const REMOTE_BRIDGE_PROBE_ENV_VAR: &str = "HERDR_REMOTE_BRIDGE_PROBE";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const MAIN_DISPLAY_NAME_ENV_VAR: &str = "HERDR_MAIN_DISPLAY_NAME";
@@ -618,7 +621,7 @@ impl RemoteHerdr {
 struct RemoteUpdateManifest {
     version: String,
     protocol: Option<u32>,
-    assets: BTreeMap<String, String>,
+    assets: BTreeMap<String, RemoteAsset>,
     #[serde(default, deserialize_with = "deserialize_remote_manifest_releases")]
     releases: BTreeMap<String, RemoteReleaseMetadata>,
 }
@@ -627,7 +630,68 @@ struct RemoteUpdateManifest {
 struct RemoteReleaseMetadata {
     protocol: Option<u32>,
     #[serde(default)]
-    assets: BTreeMap<String, String>,
+    assets: BTreeMap<String, RemoteAsset>,
+}
+
+/// One published asset in the herdr.dev manifest: a download URL plus the integrity material
+/// used to verify it before it is seeded to (and executed on) a remote host. Accepts either a
+/// bare URL string or an object `{url, sha256, sig}`, matching `update.rs::AssetRef`.
+#[derive(Clone)]
+struct RemoteAsset {
+    url: String,
+    sha256: Option<String>,
+    sig: Option<String>,
+}
+
+impl RemoteAsset {
+    /// URL of the detached minisign signature: the manifest's explicit `sig`, or the conventional
+    /// `<asset>.minisig` sidecar.
+    fn sig_url(&self) -> String {
+        self.sig
+            .clone()
+            .unwrap_or_else(|| format!("{}.minisig", self.url))
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteAsset {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(url) if !url.trim().is_empty() => Ok(Self {
+                url: url.trim().to_string(),
+                sha256: None,
+                sig: None,
+            }),
+            serde_json::Value::Object(mut object) => {
+                let url = object
+                    .remove("url")
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .ok_or_else(|| serde::de::Error::custom("asset object is missing url"))?;
+                if url.trim().is_empty() {
+                    return Err(serde::de::Error::custom("asset url must not be empty"));
+                }
+                let sha256 = object
+                    .remove("sha256")
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .filter(|value| !value.trim().is_empty());
+                let sig = object
+                    .remove("sig")
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .filter(|value| !value.trim().is_empty());
+                Ok(Self {
+                    url: url.trim().to_string(),
+                    sha256,
+                    sig,
+                })
+            }
+            _ => Err(serde::de::Error::custom(
+                "asset must be a URL string or object with url",
+            )),
+        }
+    }
 }
 
 fn deserialize_remote_manifest_releases<'de, D>(
@@ -671,7 +735,7 @@ impl RemoteUpdateManifest {
 #[derive(Clone, Copy)]
 struct RemoteManifestReleaseRef<'a> {
     protocol: Option<u32>,
-    assets: &'a BTreeMap<String, String>,
+    assets: &'a BTreeMap<String, RemoteAsset>,
 }
 
 struct InstallSource {
@@ -1173,13 +1237,52 @@ fn resolve_install_source(
     override_binary: Option<PathBuf>,
 ) -> io::Result<InstallSource> {
     if let Some(path) = override_binary {
+        verify_override_binary(&path)?;
         return Ok(InstallSource::persistent(path));
     }
 
     match classify_seed_source(platform) {
+        // The running executable and a bundle carried inside it are this trusted process's own
+        // bytes (bundle entries are SHA-256-checked on extract); only the download tier crosses an
+        // untrusted boundary and verifies sha256 + signature.
         NonOverrideSeed::LocalExe => Ok(InstallSource::persistent(std::env::current_exe()?)),
         NonOverrideSeed::Bundle => extract_bundle_install_source(platform),
         NonOverrideSeed::Download => download_release_asset(platform),
+    }
+}
+
+/// Verify an operator-provided override binary (`HERDR_REMOTE_BINARY`). If a sibling
+/// `<path>.minisig` exists it MUST verify (fail closed). If absent, the operator explicitly chose
+/// this path, so by default we proceed with a warning rather than block a from-source or air-gapped
+/// workflow — unless `HERDR_REMOTE_BINARY_REQUIRE_SIGNATURE=1`, in which case a missing sidecar is a
+/// hard failure so every seeded binary is signature-verified.
+fn verify_override_binary(path: &Path) -> io::Result<()> {
+    let mut sig_os = path.as_os_str().to_owned();
+    sig_os.push(".minisig");
+    let sig_path = PathBuf::from(sig_os);
+    match fs::read(&sig_path) {
+        Ok(signature) => crate::signing::verify_signature(path, &signature),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if matches!(
+                std::env::var(REMOTE_BINARY_REQUIRE_SIG_ENV_VAR).as_deref(),
+                Ok("1")
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{REMOTE_BINARY_ENV_VAR} binary {} has no sibling .minisig and \
+                         {REMOTE_BINARY_REQUIRE_SIG_ENV_VAR}=1; refusing to seed an unverified binary",
+                        path.display()
+                    ),
+                ));
+            }
+            tracing::warn!(
+                path = %path.display(),
+                "{REMOTE_BINARY_ENV_VAR} binary has no sibling .minisig; seeding it unverified (operator-provided)"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -1806,6 +1909,32 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
         ));
     }
 
+    // Authenticate the manifest before trusting the URLs/versions it dictates for a binary that is
+    // about to be executed on a remote host. Verify a detached minisign signature over the manifest
+    // bytes against the embedded release key, then parse.
+    let sig_url = format!("{UPDATE_MANIFEST_URL}.minisig");
+    let sig_output = Command::new("curl")
+        .args([
+            "-sfL",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "20",
+            &sig_url,
+        ])
+        .output()
+        .map_err(|err| io::Error::new(err.kind(), format!("curl failed: {err}")))?;
+    if !sig_output.status.success() {
+        return Err(io::Error::other(format!(
+            "failed to fetch manifest signature from {sig_url}"
+        )));
+    }
+    crate::signing::verify_signature_bytes(&manifest_output.stdout, &sig_output.stdout).map_err(
+        |err| io::Error::other(format!("manifest signature verification failed: {err}")),
+    )?;
+
     let manifest: RemoteUpdateManifest = serde_json::from_slice(&manifest_output.stdout)
         .map_err(|err| io::Error::other(format!("failed to parse update manifest JSON: {err}")))?;
 
@@ -1835,7 +1964,7 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
             )));
         }
     }
-    let url = release.assets.get(&asset_key).ok_or_else(|| {
+    let asset = release.assets.get(&asset_key).ok_or_else(|| {
         io::Error::other(format!(
             "no {asset_key} binary in the release manifest for herdr {CURRENT_VERSION}"
         ))
@@ -1846,7 +1975,7 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
     let status = Command::new("curl")
         .args(["-sfL", "--max-time", "120", "-o"])
         .arg(&path)
-        .arg(url)
+        .arg(&asset.url)
         .status()
         .map_err(|err| io::Error::new(err.kind(), format!("download failed: {err}")))?;
     if !status.success() {
@@ -1854,18 +1983,72 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
         return Err(io::Error::other("download failed"));
     }
 
+    // Verify BEFORE this binary is ever piped to and executed on the remote host. The minisign
+    // signature is mandatory (authenticity, the only check that survives a compromised release
+    // host); SHA-256 is an optional cheap corruption pre-check, verified only when the manifest
+    // advertises one (see `verify_downloaded_asset`).
+    if let Err(err) = verify_downloaded_asset(&path, asset) {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(err);
+    }
+
     Ok(InstallSource::temporary(path, dir))
 }
 
+/// Verify a freshly downloaded release asset before it is seeded to (and executed on) a remote
+/// host. The detached minisign signature is mandatory — a valid ed25519 signature proves both
+/// authenticity and integrity, and survives a compromised release host. SHA-256, when the manifest
+/// advertises it, is an additional cheap corruption pre-check (not load-bearing).
+fn verify_downloaded_asset(path: &Path, asset: &RemoteAsset) -> io::Result<()> {
+    verify_optional_sha256(path, asset)?;
+
+    let sig_url = asset.sig_url();
+    let output = Command::new("curl")
+        .args([
+            "-sfL",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
+            &sig_url,
+        ])
+        .output()
+        .map_err(|err| io::Error::new(err.kind(), format!("failed to fetch signature: {err}")))?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "failed to download signature from {sig_url}"
+        )));
+    }
+    crate::signing::verify_signature(path, &output.stdout)
+}
+
+/// Cheap corruption pre-check: verify the SHA-256 if the manifest advertised one. Absent is fine —
+/// the mandatory signature still covers integrity.
+fn verify_optional_sha256(path: &Path, asset: &RemoteAsset) -> io::Result<()> {
+    if let Some(expected) = &asset.sha256 {
+        crate::checksum::verify_sha256(path, expected)?;
+    }
+    Ok(())
+}
+
 fn private_download_dir(asset_key: &str) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
     let base = std::env::temp_dir();
+    // Owner-only (0700) regardless of the process umask: the download lands in a shared temp dir,
+    // and the verified binary is reopened by path before being streamed to the remote. A
+    // world/group-writable dir would let a local user swap the file between verification and use
+    // (TOCTOU). 0700 keeps everyone else out of the directory entirely.
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
     for attempt in 0..100 {
         let dir = base.join(format!(
             "herdr-remote-{}-{}-{attempt}",
             std::process::id(),
             asset_key
         ));
-        match fs::create_dir(&dir) {
+        match builder.create(&dir) {
             Ok(()) => return Ok(dir),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
@@ -1923,14 +2106,20 @@ fn install_remote_herdr(
     remote_herdr: &RemoteHerdr,
     source_path: &Path,
 ) -> io::Result<()> {
+    // mktemp the staging file rather than a predictable "$dest.tmp.$$": `cat >` follows symlinks, so
+    // a guessable name in $HOME could be pre-planted (symlink redirect / pre-created file). mktemp
+    // creates an exclusive, unpredictable, owner-only file (no symlink follow), then we chmod+mv it
+    // into place.
     let script = format!(
         r#"dest="$HOME/{install_suffix}"
 dir="${{dest%/*}}"
 mkdir -p "$dir"
-tmp="${{dest}}.tmp.$$"
+tmp="$(mktemp "${{dest}}.tmp.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
 cat > "$tmp"
 chmod 755 "$tmp"
 mv "$tmp" "$dest"
+trap - EXIT
 "#,
         install_suffix = remote_herdr.install_suffix
     );
@@ -2071,7 +2260,12 @@ impl SshStdioBridge {
         kind: RemoteBridgeKind,
     ) -> io::Result<Self> {
         let _ = std::fs::remove_file(&local_socket);
-        let listener = UnixListener::bind(&local_socket)?;
+        // Born owner-only via the umask guard; the chmod below stays authoritative. Closes the
+        // TOCTOU window where another local user could connect to the bridge socket.
+        let listener = {
+            let _umask = crate::ipc::UmaskGuard::restrictive();
+            UnixListener::bind(&local_socket)?
+        };
         crate::ipc::restrict_socket_permissions(&local_socket, BRIDGE_SOCKET_PERMISSION_MODE)?;
         listener.set_nonblocking(true)?;
 
@@ -3111,7 +3305,7 @@ mod tests {
             manifest
                 .release_for_version("1.2.3")
                 .and_then(|release| release.assets.get("linux-x86_64"))
-                .map(String::as_str),
+                .map(|asset| asset.url.as_str()),
             Some("https://example.com/latest")
         );
     }
@@ -3140,9 +3334,133 @@ mod tests {
             manifest
                 .release_for_version("1.2.3")
                 .and_then(|release| release.assets.get("linux-x86_64"))
-                .map(String::as_str),
+                .map(|asset| asset.url.as_str()),
             Some("https://example.com/archive")
         );
+    }
+
+    #[test]
+    fn remote_asset_parses_object_with_sha256_and_sig() {
+        let manifest: RemoteUpdateManifest = serde_json::from_str(
+            r#"{
+                "version": "1.2.3",
+                "assets": {
+                    "linux-x86_64": {
+                        "url": "https://example.com/herdr-linux-x86_64",
+                        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "sig": "https://example.com/herdr-linux-x86_64.sig"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let asset = manifest.assets.get("linux-x86_64").unwrap();
+        assert_eq!(asset.url, "https://example.com/herdr-linux-x86_64");
+        assert_eq!(
+            asset.sha256.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            asset.sig_url(),
+            "https://example.com/herdr-linux-x86_64.sig"
+        );
+    }
+
+    #[test]
+    fn remote_asset_sig_url_defaults_to_minisig_sidecar() {
+        let asset = RemoteAsset {
+            url: "https://example.com/herdr-linux".into(),
+            sha256: None,
+            sig: None,
+        };
+        assert_eq!(asset.sig_url(), "https://example.com/herdr-linux.minisig");
+    }
+
+    #[test]
+    fn verify_optional_sha256_accepts_missing_hash() {
+        let dir = std::env::temp_dir().join(format!("herdr-verify-none-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("herdr.tmp");
+        fs::write(&path, b"binary").unwrap();
+        // No advertised hash: the optional pre-check passes; the (mandatory) signature is enforced
+        // separately by verify_downloaded_asset.
+        let asset = RemoteAsset {
+            url: "https://example.com/herdr".into(),
+            sha256: None,
+            sig: None,
+        };
+        verify_optional_sha256(&path, &asset).expect("missing hash is allowed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_optional_sha256_rejects_mismatch() {
+        let dir = std::env::temp_dir().join(format!("herdr-verify-mm-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("herdr.tmp");
+        fs::write(&path, b"binary").unwrap();
+        // Wrong (but well-formed) hash fails the pre-check, before any signature fetch.
+        let asset = RemoteAsset {
+            url: "https://example.com/herdr".into(),
+            sha256: Some("0".repeat(64)),
+            sig: None,
+        };
+        let err = verify_optional_sha256(&path, &asset).expect_err("bad sha256 must fail");
+        assert!(err.to_string().contains("sha256 mismatch"), "got: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    #[test]
+    fn verify_override_binary_warns_but_allows_missing_sidecar_by_default() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let _restore = RestoreEnv(
+            REMOTE_BINARY_REQUIRE_SIG_ENV_VAR,
+            std::env::var_os(REMOTE_BINARY_REQUIRE_SIG_ENV_VAR),
+        );
+        std::env::remove_var(REMOTE_BINARY_REQUIRE_SIG_ENV_VAR);
+
+        let dir =
+            std::env::temp_dir().join(format!("herdr-override-default-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("herdr");
+        fs::write(&path, b"binary").unwrap();
+        // No sibling .minisig and no strict env: operator-provided override is seeded with a warning.
+        verify_override_binary(&path).expect("missing sidecar is allowed by default");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_override_binary_requires_signature_when_env_set() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let _restore = RestoreEnv(
+            REMOTE_BINARY_REQUIRE_SIG_ENV_VAR,
+            std::env::var_os(REMOTE_BINARY_REQUIRE_SIG_ENV_VAR),
+        );
+        std::env::set_var(REMOTE_BINARY_REQUIRE_SIG_ENV_VAR, "1");
+
+        let dir =
+            std::env::temp_dir().join(format!("herdr-override-strict-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("herdr");
+        fs::write(&path, b"binary").unwrap();
+        // With the strict env set, a missing sidecar fails closed instead of warning.
+        let err = verify_override_binary(&path).expect_err("missing sidecar must fail closed");
+        assert!(
+            err.to_string()
+                .contains("refusing to seed an unverified binary"),
+            "got: {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3297,7 +3615,7 @@ mod tests {
         entries: &[(&str, &str)],
     ) -> crate::bundle::BundleIndex {
         crate::bundle::BundleIndex {
-            format: 1,
+            format: 2,
             herdr_version: version.to_string(),
             build_commit: commit.map(str::to_string),
             image_len: 0,
@@ -3310,6 +3628,7 @@ mod tests {
                     compressed_len: 0,
                     uncompressed_len: 0,
                     crc32: 0,
+                    sha256: String::new(),
                 })
                 .collect(),
         }

@@ -212,10 +212,12 @@ pub(crate) struct ClientCompositor {
     // sidebar sweep to <1fps. `resolve_pending_hover` runs `hover_test` ONCE per frame at the
     // deferred-render flush (latest-wins). `None` when nothing is pending.
     pending_hover_pos: Option<(u16, u16)>,
-    // #20: client-local agents-panel scope ("all" vs "current"). The server never owns this; it is
-    // a per-client view preference fed into the render snapshot (`from_model`) and used to scope
-    // the flat `agent_routes` so agent-row hit-testing stays aligned with the rendered entries.
-    agent_panel_scope: crate::app::state::AgentPanelScope,
+    // Client-local agents-panel sort ("grouped" vs "priority"). The composited multi-remote client
+    // renders its OWN aggregated sidebar (the server frame is not shown here), so the agent ordering
+    // is per-client presentation state — never a server round-trip — mirroring the collapse toggle.
+    // It is fed into the render snapshot (`from_model` sets `app.agent_panel_sort`) and the flat
+    // `agent_routes` is reordered to match so agent-row hit-testing stays aligned with the entries.
+    agent_panel_sort: crate::app::state::AgentPanelSort,
     // #25: client-local collapsed-sidebar view state. The server never owns this; it is a per-client
     // view preference fed into `from_model` (sets `app.sidebar_collapsed`) so the SHARED renderer
     // branches to the narrow collapsed (mini) layout and `hit_test` reads the collapsed geometry.
@@ -320,7 +322,7 @@ pub(crate) struct HoverGeometry {
     filter: Option<Rect>,
     new_button: Option<Rect>,
     menu_button: Option<Rect>,
-    scope_toggle: Option<Rect>,
+    sort_toggle: Option<Rect>,
     /// The open client menu's selected-row paint (None when no menu is open). Carries the per-row
     /// cell geometry + the selection style so the overlay lifts whichever row the model now selects.
     menu: Option<MenuHoverGeometry>,
@@ -392,9 +394,10 @@ pub(crate) enum SidebarHitTarget {
     },
     New,
     Menu,
-    /// #20: the agents-panel "all"/"current" scope toggle. Client-local view state (no server
-    /// round-trip), handled in `dispatch_composited_mouse_input` since it needs `&mut compositor`.
-    AgentScopeToggle,
+    /// The agents-panel "grouped"/"priority" sort toggle. Client-local view state for the composited
+    /// sidebar (no server round-trip), handled in `dispatch_composited_mouse_input` since it needs
+    /// `&mut compositor`.
+    AgentSortToggle,
     /// #25: the collapse/expand sidebar toggle (bottom-right 1x1). Drawn in BOTH modes by
     /// `render_sidebar_toggle`, so it is hittable to collapse (expanded) AND to expand (collapsed).
     /// Client-local view state, flipped via `compositor.toggle_sidebar_collapsed()`.
@@ -437,6 +440,11 @@ struct AgentRoute {
     server_id: ServerId,
     agent_id: String,
 }
+
+/// The renderer's agent-panel sort key for one route: `(attention_priority, last_state_change_seq)`,
+/// captured alongside each `AgentRoute` so a `Priority` reorder of the flat `agent_routes` tracks the
+/// entry order `agent_panel_entries` produces. Matches the key used at `src/ui/sidebar.rs`.
+type AgentRouteSortKey = (u8, Option<u64>);
 
 struct ClientSidebarSnapshot {
     app: crate::app::AppState,
@@ -499,7 +507,7 @@ impl ClientCompositor {
             animation_tick: 0,
             hover: None,
             pending_hover_pos: None,
-            agent_panel_scope: crate::app::state::AgentPanelScope::default(),
+            agent_panel_sort: crate::app::state::AgentPanelSort::default(),
             sidebar_collapsed: false,
             collapse_progress: 0.0,
             prefix_armed: false,
@@ -548,17 +556,18 @@ impl ClientCompositor {
     }
 
     #[cfg(test)]
-    pub(crate) fn agent_panel_scope(&self) -> crate::app::state::AgentPanelScope {
-        self.agent_panel_scope
+    pub(crate) fn agent_panel_sort(&self) -> crate::app::state::AgentPanelSort {
+        self.agent_panel_sort
     }
 
-    /// #20: flip the agents-panel scope and reset the panel scroll, mirroring the monolithic
-    /// host's toggle handler (`src/app/input/mouse.rs:525`). Client-local; no server traffic.
-    pub(crate) fn toggle_agent_panel_scope(&mut self) {
-        use crate::app::state::AgentPanelScope;
-        self.agent_panel_scope = match self.agent_panel_scope {
-            AgentPanelScope::CurrentWorkspace => AgentPanelScope::AllWorkspaces,
-            AgentPanelScope::AllWorkspaces => AgentPanelScope::CurrentWorkspace,
+    /// Flip the agents-panel sort (grouped ↔ priority) and reset the panel scroll, mirroring the
+    /// monolithic host's toggle handler (`src/app/input/mouse.rs:548`). Client-local view state for
+    /// the composited sidebar; no server traffic.
+    pub(crate) fn toggle_agent_panel_sort(&mut self) {
+        use crate::app::state::AgentPanelSort;
+        self.agent_panel_sort = match self.agent_panel_sort {
+            AgentPanelSort::Spaces => AgentPanelSort::Priority,
+            AgentPanelSort::Priority => AgentPanelSort::Spaces,
         };
         self.agent_panel_scroll = 0;
     }
@@ -1690,12 +1699,12 @@ impl ClientCompositor {
             }
         }
 
-        // #20: the agents-panel scope toggle sits in the panel header; resolve it before the
-        // entry rows so a click on "all"/"current" toggles scope instead of focusing an agent.
-        // Geometry is the SAME helper the renderer uses (`agent_panel_toggle_rect` over the
-        // `expanded_sidebar_sections` detail area), so render == hit_test.
+        // The agents-panel sort toggle sits in the panel header; resolve it before the entry rows so
+        // a click on "grouped"/"priority" toggles sort instead of focusing an agent. Geometry is the
+        // SAME helper the renderer uses (`agent_panel_toggle_rect` over the `expanded_sidebar_sections`
+        // detail area), so render == hit_test.
         if rect_contains(agent_panel_toggle_hit_rect(&snapshot.app), x, y) {
-            return Some(SidebarHitTarget::AgentScopeToggle);
+            return Some(SidebarHitTarget::AgentSortToggle);
         }
 
         hit_test_agent_panel(&snapshot, x, y)
@@ -1817,10 +1826,10 @@ impl ClientCompositor {
             }
         }
 
-        // #20: hover the scope toggle (matches the monolithic host's `resolve_sidebar_hover`
-        // `ScopeToggle` arm). Same geometry as `hit_test` so hover and click agree.
+        // Hover the sort toggle (matches the monolithic host's `resolve_sidebar_hover` `SortToggle`
+        // arm). Same geometry as `hit_test` so hover and click agree.
         if rect_contains(agent_panel_toggle_hit_rect(&snapshot.app), x, y) {
-            return Some(SidebarHoverTarget::ScopeToggle);
+            return Some(SidebarHoverTarget::SortToggle);
         }
 
         hover_test_agent_panel(&snapshot, x, y)
@@ -1945,9 +1954,9 @@ impl ClientSidebarSnapshot {
         app.sidebar_section_split = compositor
             .section_split
             .unwrap_or_else(|| settings.sidebar_section_split());
-        // #20: client-local scope drives both the rendered entries and the scroll-metric clamp
-        // below, so it must be set before `agent_panel_scroll_metrics` is consulted.
-        app.agent_panel_scope = compositor.agent_panel_scope;
+        // Client-local sort drives both the rendered entries' ordering and the `agent_routes`
+        // reordering below, so it must be set before either is consulted.
+        app.agent_panel_sort = compositor.agent_panel_sort;
         app.sidebar_space = settings.sidebar_spaces.clone();
         app.sidebar_agent = settings.sidebar_agents.clone();
         // item 2 (C3): host-banner styling rides UiSettingsInfo over the wire.
@@ -2002,9 +2011,12 @@ impl ClientSidebarSnapshot {
         }
 
         let mut workspace_routes = Vec::new();
-        // #20: collect routes per-workspace so the flat `agent_routes` can be assembled to match
-        // the rendered entries under the active scope (all workspaces vs the current one only).
+        // Collect routes per-workspace so the flat `agent_routes` can be assembled to match the
+        // rendered entries. `per_ws_route_keys` carries the renderer's sort key per route (parallel
+        // to `per_ws_agent_routes`) so the flat list can be reordered to match the entries when the
+        // client-local sort is `Priority`.
         let mut per_ws_agent_routes: Vec<Vec<AgentRoute>> = Vec::new();
+        let mut per_ws_route_keys: Vec<Vec<AgentRouteSortKey>> = Vec::new();
         let mut active_idx = None;
         // #20: in mixed-remote mode every connected server independently reports its own focused
         // workspace, so multiple `workspace_rows()` can carry `row.focused == true`. A plain
@@ -2062,6 +2074,10 @@ impl ClientSidebarSnapshot {
             let mut tab_index: HashMap<String, usize> = HashMap::new();
             let mut tab_specs: Vec<crate::workspace::SidebarPlaceholderTab> = Vec::new();
             let mut tab_routes: Vec<Vec<AgentRoute>> = Vec::new();
+            // Parallel to `tab_routes`: the renderer's sort key per route, captured from the SAME
+            // synthetic terminal `agent_panel_entries` later reads, so a `Priority` reorder of the
+            // flat `agent_routes` matches the entry order the renderer produces.
+            let mut tab_route_keys: Vec<Vec<AgentRouteSortKey>> = Vec::new();
             let mut active_tab = 0usize;
             for agent in &agents {
                 let terminal_id = TerminalId::alloc();
@@ -2098,6 +2114,14 @@ impl ClientSidebarSnapshot {
                 } else {
                     terminal.state = state;
                 }
+                // Capture the renderer's Priority sort key for this route BEFORE the terminal is
+                // moved into `app.terminals`. `agent_panel_entries` sorts by
+                // `(Reverse(attention_priority(state, seen)), Reverse(last_agent_state_change_seq))`;
+                // mirror it exactly so the reordered routes track the rendered entries.
+                let route_key: AgentRouteSortKey = (
+                    crate::ui::workspace_attention_priority(state, seen),
+                    terminal.last_agent_state_change_seq,
+                );
                 app.terminals.insert(terminal_id.clone(), terminal);
                 let group = *tab_index.entry(agent.tab_id.clone()).or_insert_with(|| {
                     let group = tab_specs.len();
@@ -2107,6 +2131,7 @@ impl ClientSidebarSnapshot {
                         pane_terminals: Vec::new(),
                     });
                     tab_routes.push(Vec::new());
+                    tab_route_keys.push(Vec::new());
                     group
                 });
                 if agent.focused {
@@ -2117,9 +2142,12 @@ impl ClientSidebarSnapshot {
                     server_id: row.server_id.clone(),
                     agent_id: agent.agent_id.clone(),
                 });
+                tab_route_keys[group].push(route_key);
             }
             // Flatten routes in tab order so they line up with `pane_details` (tabs, then panes).
             let ws_agent_routes: Vec<AgentRoute> = tab_routes.into_iter().flatten().collect();
+            let ws_route_keys: Vec<AgentRouteSortKey> =
+                tab_route_keys.into_iter().flatten().collect();
 
             let workspace_id = row
                 .workspace_id
@@ -2151,9 +2179,10 @@ impl ClientSidebarSnapshot {
             // item 4: mirror the per-row local/remote signal into AppState, index-aligned with
             // app.workspaces. Empty in monolithic mode (no rows), so monolithic emits no divider.
             app.client_workspace_remote.push(row.is_remote);
-            // #20: index-aligned with `app.workspaces` so the current-workspace scope can pick its
-            // slice below.
+            // index-aligned with `app.workspaces` so the collapsed detail slice + the flat
+            // `agent_routes` assembly below can address each workspace's routes.
             per_ws_agent_routes.push(ws_agent_routes);
+            per_ws_route_keys.push(ws_route_keys);
             workspace_routes.push(WorkspaceRoute {
                 server_id: row.server_id,
                 workspace_id: row.workspace_id,
@@ -2167,27 +2196,36 @@ impl ClientSidebarSnapshot {
             app.selected = selected;
         }
 
-        // #20: flatten the per-workspace routes to match the entries `agent_panel_entries` renders
-        // under the active scope. `AllWorkspaces` concatenates every workspace's agents in row
-        // order (== the renderer's iteration); `CurrentWorkspace` keeps only the current
-        // workspace's slice. The snapshot mode is always Navigate/GlobalMenu, so the renderer's
-        // `agent_panel_current_workspace_idx` resolves to `app.selected` — mirror that here so the
-        // flat `agent_routes` index stays aligned with `hit_test_agent_panel`.
-        // #25: the collapsed detail section always shows the SELECTED workspace's panes (scope-
-        // independent), so capture that slice BEFORE the scope match consumes `per_ws_agent_routes`.
+        // Flatten the per-workspace routes to match the entries `agent_panel_entries` renders: every
+        // workspace's agents concatenated in row order (== the renderer's iteration). When the
+        // client-local sort is `Priority`, the renderer reorders the entries, so reorder the flat
+        // routes with the SAME stable comparator (`per_ws_route_keys`) to keep `route_idx` aligned
+        // with `hit_test_agent_panel`.
+        // #25: the collapsed detail section always shows the SELECTED workspace's panes (sort-
+        // independent, pane order), so capture that slice BEFORE the flatten consumes the routes.
         let collapsed_detail_agent_routes = per_ws_agent_routes
             .get(app.selected)
             .cloned()
             .unwrap_or_default();
-        let agent_routes: Vec<AgentRoute> = match app.agent_panel_scope {
-            crate::app::state::AgentPanelScope::CurrentWorkspace => per_ws_agent_routes
-                .get(app.selected)
-                .cloned()
-                .unwrap_or_default(),
-            crate::app::state::AgentPanelScope::AllWorkspaces => {
-                per_ws_agent_routes.into_iter().flatten().collect()
-            }
-        };
+        let mut agent_routes_with_keys: Vec<(AgentRoute, AgentRouteSortKey)> = per_ws_agent_routes
+            .into_iter()
+            .flatten()
+            .zip(per_ws_route_keys.into_iter().flatten())
+            .collect();
+        if matches!(
+            app.agent_panel_sort,
+            crate::app::state::AgentPanelSort::Priority
+        ) {
+            // `sort_by_key` is stable, matching `agent_panel_entries`' stable sort, so equal-priority
+            // routes keep their row (grouped) order exactly like the rendered entries.
+            agent_routes_with_keys.sort_by_key(|(_, (priority, seq))| {
+                (std::cmp::Reverse(*priority), std::cmp::Reverse(*seq))
+            });
+        }
+        let agent_routes: Vec<AgentRoute> = agent_routes_with_keys
+            .into_iter()
+            .map(|(route, _)| route)
+            .collect();
         let (_, detail_area) =
             crate::ui::expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
         app.agent_panel_scroll = compositor
@@ -3035,13 +3073,13 @@ fn hit_test_confirm_close_workspace(
     None
 }
 
-/// #20: the rect of the agents-panel "all"/"current" toggle in the rendered snapshot, derived from
-/// the SAME `expanded_sidebar_sections` detail area + `agent_panel_toggle_rect` the renderer uses
-/// (`render_agent_detail`). Returns an empty rect when the panel is too short to draw the toggle.
+/// The rect of the agents-panel "grouped"/"priority" sort toggle in the rendered snapshot, derived
+/// from the SAME `expanded_sidebar_sections` detail area + `agent_panel_toggle_rect` the renderer
+/// uses (`render_agent_detail`). Returns an empty rect when the panel is too short to draw the toggle.
 fn agent_panel_toggle_hit_rect(app: &crate::app::AppState) -> Rect {
     let (_, detail_area) =
         crate::ui::expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
-    crate::ui::agent_panel_scope_toggle_rect(detail_area, app.agent_panel_scope)
+    crate::ui::agent_panel_toggle_rect(detail_area, app.agent_panel_sort)
 }
 
 /// #25: collapsed-mode row hit-test. The collapsed renderer draws (top→bottom) a narrow
@@ -3152,9 +3190,10 @@ fn hit_test_agent_panel(
 /// item 7 (Area 4): hover sibling of `hit_test_agent_panel`. Returns `AgentRoute { route_idx }`
 /// where `route_idx = agent_panel_scroll + index` — the SAME flat `agent_routes` index
 /// `hit_test_agent_panel` resolves. The index is positional in `model.agent_groups()` order, so
-/// it survives recompose (a captured `pane_id` would not, contradiction 11). The client snapshot
-/// is always `AgentPanelScope::AllWorkspaces`, so this flat index equals the global
-/// `agent_panel_entries` index `render_agent_detail` walks (render == hover_test geometry).
+/// it survives recompose (a captured `pane_id` would not, contradiction 11). The flat `agent_routes`
+/// are reordered in `from_model` with the SAME comparator `agent_panel_entries` uses, so this flat
+/// index equals the global `agent_panel_entries` index `render_agent_detail` walks (render ==
+/// hover_test geometry) under both sort orders.
 fn hover_test_agent_panel(
     snapshot: &ClientSidebarSnapshot,
     x: u16,
@@ -3340,9 +3379,9 @@ fn compute_hover_geometry(snapshot: &ClientSidebarSnapshot) -> HoverGeometry {
         geom.new_button = Some(app.sidebar_new_button_rect());
         geom.menu_button = Some(app.global_launcher_rect());
     }
-    let toggle_rect = crate::ui::agent_panel_scope_toggle_rect(detail_area, app.agent_panel_scope);
+    let toggle_rect = crate::ui::agent_panel_toggle_rect(detail_area, app.agent_panel_sort);
     if toggle_rect != Rect::default() {
-        geom.scope_toggle = Some(toggle_rect);
+        geom.sort_toggle = Some(toggle_rect);
     }
 
     geom
@@ -3484,7 +3523,7 @@ pub(crate) fn apply_hover_overlay(
         SidebarHoverTarget::Filter => recolor_affordance(frame, geom.filter, geom),
         SidebarHoverTarget::New => recolor_affordance(frame, geom.new_button, geom),
         SidebarHoverTarget::Menu => recolor_affordance(frame, geom.menu_button, geom),
-        SidebarHoverTarget::ScopeToggle => recolor_affordance(frame, geom.scope_toggle, geom),
+        SidebarHoverTarget::SortToggle => recolor_affordance(frame, geom.sort_toggle, geom),
         // `AgentMono` is the monolithic pane-keyed variant (the client resolves `AgentRoute`);
         // `HostBanner`/`Divider` paint no highlight today (so the overlay is a no-op, matching render).
         SidebarHoverTarget::AgentMono { .. }
@@ -4181,64 +4220,122 @@ mod tests {
         model
     }
 
-    // #20: the agents-panel "all"/"current" toggle resolves to `AgentScopeToggle`, and toggling it
-    // flips the compositor's client-local scope and zeroes the panel scroll.
+    // The agents-panel "grouped"/"priority" toggle resolves to `AgentSortToggle`, and toggling it
+    // flips the compositor's client-local sort and zeroes the panel scroll.
     #[test]
-    fn scope_toggle_hit_test_resolves_and_toggles_scope() {
-        use crate::app::state::AgentPanelScope;
+    fn sort_toggle_hit_test_resolves_and_toggles_sort() {
+        use crate::app::state::AgentPanelSort;
         let model = single_server_two_ws_model();
         let mut compositor = ClientCompositor::new(26);
-        assert_eq!(
-            compositor.agent_panel_scope(),
-            AgentPanelScope::AllWorkspaces
-        );
+        assert_eq!(compositor.agent_panel_sort(), AgentPanelSort::Spaces);
 
         let snapshot =
             ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
         let rect = agent_panel_toggle_hit_rect(&snapshot.app);
-        assert!(rect.width > 0, "the scope toggle should be drawn");
+        assert!(rect.width > 0, "the sort toggle should be drawn");
         assert_eq!(
             compositor.hit_test(&model, rect.x, rect.y, 60, 28),
-            Some(SidebarHitTarget::AgentScopeToggle)
+            Some(SidebarHitTarget::AgentSortToggle)
         );
 
         compositor.agent_panel_scroll = 3;
-        compositor.toggle_agent_panel_scope();
-        assert_eq!(
-            compositor.agent_panel_scope(),
-            AgentPanelScope::CurrentWorkspace
-        );
+        compositor.toggle_agent_panel_sort();
+        assert_eq!(compositor.agent_panel_sort(), AgentPanelSort::Priority);
         assert_eq!(compositor.agent_panel_scroll, 0);
     }
 
-    // #20: under `CurrentWorkspace` scope, the agent panel only renders the active workspace's
-    // agents, and the flat `agent_routes` stays aligned so an agent-row hit resolves correctly.
+    // Under `Priority` sort the flat `agent_routes` are reordered with the SAME comparator
+    // `agent_panel_entries` uses, so route `i` keeps pointing at rendered entry `i` (hit-test stays
+    // aligned). A blocked agent in a later workspace floats ahead of an earlier idle agent.
     #[test]
-    fn current_scope_limits_agent_routes_to_active_workspace() {
-        let model = single_server_two_ws_model();
+    fn priority_sort_reorders_agent_routes_to_match_rendered_entries() {
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![
+                        WorkspaceSummary {
+                            workspace_id: "ws-1".into(),
+                            label: "one".into(),
+                            branch: None,
+                            focused: true,
+                            ..Default::default()
+                        },
+                        WorkspaceSummary {
+                            workspace_id: "ws-2".into(),
+                            label: "two".into(),
+                            branch: None,
+                            focused: false,
+                            ..Default::default()
+                        },
+                    ],
+                    agents: vec![
+                        AgentSummary {
+                            agent_id: "agent-idle".into(),
+                            workspace_id: "ws-1".into(),
+                            label: "claude".into(),
+                            status: "idle".into(),
+                            focused: false,
+                            pane_label: None,
+                            tab_id: String::new(),
+                            tab_label: None,
+                        },
+                        AgentSummary {
+                            agent_id: "agent-blocked".into(),
+                            workspace_id: "ws-2".into(),
+                            label: "codex".into(),
+                            status: "blocked".into(),
+                            focused: false,
+                            pane_label: None,
+                            tab_id: String::new(),
+                            tab_label: None,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+
         let mut compositor = ClientCompositor::new(26);
-
-        // AllWorkspaces: both agents have routes.
-        let all =
+        // Grouped (default): routes follow workspace/row order.
+        let grouped =
             ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
-        assert_eq!(all.agent_routes.len(), 2);
+        assert_eq!(
+            grouped
+                .agent_routes
+                .iter()
+                .map(|r| r.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-idle", "agent-blocked"]
+        );
 
-        // CurrentWorkspace: only the active workspace's (ws-1) agent route remains.
-        compositor.toggle_agent_panel_scope();
-        let current =
+        // Priority: the blocked agent floats to the front.
+        compositor.toggle_agent_panel_sort();
+        let prioritized =
             ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
-        assert_eq!(current.agent_routes.len(), 1);
-        assert_eq!(current.agent_routes[0].agent_id, "agent-1");
+        assert_eq!(
+            prioritized
+                .agent_routes
+                .iter()
+                .map(|r| r.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-blocked", "agent-idle"]
+        );
+        // The reordered routes line up with the rendered entry order (route[i] ↔ entry[i]):
+        // entry 0 belongs to the blocked agent's workspace (ws-2 == ws_idx 1).
+        let entries = crate::ui::agent_panel_entries(&prioritized.app);
+        assert_eq!(entries.len(), prioritized.agent_routes.len());
+        assert_eq!(entries[0].ws_idx, 1);
+        assert_eq!(entries[1].ws_idx, 0);
     }
 
     // #20 regression: in mixed-remote mode each connected server independently reports its own
     // focused workspace, so the local `main-herdr` row (focused, owning the focused agent the user
     // is attached to) AND the trailing remote `remote-api` row both carry `focused == true`. A
-    // plain last-wins selected the remote, so under the default `CurrentWorkspace` scope the local
-    // agent disappeared from the panel. The agent-focused local row must win over the merely
-    // workspace-focused remote row.
+    // plain last-wins selected the remote. The agent-focused local row must win over the merely
+    // workspace-focused remote row so the local row stays active.
     #[test]
-    fn current_scope_keeps_local_agents_when_remote_also_focused() {
+    fn agent_focused_local_row_wins_over_workspace_focused_remote() {
         let mut model = ClientSupervisorModel::new("local");
         let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
             id: "remote-x".into(),
@@ -4302,13 +4399,13 @@ mod tests {
             )
             .unwrap();
 
-        let mut compositor = ClientCompositor::new(26);
-        compositor.toggle_agent_panel_scope(); // -> CurrentWorkspace
+        let compositor = ClientCompositor::new(26);
         let current =
             ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
-        // The local workspace (row 0, the agent-focused one) wins, so its agent renders.
+        // The local workspace (row 0, the agent-focused one) wins the active resolution, so the flat
+        // routes still lead with the local agent (grouped/row order).
         assert_eq!(current.app.active, Some(0));
-        assert_eq!(current.agent_routes.len(), 1);
+        assert_eq!(current.agent_routes.len(), 2);
         assert_eq!(current.agent_routes[0].agent_id, "main-agent");
     }
 
@@ -7788,8 +7885,8 @@ mod tests {
         if shell.hover.menu_button.is_some() {
             targets.push(SidebarHoverTarget::Menu);
         }
-        if shell.hover.scope_toggle.is_some() {
-            targets.push(SidebarHoverTarget::ScopeToggle);
+        if shell.hover.sort_toggle.is_some() {
+            targets.push(SidebarHoverTarget::SortToggle);
         }
         assert!(
             targets.len() >= 4,

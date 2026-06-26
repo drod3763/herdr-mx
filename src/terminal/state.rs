@@ -395,9 +395,6 @@ impl TerminalState {
         if self.full_lifecycle_hook_report_is_suppressed(&source, &agent_label, &session_ref) {
             return None;
         }
-        if !self.hook_report_is_new(&source, seq) {
-            return None;
-        }
         if self.full_lifecycle_hook_report_matches_stale_session(
             &source,
             &agent_label,
@@ -433,6 +430,12 @@ impl TerminalState {
         }
         if reanchor_sequence {
             self.hook_report_sequences.remove(&source);
+        }
+        // Sequence freshness is checked AFTER a reanchor reset: a fresh session arriving with a
+        // lower seq than a prior release must still be accepted (matches upstream order — the merge
+        // left this check too early). See changed_session_ref_reanchors_hook_sequence_after_release.
+        if !self.hook_report_is_new(&source, seq) {
+            return None;
         }
 
         let previous_agent_label = self.effective_agent_label().map(str::to_string);

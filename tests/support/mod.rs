@@ -171,12 +171,18 @@ pub fn decode_varint_u32(payload: &[u8], offset: usize) -> Result<(u32, usize), 
     }
 }
 
-/// issue #13: frames are deflate-wrapped in `ServerMessage::Compressed` (variant 11). Given a read
+/// bincode tag of `ServerMessage::Compressed`. This MUST track the `ServerMessage` enum order in
+/// `src/protocol/wire.rs`: Welcome(0), Frame(1), Terminal(2), Graphics(3), ServerShutdown(4),
+/// Notify(5), Clipboard(6), WindowTitle(7), ReloadSoundConfig(8), MouseCapture(9), FrameDelta(10),
+/// Pong(11), Compressed(12). The v0.7.1 merge inserted FrameDelta + Pong, shifting Compressed 11->12.
+pub const COMPRESSED_MESSAGE_VARIANT: u32 = 12;
+
+/// issue #13: frames are deflate-wrapped in `ServerMessage::Compressed`. Given a read
 /// `(variant, payload_after_variant)`, return the effective frame `(variant, payload)` — inflating
 /// the inner message when compressed, or passing through otherwise. Lets frame-reading tests stay
 /// variant-based without each re-implementing inflate.
 pub fn inflate_compressed_frame(variant: u32, payload: &[u8]) -> (u32, Vec<u8>) {
-    if variant != 11 {
+    if variant != COMPRESSED_MESSAGE_VARIANT {
         return (variant, payload.to_vec());
     }
     // payload is a bincode `Vec<u8>`: varint length, then the deflate bytes.
@@ -353,7 +359,7 @@ pub fn wait_for_message_variant(
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match read_server_message(stream) {
-            // issue #13: a compressed frame (variant 11) inflates to its inner variant; match on that
+            // issue #13: a compressed frame (variant 12) inflates to its inner variant; match on that
             // so callers waiting for a Frame (1) still see a deflate-wrapped one.
             Ok((got, payload)) => {
                 let (got, _) = inflate_compressed_frame(got, &payload);

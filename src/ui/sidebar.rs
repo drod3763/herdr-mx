@@ -11,8 +11,8 @@ use ratatui::{
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{agent_icon, state_dot, state_label, state_label_color};
 use crate::app::state::{
-    ordered_sidebar_space_items, AgentPanelScope, AgentPanelSort, Palette, SidebarAgentItem,
-    SidebarLine, SidebarSpaceItem,
+    ordered_sidebar_space_items, AgentPanelSort, Palette, SidebarAgentItem, SidebarLine,
+    SidebarSpaceItem,
 };
 use crate::app::{AppState, Mode};
 use crate::config::{SidebarColorPreset, SidebarItem};
@@ -114,53 +114,6 @@ pub(crate) fn agent_panel_toggle_rect(area: Rect, sort: AgentPanelSort) -> Rect 
     )
 }
 
-/// herdr-mx: label for the client-side agent-panel scope toggle.
-fn agent_panel_toggle_label(scope: AgentPanelScope) -> &'static str {
-    match scope {
-        AgentPanelScope::CurrentWorkspace => "current",
-        AgentPanelScope::AllWorkspaces => "all",
-    }
-}
-
-/// herdr-mx: geometry for the client-side agent-panel SCOPE toggle. The multi-remote
-/// client toggles current/all here; the monolithic server uses the sort toggle
-/// (`agent_panel_toggle_rect`) in the same slot.
-pub(crate) fn agent_panel_scope_toggle_rect(area: Rect, scope: AgentPanelScope) -> Rect {
-    if area.width == 0 || area.height < 2 {
-        return Rect::default();
-    }
-    let label = agent_panel_toggle_label(scope);
-    let width = label.chars().count() as u16;
-    Rect::new(
-        area.x + area.width.saturating_sub(width),
-        area.y + 1,
-        width,
-        1,
-    )
-}
-
-/// herdr-mx: the workspace whose agents the `CurrentWorkspace` scope shows — the
-/// selected row while a menu/navigation mode is open, otherwise the active workspace.
-fn agent_panel_current_workspace_idx(app: &AppState) -> Option<usize> {
-    if matches!(
-        app.mode,
-        Mode::Navigate
-            | Mode::RenameWorkspace
-            | Mode::RenamePane
-            | Mode::Resize
-            | Mode::ConfirmClose
-            | Mode::ContextMenu
-            | Mode::Settings
-            | Mode::GlobalMenu
-            | Mode::KeybindHelp
-            | Mode::ProductAnnouncement
-    ) {
-        Some(app.selected)
-    } else {
-        app.active
-    }
-}
-
 pub(crate) fn agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     agent_panel_entries_with_runtimes(app, None)
 }
@@ -185,70 +138,32 @@ fn agent_panel_entries_with_runtimes(
         }
     };
 
-    let mut entries: Vec<AgentPanelEntry> = match app.agent_panel_scope {
-        AgentPanelScope::CurrentWorkspace => {
-            let Some(ws_idx) = agent_panel_current_workspace_idx(app) else {
-                return Vec::new();
-            };
-            let Some(ws) = app.workspaces.get(ws_idx) else {
-                return Vec::new();
-            };
+    let mut entries: Vec<AgentPanelEntry> = app
+        .workspaces
+        .iter()
+        .enumerate()
+        .flat_map(|(ws_idx, ws)| {
             let multi_tab = ws.tabs.len() > 1;
             let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);
             ws.pane_details(&app.terminals)
                 .into_iter()
-                .map(|detail| {
-                    let has_pane_label = detail.pane_label.is_some();
-                    AgentPanelEntry {
-                        ws_idx,
-                        tab_idx: detail.tab_idx,
-                        pane_id: detail.pane_id,
-                        pane_label: detail.pane_label,
-                        primary_label: if has_pane_label {
-                            workspace_label.clone()
-                        } else {
-                            detail.label
-                        },
-                        primary_tab_label: (has_pane_label && multi_tab)
-                            .then_some(detail.tab_label),
-                        agent_label: Some(detail.agent_label),
-                        state: detail.state,
-                        seen: detail.seen,
-                        last_agent_state_change_seq: detail.last_agent_state_change_seq,
-                        custom_status: detail.custom_status,
-                        state_labels: detail.state_labels,
-                        working_duration: detail.working_duration,
-                    }
+                .map(move |detail| AgentPanelEntry {
+                    ws_idx,
+                    tab_idx: detail.tab_idx,
+                    pane_id: detail.pane_id,
+                    pane_label: detail.pane_label,
+                    primary_label: workspace_label.clone(),
+                    primary_tab_label: multi_tab.then_some(detail.tab_label),
+                    agent_label: Some(detail.agent_label),
+                    state: detail.state,
+                    seen: detail.seen,
+                    last_agent_state_change_seq: detail.last_agent_state_change_seq,
+                    custom_status: detail.custom_status,
+                    state_labels: detail.state_labels,
+                    working_duration: detail.working_duration,
                 })
-                .collect()
-        }
-        AgentPanelScope::AllWorkspaces => app
-            .workspaces
-            .iter()
-            .enumerate()
-            .flat_map(|(ws_idx, ws)| {
-                let multi_tab = ws.tabs.len() > 1;
-                let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);
-                ws.pane_details(&app.terminals)
-                    .into_iter()
-                    .map(move |detail| AgentPanelEntry {
-                        ws_idx,
-                        tab_idx: detail.tab_idx,
-                        pane_id: detail.pane_id,
-                        pane_label: detail.pane_label,
-                        primary_label: workspace_label.clone(),
-                        primary_tab_label: multi_tab.then_some(detail.tab_label),
-                        agent_label: Some(detail.agent_label),
-                        state: detail.state,
-                        seen: detail.seen,
-                        last_agent_state_change_seq: detail.last_agent_state_change_seq,
-                        custom_status: detail.custom_status,
-                        state_labels: detail.state_labels,
-                        working_duration: detail.working_duration,
-                    })
-            })
-            .collect(),
-    };
+        })
+        .collect();
 
     if matches!(app.agent_panel_sort, AgentPanelSort::Priority) {
         entries.sort_by_key(|entry| {
@@ -880,7 +795,7 @@ fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace) -> u16
     workspace_render_lines(app, ws).len() as u16
 }
 
-fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
+pub(crate) fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
         (AgentState::Blocked, _) => 4,
         (AgentState::Idle, false) => 3,
@@ -2639,10 +2554,10 @@ fn render_agent_detail(
     );
     let toggle_rect = agent_panel_toggle_rect(area, app.agent_panel_sort);
     if toggle_rect != Rect::default() {
-        // item 7 (Area 4): scope-toggle hover lifts fg overlay0 → subtext0 (monolithic-only —
-        // the client hit_test/hover_test has no ScopeToggle target).
+        // item 7 (Area 4): sort-toggle hover lifts fg overlay0 → subtext0. Shared by the monolithic
+        // host and the multi-remote client (both resolve the toggle to `SortToggle`).
         let toggle_fg =
-            if app.sidebar_hover == Some(crate::app::state::SidebarHoverTarget::ScopeToggle) {
+            if app.sidebar_hover == Some(crate::app::state::SidebarHoverTarget::SortToggle) {
                 p.subtext0
             } else {
                 p.overlay0
@@ -2889,7 +2804,6 @@ mod tests {
             false,
             start,
         );
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app
     }
 
@@ -3231,7 +3145,6 @@ lines = [
                 Some("planning".into()),
                 None,
             );
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let backend = ratatui::backend::TestBackend::new(42, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -3277,7 +3190,6 @@ lines = [
                 None,
                 None,
             );
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let backend = ratatui::backend::TestBackend::new(42, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -3340,7 +3252,6 @@ lines = [
         let terminal = app.terminals.get_mut(&terminal_id).unwrap();
         terminal.detected_agent = Some(Agent::Codex);
         terminal.set_manual_label("Echo".into());
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let entries = agent_panel_entries(&app);
         let label = format_agent_panel_primary_label(&entries[0], 30);
@@ -3364,7 +3275,6 @@ lines = [
         let terminal = app.terminals.get_mut(&terminal_id).unwrap();
         terminal.detected_agent = Some(Agent::Codex);
         terminal.set_manual_label("Echo".into());
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let entries = agent_panel_entries(&app);
         let label = format_agent_panel_primary_label(&entries[0], 30);
@@ -3388,7 +3298,6 @@ lines = [
         let terminal = app.terminals.get_mut(&terminal_id).unwrap();
         terminal.detected_agent = Some(Agent::Codex);
         terminal.set_manual_label("Echo".into());
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let entries = agent_panel_entries(&app);
 
@@ -3420,7 +3329,6 @@ lines = [
         let terminal = app.terminals.get_mut(&terminal_id).unwrap();
         terminal.detected_agent = Some(Agent::Codex);
         terminal.set_manual_label("EchoLongName".into());
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let entries = agent_panel_entries(&app);
         let label = format_agent_panel_primary_label(&entries[0], 16);
@@ -3440,7 +3348,6 @@ lines = [
             .attached_terminal_id
             .clone();
         app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Codex);
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let entries = agent_panel_entries(&app);
         let label = format_agent_panel_primary_label(&entries[0], 30);
@@ -3462,7 +3369,6 @@ lines = [
             .attached_terminal_id
             .clone();
         app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Codex);
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let entries = agent_panel_entries(&app);
         let label = format_agent_panel_primary_label(&entries[0], 30);
@@ -3486,7 +3392,6 @@ lines = [
         let terminal = app.terminals.get_mut(&terminal_id).unwrap();
         terminal.detected_agent = Some(Agent::Codex);
         terminal.set_manual_label("Echo".into());
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let backend = ratatui::backend::TestBackend::new(40, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -3525,7 +3430,6 @@ lines = [
         let terminal = app.terminals.get_mut(&terminal_id).unwrap();
         terminal.detected_agent = Some(Agent::Codex);
         terminal.set_manual_label("EchoLongName".into());
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let backend = ratatui::backend::TestBackend::new(24, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -3696,7 +3600,6 @@ lines = [
         let terminal = app.terminals.get_mut(&terminal_id).unwrap();
         terminal.detected_agent = Some(Agent::Codex);
         terminal.set_manual_label("Echo".into());
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let backend = ratatui::backend::TestBackend::new(40, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -3741,7 +3644,6 @@ lines = [
         let terminal = app.terminals.get_mut(&terminal_id).unwrap();
         terminal.detected_agent = Some(Agent::Codex);
         terminal.set_manual_label("Echo".into());
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let backend = ratatui::backend::TestBackend::new(40, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -3778,7 +3680,6 @@ lines = [
             .get_mut(&terminal_id)
             .unwrap()
             .set_detected_state(Some(Agent::Codex), AgentState::Idle);
-        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let backend = ratatui::backend::TestBackend::new(40, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

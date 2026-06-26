@@ -42,6 +42,11 @@ pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
         use interprocess::local_socket::{prelude::*, GenericFilePath, ListenerOptions};
 
         let name = path.to_fs_name::<GenericFilePath>()?;
+        // Force a restrictive umask so the socket inode is born owner-only (0o600) rather
+        // than being created with the process default umask and chmod'd afterward. The
+        // post-bind `restrict_socket_permissions` call remains the authoritative mode, but
+        // this closes the brief TOCTOU window where another local user could connect.
+        let _umask = UmaskGuard::restrictive();
         ListenerOptions::new()
             .name(name)
             .reclaim_name(false)
@@ -159,11 +164,148 @@ pub(crate) fn restrict_socket_permissions(_path: &Path, _mode: u32) -> io::Resul
     Ok(())
 }
 
+/// Serializes every `UmaskGuard` so the process-global `umask` is only ever changed by one guard
+/// at a time. Without this, two overlapping guarded binds could interleave — one guard restoring
+/// the original permissive umask while another is still mid-`create_sync()` — recreating the very
+/// TOCTOU window the guard exists to close (and potentially leaving the umask stuck).
+#[cfg(unix)]
+static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard that installs a restrictive `umask` for its lifetime so files and sockets created
+/// while it is held are born without group/other access (`mode & 0o177 == 0`).
+///
+/// Construction acquires [`UMASK_LOCK`] and holds it for the guard's lifetime, so the
+/// set-umask → create → restore-umask sequence is atomic with respect to all other guards. Hold a
+/// guard only across the individual create/bind call it protects — the lock also serializes other
+/// guarded creates, so wrapping unrelated work would needlessly block them.
+#[cfg(unix)]
+pub(crate) struct UmaskGuard {
+    previous: libc::mode_t,
+    // Dropped after the custom `Drop` restores the umask, releasing the lock last.
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl UmaskGuard {
+    pub(crate) fn restrictive() -> Self {
+        let lock = UMASK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: `umask` cannot fail and always returns the previous mask. We restore it on drop,
+        // while still holding the lock, so no other guard observes the transient state.
+        let previous = unsafe { libc::umask(0o177) };
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: restore the mask captured at construction. Runs before `_lock` is dropped, so the
+        // restore is still serialized.
+        unsafe {
+            libc::umask(self.previous);
+        }
+    }
+}
+
+/// Windows has no `umask`; socket permissions are handled by `restrict_socket_permissions`
+/// (also a no-op there). The guard exists so callers stay platform-agnostic.
+#[cfg(windows)]
+pub(crate) struct UmaskGuard;
+
+#[cfg(windows)]
+impl UmaskGuard {
+    pub(crate) fn restrictive() -> Self {
+        Self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(windows)]
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_local_listener_creates_owner_only_socket() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Force a fully-permissive process umask so a socket created without the guard
+        // WOULD show group/other bits — isolating the guard as the thing under test.
+        // SAFETY: nextest runs each test in its own process; we restore the mask below.
+        let previous = unsafe { libc::umask(0) };
+
+        let dir = std::env::temp_dir().join(format!("herdr-ipc-umask-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.sock");
+        let _ = fs::remove_file(&path);
+
+        let listener = bind_local_listener(&path).expect("bind listener");
+        let mode = fs::metadata(&path)
+            .expect("stat socket")
+            .permissions()
+            .mode();
+
+        // SAFETY: restore the umask captured above.
+        unsafe {
+            libc::umask(previous);
+        }
+        drop(listener);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            mode & 0o177,
+            0,
+            "socket must be born owner-only, got mode {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn umask_guard_serializes_concurrent_creates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Permissive umask so any create that escaped the guard (e.g. a raced restore in another
+        // thread) would be born group/other-accessible. The guard's lock must serialize all of
+        // these so every file is 0600 regardless of interleaving.
+        // SAFETY: nextest isolates each test in its own process; restored after the joins.
+        let previous = unsafe { libc::umask(0) };
+        let dir = std::env::temp_dir().join(format!("herdr-ipc-umask-conc-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let path = dir.join(format!("f{i}"));
+                    let _ = fs::remove_file(&path);
+                    let _guard = UmaskGuard::restrictive();
+                    fs::File::create(&path).expect("create file under guard");
+                    fs::metadata(&path).expect("stat").permissions().mode()
+                })
+            })
+            .collect();
+        let modes: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // SAFETY: restore the umask captured above and confirm no guard left it stuck.
+        let after = unsafe { libc::umask(previous) };
+        let _ = fs::remove_dir_all(&dir);
+
+        for mode in modes {
+            assert_eq!(
+                mode & 0o177,
+                0,
+                "file born group/other-accessible under concurrent guards, mode {mode:o}"
+            );
+        }
+        assert_eq!(after & 0o777, 0, "process umask left stuck at {after:o}");
+    }
 
     #[test]
     fn stale_socket_connect_errors_keep_unix_would_block_strict() {
