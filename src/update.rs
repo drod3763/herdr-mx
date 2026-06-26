@@ -2222,8 +2222,17 @@ fn homebrew_cellar_keg_root_impl(path: &Path, allow_mx_formulae: bool) -> Option
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     if crate::build_info::channel() == MX_BUILD_CHANNEL {
+        // Share the formula-aware routing so a preview Homebrew install is told to upgrade the
+        // preview formula, not the stable one. For an unmanaged install this resolves to the
+        // releases instruction, so avoid repeating it.
+        let command = update_install_command();
+        if command == MX_RELEASES_UPDATE_COMMAND {
+            return Err(format!(
+                "self-update is disabled for herdr-mx builds; {MX_RELEASES_UPDATE_COMMAND}"
+            ));
+        }
         return Err(format!(
-            "self-update is disabled for herdr-mx builds; run `{MX_HOMEBREW_UPDATE_COMMAND}` for Homebrew installs or upgrade the herdr-mx tool through mise, or {MX_RELEASES_UPDATE_COMMAND}"
+            "self-update is disabled for herdr-mx builds; run `{command}`, or {MX_RELEASES_UPDATE_COMMAND}"
         ));
     }
     let channel = UpdateChannel::configured();
