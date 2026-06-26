@@ -50,8 +50,8 @@ class PreviewNotesTests(unittest.TestCase):
                 "deadbeef",
             )
             self.assertEqual(
-                data["assets"]["windows-x86_64"]["url"],
-                "https://github.com/ogulcancelik/herdr/releases/download/preview-2026-06-02-abcdef123456/herdr-windows-x86_64.exe",
+                data["assets"]["macos-aarch64"]["url"],
+                "https://github.com/ogulcancelik/herdr/releases/download/preview-2026-06-02-abcdef123456/herdr-macos-aarch64",
             )
             self.assertIn("2026-06-02-abcdef123456", data["builds"])
 
