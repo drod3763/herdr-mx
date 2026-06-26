@@ -1965,9 +1965,10 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
         return Err(io::Error::other("download failed"));
     }
 
-    // Verify BEFORE this binary is ever piped to and executed on the remote host. SHA-256 is
-    // mandatory (corruption / at-rest tamper); the minisign signature is mandatory (authenticity,
-    // the only check that survives a compromised release host).
+    // Verify BEFORE this binary is ever piped to and executed on the remote host. The minisign
+    // signature is mandatory (authenticity, the only check that survives a compromised release
+    // host); SHA-256 is an optional cheap corruption pre-check, verified only when the manifest
+    // advertises one (see `verify_downloaded_asset`).
     if let Err(err) = verify_downloaded_asset(&path, asset) {
         let _ = fs::remove_dir_all(&dir);
         return Err(err);
