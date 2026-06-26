@@ -1933,19 +1933,18 @@ fn print_running_session_update_outcomes(
 
 pub(crate) fn update_install_command() -> &'static str {
     let channel = crate::build_info::channel();
-    // mx ships through a ubi-backend mise install whose tool directory is not named
-    // `herdr`, so the strict detector misses it; use the relaxed mx detector here.
-    let is_mise = if channel == MX_BUILD_CHANNEL {
-        is_mx_mise_managed_install()
+    // mx installs under the `herdr-mx` Homebrew formula and a ubi-backend mise tool
+    // directory, neither named `herdr`, so the strict detectors miss them; use the
+    // relaxed mx detectors for mx builds.
+    let (is_homebrew, is_mise) = if channel == MX_BUILD_CHANNEL {
+        (
+            is_mx_homebrew_managed_install(),
+            is_mx_mise_managed_install(),
+        )
     } else {
-        is_mise_managed_install()
+        (is_homebrew_managed_install(), is_mise_managed_install())
     };
-    select_update_command(
-        channel,
-        is_homebrew_managed_install(),
-        is_mise,
-        is_nix_managed_install(),
-    )
+    select_update_command(channel, is_homebrew, is_mise, is_nix_managed_install())
 }
 
 /// Pure mapping from build channel + detected install manager to the command we tell
@@ -2007,6 +2006,30 @@ fn is_homebrew_managed_install() -> bool {
     };
 
     is_homebrew_managed_exe_path_following_links(&current_exe)
+}
+
+/// Relaxed Homebrew detection for mx builds, which install under the `herdr-mx` /
+/// `herdr-mx-preview` Cellar formula rather than `herdr`. See [`is_mx_mise_managed_install`]
+/// for the analogous mise case.
+fn is_mx_homebrew_managed_install() -> bool {
+    let Ok(current_exe) = env::current_exe() else {
+        return false;
+    };
+
+    is_mx_homebrew_managed_exe_path_following_links(&current_exe)
+}
+
+fn is_mx_homebrew_managed_exe_path_following_links(path: &Path) -> bool {
+    if is_mx_homebrew_managed_exe_path(path) {
+        return true;
+    }
+
+    path.canonicalize()
+        .is_ok_and(|path| is_mx_homebrew_managed_exe_path(&path))
+}
+
+fn is_mx_homebrew_managed_exe_path(path: &Path) -> bool {
+    homebrew_cellar_keg_root_impl(path, true).is_some()
 }
 
 fn is_nix_managed_install() -> bool {
@@ -2207,6 +2230,13 @@ fn is_homebrew_managed_exe_path(path: &Path) -> bool {
 }
 
 fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
+    homebrew_cellar_keg_root_impl(path, false)
+}
+
+/// `allow_mx_formulae` additionally accepts the mx Cellar formula names (`herdr-mx`,
+/// `herdr-mx-preview`) produced by `brew install drod3763/tap/herdr-mx`. The binary itself
+/// is still installed as `herdr`, so the keg shape is `Cellar/<formula>/<version>/bin/herdr`.
+fn homebrew_cellar_keg_root_impl(path: &Path, allow_mx_formulae: bool) -> Option<PathBuf> {
     if path.file_name()? != "herdr" {
         return None;
     }
@@ -2216,7 +2246,11 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
     }
     let version_dir = bin_dir.parent()?;
     let formula_dir = version_dir.parent()?;
-    if formula_dir.file_name()? != "herdr" {
+    let formula_name = formula_dir.file_name()?;
+    let formula_matches = formula_name == "herdr"
+        || (allow_mx_formulae
+            && (formula_name == "herdr-mx" || formula_name == "herdr-mx-preview"));
+    if !formula_matches {
         return None;
     }
     let cellar_dir = formula_dir.parent()?;
@@ -2852,6 +2886,31 @@ mod tests {
         let path = Path::new("/home/linuxbrew/.linuxbrew/Cellar/herdr/0.5.9/bin/herdr");
 
         assert!(is_homebrew_managed_exe_path(path));
+    }
+
+    #[test]
+    fn mx_homebrew_cellar_path_is_detected() {
+        // `brew install drod3763/tap/herdr-mx` installs under the `herdr-mx` formula
+        // (preview under `herdr-mx-preview`); the binary is still `herdr`.
+        let stable = Path::new("/opt/homebrew/Cellar/herdr-mx/0.7.1/bin/herdr");
+        let preview = Path::new("/opt/homebrew/Cellar/herdr-mx-preview/0.7.1/bin/herdr");
+        // The strict (upstream-formula) detector requires a `herdr` formula and misses these.
+        assert!(!is_homebrew_managed_exe_path(stable));
+        assert!(!is_homebrew_managed_exe_path(preview));
+        // The relaxed mx detector recognizes the mx formulae.
+        assert!(is_mx_homebrew_managed_exe_path(stable));
+        assert!(is_mx_homebrew_managed_exe_path(preview));
+    }
+
+    #[test]
+    fn mx_homebrew_detection_rejects_non_cellar() {
+        assert!(!is_mx_homebrew_managed_exe_path(Path::new(
+            "/usr/local/bin/herdr"
+        )));
+        // An unrelated mx-prefixed formula directory outside Cellar must not match.
+        assert!(!is_mx_homebrew_managed_exe_path(Path::new(
+            "/opt/homebrew/opt/herdr-mx/bin/herdr"
+        )));
     }
 
     #[test]
