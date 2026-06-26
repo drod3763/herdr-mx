@@ -35,6 +35,11 @@ const NIX_UPDATE_COMMAND: &str = "update through Nix";
 // herdr that lacks the multi-remote client.
 const MX_BUILD_CHANNEL: &str = "mx";
 const MX_HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr-mx";
+// mx is installed via a ubi backend (`mise use -g "ubi:drod3763/herdr-mx[exe=herdr]"`),
+// so the mise tool name is not `herdr` and `mise upgrade herdr` would target the wrong
+// tool. Bare `mise upgrade` (the command documented in the README) upgrades the install
+// regardless of its backend-derived tool name.
+const MX_MISE_UPDATE_COMMAND: &str = "mise upgrade";
 const MX_RELEASES_UPDATE_COMMAND: &str =
     "install a newer herdr-mx from https://github.com/drod3763/herdr-mx/releases";
 const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
@@ -1927,10 +1932,18 @@ fn print_running_session_update_outcomes(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn update_install_command() -> &'static str {
+    let channel = crate::build_info::channel();
+    // mx ships through a ubi-backend mise install whose tool directory is not named
+    // `herdr`, so the strict detector misses it; use the relaxed mx detector here.
+    let is_mise = if channel == MX_BUILD_CHANNEL {
+        is_mx_mise_managed_install()
+    } else {
+        is_mise_managed_install()
+    };
     select_update_command(
-        crate::build_info::channel(),
+        channel,
         is_homebrew_managed_install(),
-        is_mise_managed_install(),
+        is_mise,
         is_nix_managed_install(),
     )
 }
@@ -1954,7 +1967,7 @@ fn select_update_command(
             return MX_HOMEBREW_UPDATE_COMMAND;
         }
         if is_mise {
-            return MISE_UPDATE_COMMAND;
+            return MX_MISE_UPDATE_COMMAND;
         }
         return MX_RELEASES_UPDATE_COMMAND;
     }
@@ -2010,6 +2023,31 @@ fn is_mise_managed_install() -> bool {
     };
 
     is_mise_managed_exe_path_following_links(&current_exe)
+}
+
+/// Relaxed mise detection for mx builds. mx is installed via a ubi backend
+/// (`ubi:drod3763/herdr-mx`), which mise stores under a backend-derived tool directory
+/// rather than `herdr`, so [`is_mise_managed_install`] misses it. This variant keys only
+/// on the `installs/<tool>/<version>/bin/herdr` shape and accepts any tool directory.
+fn is_mx_mise_managed_install() -> bool {
+    let Ok(current_exe) = env::current_exe() else {
+        return false;
+    };
+
+    is_mx_mise_managed_exe_path_following_links(&current_exe)
+}
+
+fn is_mx_mise_managed_exe_path_following_links(path: &Path) -> bool {
+    if is_mx_mise_managed_exe_path(path) {
+        return true;
+    }
+
+    path.canonicalize()
+        .is_ok_and(|path| is_mx_mise_managed_exe_path(&path))
+}
+
+fn is_mx_mise_managed_exe_path(path: &Path) -> bool {
+    mise_install_root_impl(path, true).is_some()
 }
 
 pub(crate) fn preview_channel_rejection_for_current_install() -> Option<&'static str> {
@@ -2092,24 +2130,38 @@ fn is_mise_managed_exe_path(path: &Path) -> bool {
 }
 
 fn mise_install_root(path: &Path) -> Option<PathBuf> {
-    if let Some(root) = mise_install_root_under_configured_installs_dir(path) {
+    mise_install_root_impl(path, false)
+}
+
+/// `allow_any_tool` relaxes the requirement that the mise tool directory be named `herdr`,
+/// so a ubi-backend mx install (tool directory derived from `ubi:drod3763/herdr-mx`) is
+/// still recognized. The surrounding `installs/<tool>/<version>/bin/herdr` structure is
+/// always required.
+fn mise_install_root_impl(path: &Path, allow_any_tool: bool) -> Option<PathBuf> {
+    if let Some(root) = mise_install_root_under_configured_installs_dir(path, allow_any_tool) {
         return Some(root);
     }
 
-    mise_install_root_under_named_installs_dir(path)
+    mise_install_root_under_named_installs_dir(path, allow_any_tool)
 }
 
-fn mise_install_root_under_configured_installs_dir(path: &Path) -> Option<PathBuf> {
+fn mise_install_root_under_configured_installs_dir(
+    path: &Path,
+    allow_any_tool: bool,
+) -> Option<PathBuf> {
     let installs_dir = env::var_os(MISE_INSTALLS_DIR_ENV)
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())?;
-    let version_dir = mise_tool_version_dir(path)?;
+    let version_dir = mise_tool_version_dir(path, allow_any_tool)?;
     let tool_dir = version_dir.parent()?;
     paths_match(tool_dir.parent()?, &installs_dir).then_some(version_dir.to_path_buf())
 }
 
-fn mise_install_root_under_named_installs_dir(path: &Path) -> Option<PathBuf> {
-    let version_dir = mise_tool_version_dir(path)?;
+fn mise_install_root_under_named_installs_dir(
+    path: &Path,
+    allow_any_tool: bool,
+) -> Option<PathBuf> {
+    let version_dir = mise_tool_version_dir(path, allow_any_tool)?;
     let tool_dir = version_dir.parent()?;
     let installs_dir = tool_dir.parent()?;
     if installs_dir.file_name()? != "installs" {
@@ -2118,7 +2170,7 @@ fn mise_install_root_under_named_installs_dir(path: &Path) -> Option<PathBuf> {
     Some(version_dir.to_path_buf())
 }
 
-fn mise_tool_version_dir(path: &Path) -> Option<&Path> {
+fn mise_tool_version_dir(path: &Path, allow_any_tool: bool) -> Option<&Path> {
     if path.file_name()? != "herdr" {
         return None;
     }
@@ -2127,9 +2179,11 @@ fn mise_tool_version_dir(path: &Path) -> Option<&Path> {
         return None;
     }
     let version_dir = bin_dir.parent()?;
-    let tool_dir = version_dir.parent()?;
-    if tool_dir.file_name()? != "herdr" {
-        return None;
+    if !allow_any_tool {
+        let tool_dir = version_dir.parent()?;
+        if tool_dir.file_name()? != "herdr" {
+            return None;
+        }
     }
     Some(version_dir)
 }
@@ -2180,7 +2234,7 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     if crate::build_info::channel() == MX_BUILD_CHANNEL {
         return Err(format!(
-            "self-update is disabled for herdr-mx builds; run `{MX_HOMEBREW_UPDATE_COMMAND}` for Homebrew installs or `{MISE_UPDATE_COMMAND}` for mise installs, or {MX_RELEASES_UPDATE_COMMAND}"
+            "self-update is disabled for herdr-mx builds; run `{MX_HOMEBREW_UPDATE_COMMAND}` for Homebrew installs or `{MX_MISE_UPDATE_COMMAND}` for mise installs, or {MX_RELEASES_UPDATE_COMMAND}"
         ));
     }
     let channel = UpdateChannel::configured();
@@ -2502,10 +2556,10 @@ mod tests {
             select_update_command(MX_BUILD_CHANNEL, true, false, false),
             MX_HOMEBREW_UPDATE_COMMAND
         );
-        // mise-managed mx install → mise upgrade, not a manual releases install.
+        // mise-managed mx install → mx mise upgrade, not a manual releases install.
         assert_eq!(
             select_update_command(MX_BUILD_CHANNEL, false, true, false),
-            MISE_UPDATE_COMMAND
+            MX_MISE_UPDATE_COMMAND
         );
         // Homebrew wins when both managers somehow match.
         assert_eq!(
@@ -2823,6 +2877,27 @@ mod tests {
             mise_install_root(path).unwrap(),
             PathBuf::from("/home/user/.local/share/mise/installs/herdr/0.6.6")
         );
+    }
+
+    #[test]
+    fn mx_mise_ubi_backend_install_path_is_detected() {
+        // `mise use -g "ubi:drod3763/herdr-mx[exe=herdr]"` installs under a backend-derived
+        // tool directory (not `herdr`); the binary is still `<tool>/<version>/bin/herdr`.
+        let path = Path::new(
+            "/home/user/.local/share/mise/installs/ubi-drod3763-herdr-mx/0.7.1/bin/herdr",
+        );
+        // The strict (upstream-registry) detector requires a `herdr` tool dir and misses it.
+        assert!(!is_mise_managed_exe_path(path));
+        // The relaxed mx detector recognizes it so mx mise installs get mise update guidance.
+        assert!(is_mx_mise_managed_exe_path(path));
+    }
+
+    #[test]
+    fn mx_mise_relaxed_detection_still_requires_installs_structure() {
+        // A bare direct install must not be misread as mise even under the relaxed mx check.
+        assert!(!is_mx_mise_managed_exe_path(Path::new(
+            "/home/user/.local/bin/herdr"
+        )));
     }
 
     #[test]
