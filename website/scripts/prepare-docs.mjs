@@ -51,39 +51,37 @@ async function preparePublicAssets() {
     }
   }
 
-  // The updater fails closed when <manifest>.minisig is missing, so serving a manifest without its
-  // signature would brick `herdr update` / remote-download for every client. Enforce signed
-  // manifests on the production update deploy — automatically, so a forgotten env var can't open a
-  // hole — while keeping local, CI, and Cloudflare *preview* builds permissive so the docs site
-  // still builds without the signing key.
-  //
-  // Enforcement is on when either:
-  //   - REQUIRE_MANIFEST_SIGNATURES=1 is set explicitly (force-on for any caller), or
-  //   - this is the Cloudflare Pages production deploy (CF_PAGES=1 on a production branch).
-  // HERDR_DOCS_ALLOW_UNSIGNED=1 forces permissive (local docs build without the signing key); an
-  // explicit REQUIRE_MANIFEST_SIGNATURES=1 still wins over it.
-  const PRODUCTION_DEPLOY_BRANCHES = new Set(['mx', 'master']);
-  const isCloudflareProduction =
-    process.env.CF_PAGES === '1' &&
-    PRODUCTION_DEPLOY_BRANCHES.has(process.env.CF_PAGES_BRANCH ?? '');
-  const forceOn = process.env.REQUIRE_MANIFEST_SIGNATURES === '1';
-  const optOut = process.env.HERDR_DOCS_ALLOW_UNSIGNED === '1';
-  const enforceSignatures = forceOn || (isCloudflareProduction && !optOut);
-  if (enforceSignatures) {
-    for (const [manifest, signature] of [
-      ['latest.json', 'latest.json.minisig'],
-      ['preview.json', 'preview.json.minisig'],
-    ]) {
-      if (
-        existsSync(resolve(publicDir, manifest)) &&
-        !existsSync(resolve(publicDir, signature))
-      ) {
+  // The updater fetches <manifest>.minisig before parsing the manifest, so an unsigned manifest is
+  // unusable to clients and must never be served. But publishing the docs site must not depend on
+  // the signing key, so a missing sidecar never takes the whole site down. Therefore:
+  //   - manifest + sidecar both present  -> publish both (already copied above);
+  //   - manifest present, sidecar absent -> DROP the manifest from the published output (and warn),
+  //     so the docs site still deploys while no unsigned manifest is ever served — the updater then
+  //     simply finds no manifest (a soft "couldn't check for updates") instead of fetching one whose
+  //     signature 404s;
+  //   - REQUIRE_MANIFEST_SIGNATURES=1 (release/production pipelines that guarantee sidecars) turns a
+  //     missing sidecar into a hard build failure instead of a silent drop, so a broken signing step
+  //     can't quietly ship an empty update channel.
+  const requireSignatures = process.env.REQUIRE_MANIFEST_SIGNATURES === '1';
+  for (const [manifest, signature] of [
+    ['latest.json', 'latest.json.minisig'],
+    ['preview.json', 'preview.json.minisig'],
+  ]) {
+    const manifestPath = resolve(publicDir, manifest);
+    const signaturePath = resolve(publicDir, signature);
+    if (existsSync(manifestPath) && !existsSync(signaturePath)) {
+      if (requireSignatures) {
         throw new Error(
           `${manifest} is being published without ${signature}; herdr clients require a signed ` +
-            `manifest. Run the signing workflow (or restore the .minisig) before deploying. ` +
-            `For a local docs build without the signing key, set HERDR_DOCS_ALLOW_UNSIGNED=1.`,
+            `manifest. Run the signing workflow (or restore the .minisig) before deploying.`,
         );
       }
+      console.warn(
+        `warning: ${manifest} has no ${signature}; dropping it from the published output so no ` +
+          `unsigned manifest is served. Sign it (or set REQUIRE_MANIFEST_SIGNATURES=1 to fail the ` +
+          `build) to publish the update channel.`,
+      );
+      await rm(manifestPath, { force: true });
     }
   }
 
