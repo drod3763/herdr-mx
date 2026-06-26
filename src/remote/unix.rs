@@ -1891,6 +1891,32 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
         ));
     }
 
+    // Authenticate the manifest before trusting the URLs/versions it dictates for a binary that is
+    // about to be executed on a remote host. Verify a detached minisign signature over the manifest
+    // bytes against the embedded release key, then parse.
+    let sig_url = format!("{UPDATE_MANIFEST_URL}.minisig");
+    let sig_output = Command::new("curl")
+        .args([
+            "-sfL",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "20",
+            &sig_url,
+        ])
+        .output()
+        .map_err(|err| io::Error::new(err.kind(), format!("curl failed: {err}")))?;
+    if !sig_output.status.success() {
+        return Err(io::Error::other(format!(
+            "failed to fetch manifest signature from {sig_url}"
+        )));
+    }
+    crate::signing::verify_signature_bytes(&manifest_output.stdout, &sig_output.stdout).map_err(
+        |err| io::Error::other(format!("manifest signature verification failed: {err}")),
+    )?;
+
     let manifest: RemoteUpdateManifest = serde_json::from_slice(&manifest_output.stdout)
         .map_err(|err| io::Error::other(format!("failed to parse update manifest JSON: {err}")))?;
 

@@ -339,6 +339,31 @@ where
         return Err("failed to fetch update manifest".into());
     }
 
+    // Authenticate the manifest itself before trusting ANY field. The manifest is the updater's
+    // root of trust — it dictates the version, download URL, signature URL, and hash. Without a
+    // signature over the manifest bytes, a compromised or stale host could advertise any
+    // validly-signed-but-wrong artifact (downgrade, cross-channel, rollback). Verify a detached
+    // minisign signature over the exact bytes against the embedded release key, then parse.
+    let sig_url = format!("{url}.minisig");
+    let sig = Command::new("curl")
+        .args([
+            "-sfL",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "20",
+            &sig_url,
+        ])
+        .output()
+        .map_err(|e| format!("curl failed: {e}"))?;
+    if !sig.status.success() {
+        return Err(format!("failed to fetch manifest signature from {sig_url}"));
+    }
+    crate::signing::verify_signature_bytes(&output.stdout, &sig.stdout)
+        .map_err(|e| format!("manifest signature verification failed: {e}"))?;
+
     serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("failed to parse update manifest JSON: {e}"))
 }

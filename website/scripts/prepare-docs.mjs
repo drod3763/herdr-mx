@@ -23,12 +23,21 @@ async function preparePublicAssets() {
   await rm(publicDir, { recursive: true, force: true });
   await mkdir(publicDir, { recursive: true });
 
+  // Files that may legitimately be absent (preview.json only after a preview run; the manifest
+  // signatures only after a signed release). Their absence must not fail a local/docs build.
+  const optional = new Set([
+    'preview.json',
+    'latest.json.minisig',
+    'preview.json.minisig',
+  ]);
   for (const file of [
     'install.sh',
     'install.ps1',
     'agent-guide.md',
     'latest.json',
+    'latest.json.minisig',
     'preview.json',
+    'preview.json.minisig',
     'robots.txt',
     '_headers',
     '_redirects',
@@ -37,7 +46,7 @@ async function preparePublicAssets() {
     try {
       await cp(source, resolve(publicDir, file));
     } catch (error) {
-      if (file !== 'preview.json' || error.code !== 'ENOENT') throw error;
+      if (!optional.has(file) || error.code !== 'ENOENT') throw error;
     }
   }
 
