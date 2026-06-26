@@ -143,7 +143,19 @@ fn run_verify(args: &[String]) -> std::io::Result<i32> {
         PathBuf::from(os)
     });
 
-    let signature = std::fs::read(&sig_path)?;
+    let signature = match std::fs::read(&sig_path) {
+        Ok(signature) => signature,
+        Err(err) => {
+            // A missing or unreadable sidecar is a common, user-facing failure for this command;
+            // report it like any other verification failure (clear message, exit code 1) rather
+            // than as a generic top-level I/O error.
+            eprintln!(
+                "FAILED: cannot read signature {}: {err}",
+                sig_path.display()
+            );
+            return Ok(1);
+        }
+    };
     match crate::signing::verify_signature(&path, &signature) {
         Ok(()) => {
             println!(
