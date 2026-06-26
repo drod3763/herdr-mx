@@ -17,7 +17,7 @@
 
 **herdr-mx** is a friendly downstream distribution of [herdr](https://github.com/ogulcancelik/herdr) by [@ogulcancelik](https://github.com/ogulcancelik). it tracks every upstream release and adds one big thing: a full **multi-remote client** — attach to herdr servers on all your machines at once, one sidebar, one keymap, zero ssh tabs. all credit for herdr itself goes upstream; herdr-mx exists so you can run multi-remote *today*, and retires the day it lands upstream.
 
-everything herdr-mx adds is documented in [DIVERGENCE.md](DIVERGENCE.md). report herdr-mx issues [here](https://github.com/2lab-ai/herdr-mx/issues), **not** upstream — if `herdr --version` prints a `-mx.` version, it's this distribution.
+everything herdr-mx adds is documented in [DIVERGENCE.md](DIVERGENCE.md). report herdr-mx issues [here](https://github.com/drod3763/herdr-mx/issues), **not** upstream — if `herdr --version` prints a `-mx.` version, it's this distribution.
 
 ---
 
@@ -38,10 +38,10 @@ brew install drod3763/tap/herdr-mx
 or install with mise (straight from GitHub releases):
 
 ```bash
-mise use -g "ubi:2lab-ai/herdr-mx[exe=herdr]"
+mise use -g "ubi:drod3763/herdr-mx[exe=herdr]"
 ```
 
-or download the Linux/macOS binary from [releases](https://github.com/2lab-ai/herdr-mx/releases). the binary installs as `herdr` — a drop-in replacement for upstream herdr, so don't install both. native Windows builds are not available in herdr-mx yet (tracked in [#63](https://github.com/2lab-ai/herdr-mx/issues/63)).
+or download the Linux/macOS binary from [releases](https://github.com/drod3763/herdr-mx/releases). the binary installs as `herdr` — a drop-in replacement for upstream herdr, so don't install both. native Windows builds are not available in herdr-mx yet (tracked in [#63](https://github.com/drod3763/herdr-mx/issues/63)).
 
 ## quick start
 
@@ -78,7 +78,7 @@ brew upgrade herdr-mx        # Homebrew
 mise upgrade                 # mise
 ```
 
-or install a newer binary from [releases](https://github.com/2lab-ai/herdr-mx/releases). `herdr update` and the herdr.dev update channels are intentionally disabled in mx builds — they would replace this binary with a stock herdr that lacks the multi-remote client. After updating, use the same stop-and-run-again flow as upstream if a session is still running the old server.
+or install a newer binary from [releases](https://github.com/drod3763/herdr-mx/releases). `herdr update` and the herdr.dev update channels are intentionally disabled in mx builds — they would replace this binary with a stock herdr that lacks the multi-remote client. After updating, use the same stop-and-run-again flow as upstream if a session is still running the old server.
 
 ## how it compares
 
