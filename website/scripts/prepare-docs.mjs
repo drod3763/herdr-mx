@@ -51,11 +51,16 @@ async function preparePublicAssets() {
     }
   }
 
-  // The updater fails closed when <manifest>.minisig is missing, so a production/release deploy must
-  // never publish a manifest without its signature. Enforce that when REQUIRE_MANIFEST_SIGNATURES=1
-  // (set in the production/release deploy). Local and docs builds leave it unset, keeping the
-  // sidecars optional so they don't need the signing key.
-  if (process.env.REQUIRE_MANIFEST_SIGNATURES === '1') {
+  // The updater fails closed when <manifest>.minisig is missing, so publishing a manifest without
+  // its signature would brick `herdr update` / remote-download for every client. Enforce this by
+  // DEFAULT (fail closed) so a deploy can never silently publish an unsigned manifest just because
+  // an env var was forgotten. A local or docs build without the signing key sets
+  // HERDR_DOCS_ALLOW_UNSIGNED=1 to opt out (it still copies a sidecar if one is present).
+  // REQUIRE_MANIFEST_SIGNATURES=1 is still honored as an explicit force-on for callers that set it.
+  const allowUnsigned =
+    process.env.HERDR_DOCS_ALLOW_UNSIGNED === '1' &&
+    process.env.REQUIRE_MANIFEST_SIGNATURES !== '1';
+  if (!allowUnsigned) {
     for (const [manifest, signature] of [
       ['latest.json', 'latest.json.minisig'],
       ['preview.json', 'preview.json.minisig'],
@@ -66,7 +71,8 @@ async function preparePublicAssets() {
       ) {
         throw new Error(
           `${manifest} is being published without ${signature}; herdr clients require a signed ` +
-            `manifest. Run the signing workflow (or restore the .minisig) before deploying.`,
+            `manifest. Run the signing workflow (or restore the .minisig) before deploying. ` +
+            `For a local docs build without the signing key, set HERDR_DOCS_ALLOW_UNSIGNED=1.`,
         );
       }
     }
