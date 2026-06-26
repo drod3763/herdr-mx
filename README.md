@@ -32,7 +32,7 @@ workspaces, tabs, panes. mouse-native: click, drag, split. every agent at a glan
 ## install
 
 ```bash
-brew install 2lab-ai/tap/herdr-mx
+brew install drod3763/tap/herdr-mx
 ```
 
 or install with mise (straight from GitHub releases):

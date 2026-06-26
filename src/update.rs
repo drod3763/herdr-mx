@@ -36,7 +36,7 @@ const NIX_UPDATE_COMMAND: &str = "update through Nix";
 const MX_BUILD_CHANNEL: &str = "mx";
 const MX_HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr-mx";
 const MX_RELEASES_UPDATE_COMMAND: &str =
-    "install a newer herdr-mx from https://github.com/2lab-ai/herdr-mx/releases";
+    "install a newer herdr-mx from https://github.com/drod3763/herdr-mx/releases";
 const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
 const FAKE_UPDATE_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_VERSION";
 const FAKE_UPDATE_NOTES_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_NOTES_VERSION";

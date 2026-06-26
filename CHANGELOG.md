@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## [0.7.1-mx.1] - 2026-06-26
+
+First herdr-mx release on top of upstream herdr 0.7.1 (see the [0.7.1] entry for upstream changes). This release focuses on release-artifact authenticity for the mx self-update and remote-seed paths.
+
+### Added
+- Release artifacts are now signed with minisign (ed25519). Herdr verifies both the signature and SHA-256 of any binary it downloads for self-update or remote seed/handoff before running it, so a compromised release host cannot serve a forged binary. The accepted public key is embedded in the binary.
+- The update manifest is now authenticated with a detached minisign signature; the updater verifies the manifest before trusting any version, URL, or hash it lists.
+
+### Changed
+- Stopped building and shipping Windows artifacts. herdr-mx releases now cover Linux (x86_64, aarch64) and macOS (x86_64, aarch64).
+- Self-update is bound to the exact advertised version, release channel, and build id, and refuses rollback to an older build.
+
+### Fixed
+- Local sockets and remote-seed download directories are created with restrictive owner-only permissions.
+- Remote-seed staging is hardened: unreadable or corrupt bundle/signature sidecars now fail with a clear error instead of being silently trusted.
+
 ## [0.7.1] - 2026-06-24
 
 ### Added

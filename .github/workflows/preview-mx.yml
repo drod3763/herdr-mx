@@ -200,7 +200,7 @@ jobs:
             echo "Fat-bundle binaries; installs as \`herdr\`. Install with:"
             echo
             echo '```'
-            echo "brew install 2lab-ai/tap/herdr-mx-preview"
+            echo "brew install drod3763/tap/herdr-mx-preview"
             echo '```'
             echo
             if [ -n "$prev" ]; then
