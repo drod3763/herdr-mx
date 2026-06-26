@@ -646,25 +646,33 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
     }
 
     // Bind the artifact to the advertised release. A valid signature only proves the bytes are
-    // authentic herdr — not that they are the version the manifest claimed. Without this, a
-    // compromised manifest could point download_url/sig_url at an older, still-validly-signed
-    // release and silently downgrade the user to vulnerable code. Run the staged binary (already
-    // signature-verified, so safe to exec) and require it report exactly the version we resolved.
-    let reported_ok = match Command::new(&tmp_path).arg("--version").output() {
+    // authentic herdr — not that they are the version/channel the manifest claimed. Without this, a
+    // compromised manifest could point download_url/sig_url at another validly-signed release (an
+    // older version, or a same-base build from the other channel) and silently downgrade or
+    // cross-substitute. Run the staged binary (already signature-verified, so safe to exec) and
+    // require its `--version` to match BOTH the resolved numeric version AND the channel: stable
+    // builds never carry a "preview" marker, preview builds always do (build_info::FULL_VERSION).
+    let reported_token = match Command::new(&tmp_path).arg("--version").output() {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
             .split_whitespace()
-            .find_map(Version::parse)
-            .is_some_and(|reported| reported == release.version),
-        _ => false,
+            .find(|token| Version::parse(token).is_some())
+            .map(str::to_string),
+        _ => None,
     };
+    let release_is_preview = matches!(release.channel, UpdateChannel::Preview);
+    let reported_ok = reported_token.as_deref().is_some_and(|token| {
+        Version::parse(token).as_ref() == Some(&release.version)
+            && token.contains("preview") == release_is_preview
+    });
     if !reported_ok {
         let _ = fs::remove_file(&tmp_path);
         return Err(format!(
-            "downloaded update did not report the expected version {}; refusing to install (possible downgrade or substituted artifact)",
+            "downloaded update did not report the expected {} version {}; refusing to install (possible downgrade, channel substitution, or substituted artifact)",
+            release.channel.as_str(),
             release.version
         ));
     }
-    tracing::info!(version = %release.version, "downloaded update version verified");
+    tracing::info!(version = %release.version, channel = release.channel.as_str(), "downloaded update verified");
 
     Ok(DownloadedUpdate {
         current_exe,
