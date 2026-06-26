@@ -308,6 +308,29 @@ jobs:
           pathlib.Path('preview-sha256.json').write_text(json.dumps(result, indent=2) + '\n')
           PY
 
+      # herdr-mx: the updater requires a detached minisign signature for every asset it installs
+      # (mandatory on the unix self-update path). Sign the unix preview binaries so the preview
+      # channel (herdr.dev/preview.json) does not fail closed. Windows updates use the installer
+      # script, not the signature path, so its binary needs no sidecar.
+      - name: Sign preview artifacts
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PUBKEY: RWQupm2xx/vDQ2YjRHgy/84xAkdgzIgwIN/4CyOy5n1rQRQnHW34r3D2
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set; refusing to publish unsigned preview assets" >&2
+            exit 1
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          trap 'rm -f minisign.key' EXIT
+          for name in herdr-linux-x86_64 herdr-linux-aarch64 herdr-macos-x86_64 herdr-macos-aarch64; do
+            minisign -S -s minisign.key -m "artifacts/$name/$name"
+            minisign -Vm "artifacts/$name/$name" -P "$MINISIGN_PUBKEY"
+          done
+
       - name: Create preview prerelease
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
@@ -324,6 +347,10 @@ jobs:
             artifacts/herdr-macos-x86_64/herdr-macos-x86_64
             artifacts/herdr-macos-aarch64/herdr-macos-aarch64
             artifacts/herdr-windows-x86_64.exe/herdr-windows-x86_64.exe
+            artifacts/herdr-linux-x86_64/herdr-linux-x86_64.minisig
+            artifacts/herdr-linux-aarch64/herdr-linux-aarch64.minisig
+            artifacts/herdr-macos-x86_64/herdr-macos-x86_64.minisig
+            artifacts/herdr-macos-aarch64/herdr-macos-aarch64.minisig
 
       - name: Update preview manifest
         run: |
