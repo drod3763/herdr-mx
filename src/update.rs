@@ -659,11 +659,9 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
             .map(str::to_string),
         _ => None,
     };
-    let release_is_preview = matches!(release.channel, UpdateChannel::Preview);
-    let reported_ok = reported_token.as_deref().is_some_and(|token| {
-        Version::parse(token).as_ref() == Some(&release.version)
-            && token.contains("preview") == release_is_preview
-    });
+    let reported_ok = reported_token
+        .as_deref()
+        .is_some_and(|token| staged_version_matches(token, release));
     if !reported_ok {
         let _ = fs::remove_file(&tmp_path);
         return Err(format!(
@@ -678,6 +676,34 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         current_exe,
         tmp_path: Some(tmp_path),
     })
+}
+
+/// Whether the staged binary's reported `--version` `token` is exactly the release we resolved.
+/// A valid signature proves authenticity, not identity; this binds the artifact to the manifest's
+/// version, channel, and — for preview — exact build id, so a compromised manifest cannot
+/// substitute another validly-signed build (cross-channel, an older version, or an older preview).
+///
+/// `Version::parse` strips channel/build suffixes, so the numeric core alone is insufficient. The
+/// channel is inferred from the "preview" marker (stable builds never carry it, preview builds
+/// always do — build_info::FULL_VERSION). For preview, the manifest build id is embedded verbatim
+/// in the reported version (`{base}-preview.{build_id}`, see build.rs), so requiring it blocks
+/// rollback to an older same-base signed preview.
+#[cfg(not(windows))]
+fn staged_version_matches(token: &str, release: &ReleaseInfo) -> bool {
+    if Version::parse(token).as_ref() != Some(&release.version) {
+        return false;
+    }
+    let token_is_preview = token.contains("preview");
+    match release.channel {
+        UpdateChannel::Stable => !token_is_preview,
+        UpdateChannel::Preview => {
+            token_is_preview
+                && release
+                    .build_id
+                    .as_deref()
+                    .is_some_and(|build_id| token.contains(build_id))
+        }
+    }
 }
 
 /// Download the detached minisign signature from `sig_url` and verify it over `file` against the
@@ -2428,6 +2454,49 @@ mod tests {
             sig_url: "https://example.com/herdr.minisig".to_string(),
             notes_body: "### Changed\n- One".to_string(),
         }
+    }
+
+    fn fake_preview_release(version: &str, build_id: &str) -> ReleaseInfo {
+        ReleaseInfo {
+            version: Version::parse(version).unwrap(),
+            identity: super::preview_display_version(version, build_id),
+            channel: UpdateChannel::Preview,
+            build_id: Some(build_id.to_string()),
+            commit: None,
+            target_protocol: Some(2),
+            download_url: "https://example.com/herdr".to_string(),
+            sha256: None,
+            sig_url: "https://example.com/herdr.minisig".to_string(),
+            notes_body: "### Changed\n- One".to_string(),
+        }
+    }
+
+    #[test]
+    fn staged_version_matches_binds_version_channel_and_build() {
+        // Stable: exact base, no preview marker.
+        let stable = fake_release("9.9.9", Some(2));
+        assert!(super::staged_version_matches("9.9.9", &stable));
+        // Downgrade to an older signed stable is rejected (numeric core differs).
+        assert!(!super::staged_version_matches("9.9.8", &stable));
+        // A signed preview artifact cannot be substituted for a stable update.
+        assert!(!super::staged_version_matches("9.9.9-preview.123", &stable));
+
+        // Preview: build.rs reports `{base}-preview.{build_id}`.
+        let preview = fake_preview_release("9.9.9", "new");
+        assert!(super::staged_version_matches("9.9.9-preview.new", &preview));
+        // Regression (codex iter 5): an older same-base signed preview must NOT satisfy a manifest
+        // advertising a newer build id.
+        assert!(!super::staged_version_matches(
+            "9.9.9-preview.old",
+            &preview
+        ));
+        // A stable artifact cannot be substituted for a preview update.
+        assert!(!super::staged_version_matches("9.9.9", &preview));
+        // Wrong base version is rejected even with the right channel/build marker.
+        assert!(!super::staged_version_matches(
+            "9.9.8-preview.new",
+            &preview
+        ));
     }
 
     fn set_test_config_home(name: &str) -> PathBuf {
