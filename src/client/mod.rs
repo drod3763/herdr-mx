@@ -2116,6 +2116,9 @@ fn setup_terminal_with_capabilities(
         }
         execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
         push_keyboard_enhancement_flags()?;
+        if should_query_host_terminal_theme() {
+            set_host_color_scheme_reports(true)?;
+        }
     } else if mouse_capture {
         set_mouse_capture(true)?;
     } else {
@@ -2179,6 +2182,7 @@ fn restore_terminal_state(reset_modify_other_keys: bool) {
     }
 
     let _ = pop_keyboard_enhancement_flags();
+    let _ = set_host_color_scheme_reports(false);
     let _ = execute!(
         io::stdout(),
         DisableFocusChange,
@@ -6870,6 +6874,23 @@ fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io::Result<()>
     writer.flush()
 }
 
+/// Toggle host terminal mode 2031 so the host emits a color-scheme report whenever the OS
+/// appearance changes. Without this the thin client never receives the `?997` reports it
+/// reacts to in the input loop, so live theme refresh would be inert.
+fn write_host_color_scheme_reports(mut writer: impl io::Write, enabled: bool) -> io::Result<()> {
+    let sequence = if enabled {
+        crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_ENABLE_SEQUENCE
+    } else {
+        crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE
+    };
+    writer.write_all(sequence.as_bytes())?;
+    writer.flush()
+}
+
+fn set_host_color_scheme_reports(enabled: bool) -> io::Result<()> {
+    write_host_color_scheme_reports(io::stdout(), enabled)
+}
+
 fn init_logging() {
     crate::logging::init_file_logging("herdr-client.log");
 }
@@ -7302,6 +7323,23 @@ mod tests {
     #[test]
     fn host_terminal_theme_query_is_disabled_on_windows() {
         assert_eq!(should_query_host_terminal_theme(), !cfg!(windows));
+    }
+
+    #[test]
+    fn host_color_scheme_reports_toggle_mode_2031() {
+        let mut enable = Vec::new();
+        write_host_color_scheme_reports(&mut enable, true).unwrap();
+        assert_eq!(
+            enable,
+            crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_ENABLE_SEQUENCE.as_bytes()
+        );
+
+        let mut disable = Vec::new();
+        write_host_color_scheme_reports(&mut disable, false).unwrap();
+        assert_eq!(
+            disable,
+            crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes()
+        );
     }
 
     #[test]
