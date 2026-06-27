@@ -400,28 +400,43 @@ pub(crate) fn events_require_host_terminal_theme_query(events: &[RawInputEvent])
         .any(|event| matches!(event, RawInputEvent::HostColorSchemeChanged(_)))
 }
 
-/// Remove any host color-scheme report sequences (mode 2031 `?997` reports) from a raw input
-/// buffer, preserving every other byte. These reports are a client-only signal the client
-/// consumes locally (it re-queries the palette), so they must not reach the server PTY — even
-/// when the terminal coalesces a report into the same read as real user keystrokes.
+/// Remove any complete host color-scheme report (mode 2031 `ESC[?997;<digits>n`) from a raw
+/// input buffer, preserving every other byte. The client enables mode 2031 itself, so every
+/// such report — whatever appearance value it carries, including ones the parser doesn't
+/// classify — is client-only control traffic and must not reach the server PTY, even when the
+/// terminal coalesces a report into the same read as real keystrokes.
+///
+/// Returns `None` when there is nothing to strip, so the common keystroke path forwards the
+/// original buffer without reallocating. Incomplete (split) reports are left intact for the
+/// framer to reassemble.
 #[cfg(any(not(windows), test))]
-pub(crate) fn strip_host_color_scheme_reports(data: &[u8]) -> Vec<u8> {
-    const REPORTS: [&[u8]; 2] = [
-        GHOSTTY_COLOR_SCHEME_DARK_REPORT,
-        GHOSTTY_COLOR_SCHEME_LIGHT_REPORT,
-    ];
+pub(crate) fn strip_host_color_scheme_reports(data: &[u8]) -> Option<Vec<u8>> {
+    const PREFIX: &[u8] = b"\x1b[?997;";
+    if data.len() < PREFIX.len() || !data.windows(PREFIX.len()).any(|window| window == PREFIX) {
+        return None;
+    }
+
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
+    let mut stripped = false;
     while i < data.len() {
-        match REPORTS.iter().find(|report| data[i..].starts_with(report)) {
-            Some(report) => i += report.len(),
-            None => {
-                out.push(data[i]);
-                i += 1;
+        if data[i..].starts_with(PREFIX) {
+            let mut end = i + PREFIX.len();
+            while data.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            // A complete report is the prefix, one or more digits, then a terminating `n`.
+            if end > i + PREFIX.len() && data.get(end) == Some(&b'n') {
+                i = end + 1;
+                stripped = true;
+                continue;
             }
         }
+        out.push(data[i]);
+        i += 1;
     }
-    out
+
+    stripped.then_some(out)
 }
 
 pub fn spawn_input_reader() -> mpsc::Receiver<RawInputEvent> {
@@ -1064,8 +1079,9 @@ mod tests {
                 RawInputEvent::HostColorSchemeChanged(HostAppearance::Dark | HostAppearance::Light)
             ));
             assert!(events_require_host_terminal_theme_query(&events));
-            assert!(
-                strip_host_color_scheme_reports(bytes).is_empty(),
+            assert_eq!(
+                strip_host_color_scheme_reports(bytes).as_deref(),
+                Some(b"".as_slice()),
                 "a standalone color-scheme report should strip to nothing: {bytes:?}"
             );
         }
@@ -1074,22 +1090,48 @@ mod tests {
     #[test]
     fn strip_host_color_scheme_reports_preserves_other_bytes() {
         // Standalone report → nothing left.
-        assert!(strip_host_color_scheme_reports(GHOSTTY_COLOR_SCHEME_DARK_REPORT).is_empty());
+        assert_eq!(
+            strip_host_color_scheme_reports(GHOSTTY_COLOR_SCHEME_DARK_REPORT).as_deref(),
+            Some(b"".as_slice())
+        );
 
         // Report coalesced with real keystrokes → only the report is removed.
         let mut report_then_keys = GHOSTTY_COLOR_SCHEME_LIGHT_REPORT.to_vec();
         report_then_keys.extend_from_slice(b"ls\r");
-        assert_eq!(strip_host_color_scheme_reports(&report_then_keys), b"ls\r");
+        assert_eq!(
+            strip_host_color_scheme_reports(&report_then_keys).as_deref(),
+            Some(b"ls\r".as_slice())
+        );
+
+        // Unknown/unsupported appearance values are still complete mode-2031 reports and must
+        // be stripped by CSI shape, even though the parser classifies them as Unsupported.
+        for unknown in [b"\x1b[?997;0n".as_slice(), b"\x1b[?997;3n".as_slice()] {
+            assert_eq!(
+                strip_host_color_scheme_reports(unknown).as_deref(),
+                Some(b"".as_slice()),
+                "unknown report should strip to nothing: {unknown:?}"
+            );
+            let mut unknown_then_keys = unknown.to_vec();
+            unknown_then_keys.extend_from_slice(b"ls\r");
+            assert_eq!(
+                strip_host_color_scheme_reports(&unknown_then_keys).as_deref(),
+                Some(b"ls\r".as_slice())
+            );
+        }
+
+        // Plain input and incomplete (split) reports are left untouched (None = forward as-is).
+        assert_eq!(strip_host_color_scheme_reports(b"ls\r"), None);
+        assert_eq!(strip_host_color_scheme_reports(b"\x1b[?997;1"), None);
 
         // Report sandwiched between input, and multiple reports.
         let mut sandwiched = b"ab".to_vec();
         sandwiched.extend_from_slice(GHOSTTY_COLOR_SCHEME_DARK_REPORT);
         sandwiched.extend_from_slice(b"cd");
         sandwiched.extend_from_slice(GHOSTTY_COLOR_SCHEME_LIGHT_REPORT);
-        assert_eq!(strip_host_color_scheme_reports(&sandwiched), b"abcd");
-
-        // Plain input is untouched.
-        assert_eq!(strip_host_color_scheme_reports(b"ls\r"), b"ls\r");
+        assert_eq!(
+            strip_host_color_scheme_reports(&sandwiched).as_deref(),
+            Some(b"abcd".as_slice())
+        );
     }
 
     #[test]

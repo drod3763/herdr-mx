@@ -5079,22 +5079,20 @@ async fn run_client_loop(
                     }
                     // Re-query the terminal palette when the OS appearance changes so colors
                     // refresh live (the initial query fires once at client startup).
-                    let data =
-                        if crate::raw_input::events_require_host_terminal_theme_query(&events) {
-                            if should_query_host_terminal_theme() {
-                                query_host_terminal_theme();
-                            }
-                            // Host color-scheme reports are a client-only signal (consumed by the
-                            // re-query above); strip them so they never reach the server PTY, even
-                            // when coalesced into the same read as real keystrokes. Forward the rest.
-                            let stripped = crate::raw_input::strip_host_color_scheme_reports(&data);
-                            if stripped.is_empty() {
-                                continue;
-                            }
-                            stripped
-                        } else {
-                            data
-                        };
+                    if crate::raw_input::events_require_host_terminal_theme_query(&events)
+                        && should_query_host_terminal_theme()
+                    {
+                        query_host_terminal_theme();
+                    }
+                    // Host color-scheme reports are client-only control traffic (the client
+                    // enables mode 2031 itself); strip every complete report so it never reaches
+                    // the server PTY, even an unrecognized value or one coalesced into the same
+                    // read as real keystrokes. Forward the remainder; skip if nothing remains.
+                    let data = match crate::raw_input::strip_host_color_scheme_reports(&data) {
+                        Some(stripped) if stripped.is_empty() => continue,
+                        Some(stripped) => stripped,
+                        None => data,
+                    };
                     if let (Some(compositor), Some(model)) =
                         (&mut state.compositor, &mut state.supervisor_model)
                     {
