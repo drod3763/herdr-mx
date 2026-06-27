@@ -2108,6 +2108,12 @@ fn setup_terminal_with_capabilities(
 ) -> io::Result<TerminalGuard> {
     ratatui::init();
 
+    // Only the full client enables host color-scheme reports, so only it may disable them on
+    // restore. Tracking ownership keeps a direct-attach client (or a nested Herdr / caller that
+    // already had mode 2031 on) from clobbering host-terminal state it never enabled.
+    let enabled_host_color_scheme_reports =
+        client_terminal_enables_host_color_scheme_reports(enable_client_protocols);
+
     if enable_client_protocols {
         if mouse_capture {
             set_mouse_capture(true)?;
@@ -2116,7 +2122,7 @@ fn setup_terminal_with_capabilities(
         }
         execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
         push_keyboard_enhancement_flags()?;
-        if should_query_host_terminal_theme() {
+        if enabled_host_color_scheme_reports {
             set_host_color_scheme_reports(true)?;
         }
     } else if mouse_capture {
@@ -2141,12 +2147,16 @@ fn setup_terminal_with_capabilities(
 
     Ok(TerminalGuard {
         reset_modify_other_keys: modify_other_keys_mode.is_some(),
+        disable_host_color_scheme_reports: enabled_host_color_scheme_reports,
     })
 }
 
 /// Guard that restores the terminal when dropped.
 struct TerminalGuard {
     reset_modify_other_keys: bool,
+    /// True only when this client enabled host color-scheme reports (mode 2031) and therefore
+    /// owns disabling them on restore.
+    disable_host_color_scheme_reports: bool,
 }
 
 fn write_terminal_restore_postlude(writer: &mut impl io::Write) -> io::Result<()> {
@@ -2172,7 +2182,7 @@ fn desired_mouse_capture(server_enabled: bool, client_compositor_enabled: bool) 
     server_enabled || client_compositor_enabled
 }
 
-fn restore_terminal_state(reset_modify_other_keys: bool) {
+fn restore_terminal_state(reset_modify_other_keys: bool, disable_host_color_scheme_reports: bool) {
     let _ = clear_received_kitty_graphics(&mut io::stdout());
 
     // Reset modifyOtherKeys if we enabled it.
@@ -2182,7 +2192,10 @@ fn restore_terminal_state(reset_modify_other_keys: bool) {
     }
 
     let _ = pop_keyboard_enhancement_flags();
-    let _ = set_host_color_scheme_reports(false);
+    // Only disable mode 2031 if this client enabled it (see TerminalGuard).
+    if disable_host_color_scheme_reports {
+        let _ = set_host_color_scheme_reports(false);
+    }
     let _ = execute!(
         io::stdout(),
         DisableFocusChange,
@@ -2218,7 +2231,10 @@ fn pop_keyboard_enhancement_flags() -> io::Result<()> {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        restore_terminal_state(self.reset_modify_other_keys);
+        restore_terminal_state(
+            self.reset_modify_other_keys,
+            self.disable_host_color_scheme_reports,
+        );
     }
 }
 
@@ -2670,9 +2686,13 @@ fn run_client_with_mode(
 
     // Install a panic hook to restore the terminal on panic (same as monolithic).
     let panic_resets_modify_other_keys = terminal_guard.reset_modify_other_keys;
+    let panic_disables_host_color_scheme_reports = terminal_guard.disable_host_color_scheme_reports;
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal_state(panic_resets_modify_other_keys);
+        restore_terminal_state(
+            panic_resets_modify_other_keys,
+            panic_disables_host_color_scheme_reports,
+        );
         original_hook(info);
     }));
 
@@ -6864,6 +6884,12 @@ fn should_query_host_terminal_theme() -> bool {
     !cfg!(windows)
 }
 
+/// Whether a client terminal set up with the given protocol level enables (and therefore owns
+/// disabling) host color-scheme reports. Direct-attach terminals never enable them.
+fn client_terminal_enables_host_color_scheme_reports(enable_client_protocols: bool) -> bool {
+    enable_client_protocols && should_query_host_terminal_theme()
+}
+
 fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io::Result<()> {
     writer.write_all(crate::terminal_theme::HOST_COLOR_QUERY_SEQUENCE.as_bytes())?;
     writer.flush()
@@ -7334,6 +7360,17 @@ mod tests {
         assert_eq!(
             disable,
             crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes()
+        );
+    }
+
+    #[test]
+    fn only_full_client_owns_host_color_scheme_reports() {
+        // Direct-attach terminals never enable mode 2031, so restore must not disable it for
+        // them (which would clobber outer/nested terminal state they don't own).
+        assert!(!client_terminal_enables_host_color_scheme_reports(false));
+        assert_eq!(
+            client_terminal_enables_host_color_scheme_reports(true),
+            !cfg!(windows)
         );
     }
 
