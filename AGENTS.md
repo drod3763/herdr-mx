@@ -171,7 +171,7 @@ The release workflows must publish these four assets:
 
 ## External contributor guardrail
 
-Before opening an issue, opening a PR, or pushing branches to this repository, detect the acting GitHub account when possible. Check `gh auth status`, the configured git remote, or the available environment context. If the acting account is not `ogulcancelik`, treat the human as an *external contributor* unless this is clearly a private or custom fork.
+Before opening an issue, opening a PR, or pushing branches to this repository, detect the acting GitHub account when possible. Check `gh auth status`, the configured git remote, or the available environment context. If the acting account is not `drod3763`, treat the human as an *external contributor* unless this is clearly a private or custom fork.
 
 External contributors should follow `CONTRIBUTING.md`. For first-time contributors, strongly encourage getting maintainer alignment on an accepted issue before opening a PR; this is no longer auto-enforced, so a PR opened without it is not auto-closed but may be closed by a maintainer. Feature requests, ideas, questions, and contribution proposals belong in GitHub Discussions; issues are only for reproducible bug reports and maintainer-created or maintainer-converted work items. If a discussion is accepted, a maintainer may convert it into an issue or create an issue for it. If the human wants to skip the alignment step, tell them the maintainer prefers an accepted issue first and that a PR without it may be closed.
 
