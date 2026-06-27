@@ -5080,6 +5080,11 @@ async fn run_client_loop(
                     {
                         query_host_terminal_theme();
                     }
+                    // A standalone host color-scheme report is a client-only signal (consumed by
+                    // the re-query above); don't forward it on to the server PTY as stray input.
+                    if crate::raw_input::events_are_client_only_host_report(&events) {
+                        continue;
+                    }
                     if let (Some(compositor), Some(model)) =
                         (&mut state.compositor, &mut state.supervisor_model)
                     {

@@ -400,6 +400,14 @@ pub(crate) fn events_require_host_terminal_theme_query(events: &[RawInputEvent])
         .any(|event| matches!(event, RawInputEvent::HostColorSchemeChanged(_)))
 }
 
+/// True when the input is solely a host color-scheme report that the client consumes locally
+/// (it re-queries the palette). Such bytes are a client-only signal and must not be forwarded
+/// to the server PTY as stray terminal input.
+#[cfg(any(not(windows), test))]
+pub(crate) fn events_are_client_only_host_report(events: &[RawInputEvent]) -> bool {
+    matches!(events, [RawInputEvent::HostColorSchemeChanged(_)])
+}
+
 pub fn spawn_input_reader() -> mpsc::Receiver<RawInputEvent> {
     let (tx, rx) = mpsc::channel(256);
 
@@ -1040,7 +1048,28 @@ mod tests {
                 RawInputEvent::HostColorSchemeChanged(HostAppearance::Dark | HostAppearance::Light)
             ));
             assert!(events_require_host_terminal_theme_query(&events));
+            assert!(
+                events_are_client_only_host_report(&events),
+                "standalone color-scheme report should be client-only: {bytes:?}"
+            );
         }
+    }
+
+    #[test]
+    fn client_only_host_report_requires_sole_color_scheme_event() {
+        // A report mixed with other input must still be forwarded to the server.
+        let mut mixed = GHOSTTY_COLOR_SCHEME_DARK_REPORT.to_vec();
+        mixed.extend_from_slice(b"ls\r");
+        let events = parse_raw_input_bytes_sync(&mixed);
+        assert!(events_require_host_terminal_theme_query(&events));
+        assert!(
+            !events_are_client_only_host_report(&events),
+            "mixed input must not be treated as a client-only report"
+        );
+
+        // Plain keystrokes are not a host report.
+        let typed = parse_raw_input_bytes_sync(b"ls\r");
+        assert!(!events_are_client_only_host_report(&typed));
     }
 
     #[test]
