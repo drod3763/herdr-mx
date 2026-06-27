@@ -16,7 +16,7 @@ body:
     id: bug-confirmation
     attributes:
       label: Is this a reproducible bug?
-      description: Feature requests, ideas, questions, contribution proposals, and direction checks belong in Discussions and may be closed if opened as issues.
+      description: Feature requests, ideas, questions, contribution proposals, and direction checks belong in Discussions; if opened as issues, a maintainer may close them.
       options:
         - label: I confirm this is a reproducible bug, not a feature request, idea, question, contribution proposal, or direction check.
           required: true
