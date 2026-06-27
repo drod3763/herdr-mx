@@ -400,12 +400,28 @@ pub(crate) fn events_require_host_terminal_theme_query(events: &[RawInputEvent])
         .any(|event| matches!(event, RawInputEvent::HostColorSchemeChanged(_)))
 }
 
-/// True when the input is solely a host color-scheme report that the client consumes locally
-/// (it re-queries the palette). Such bytes are a client-only signal and must not be forwarded
-/// to the server PTY as stray terminal input.
+/// Remove any host color-scheme report sequences (mode 2031 `?997` reports) from a raw input
+/// buffer, preserving every other byte. These reports are a client-only signal the client
+/// consumes locally (it re-queries the palette), so they must not reach the server PTY — even
+/// when the terminal coalesces a report into the same read as real user keystrokes.
 #[cfg(any(not(windows), test))]
-pub(crate) fn events_are_client_only_host_report(events: &[RawInputEvent]) -> bool {
-    matches!(events, [RawInputEvent::HostColorSchemeChanged(_)])
+pub(crate) fn strip_host_color_scheme_reports(data: &[u8]) -> Vec<u8> {
+    const REPORTS: [&[u8]; 2] = [
+        GHOSTTY_COLOR_SCHEME_DARK_REPORT,
+        GHOSTTY_COLOR_SCHEME_LIGHT_REPORT,
+    ];
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        match REPORTS.iter().find(|report| data[i..].starts_with(report)) {
+            Some(report) => i += report.len(),
+            None => {
+                out.push(data[i]);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 pub fn spawn_input_reader() -> mpsc::Receiver<RawInputEvent> {
@@ -1049,27 +1065,31 @@ mod tests {
             ));
             assert!(events_require_host_terminal_theme_query(&events));
             assert!(
-                events_are_client_only_host_report(&events),
-                "standalone color-scheme report should be client-only: {bytes:?}"
+                strip_host_color_scheme_reports(bytes).is_empty(),
+                "a standalone color-scheme report should strip to nothing: {bytes:?}"
             );
         }
     }
 
     #[test]
-    fn client_only_host_report_requires_sole_color_scheme_event() {
-        // A report mixed with other input must still be forwarded to the server.
-        let mut mixed = GHOSTTY_COLOR_SCHEME_DARK_REPORT.to_vec();
-        mixed.extend_from_slice(b"ls\r");
-        let events = parse_raw_input_bytes_sync(&mixed);
-        assert!(events_require_host_terminal_theme_query(&events));
-        assert!(
-            !events_are_client_only_host_report(&events),
-            "mixed input must not be treated as a client-only report"
-        );
+    fn strip_host_color_scheme_reports_preserves_other_bytes() {
+        // Standalone report → nothing left.
+        assert!(strip_host_color_scheme_reports(GHOSTTY_COLOR_SCHEME_DARK_REPORT).is_empty());
 
-        // Plain keystrokes are not a host report.
-        let typed = parse_raw_input_bytes_sync(b"ls\r");
-        assert!(!events_are_client_only_host_report(&typed));
+        // Report coalesced with real keystrokes → only the report is removed.
+        let mut report_then_keys = GHOSTTY_COLOR_SCHEME_LIGHT_REPORT.to_vec();
+        report_then_keys.extend_from_slice(b"ls\r");
+        assert_eq!(strip_host_color_scheme_reports(&report_then_keys), b"ls\r");
+
+        // Report sandwiched between input, and multiple reports.
+        let mut sandwiched = b"ab".to_vec();
+        sandwiched.extend_from_slice(GHOSTTY_COLOR_SCHEME_DARK_REPORT);
+        sandwiched.extend_from_slice(b"cd");
+        sandwiched.extend_from_slice(GHOSTTY_COLOR_SCHEME_LIGHT_REPORT);
+        assert_eq!(strip_host_color_scheme_reports(&sandwiched), b"abcd");
+
+        // Plain input is untouched.
+        assert_eq!(strip_host_color_scheme_reports(b"ls\r"), b"ls\r");
     }
 
     #[test]

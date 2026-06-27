@@ -5079,16 +5079,22 @@ async fn run_client_loop(
                     }
                     // Re-query the terminal palette when the OS appearance changes so colors
                     // refresh live (the initial query fires once at client startup).
-                    if crate::raw_input::events_require_host_terminal_theme_query(&events)
-                        && should_query_host_terminal_theme()
-                    {
-                        query_host_terminal_theme();
-                    }
-                    // A standalone host color-scheme report is a client-only signal (consumed by
-                    // the re-query above); don't forward it on to the server PTY as stray input.
-                    if crate::raw_input::events_are_client_only_host_report(&events) {
-                        continue;
-                    }
+                    let data =
+                        if crate::raw_input::events_require_host_terminal_theme_query(&events) {
+                            if should_query_host_terminal_theme() {
+                                query_host_terminal_theme();
+                            }
+                            // Host color-scheme reports are a client-only signal (consumed by the
+                            // re-query above); strip them so they never reach the server PTY, even
+                            // when coalesced into the same read as real keystrokes. Forward the rest.
+                            let stripped = crate::raw_input::strip_host_color_scheme_reports(&data);
+                            if stripped.is_empty() {
+                                continue;
+                            }
+                            stripped
+                        } else {
+                            data
+                        };
                     if let (Some(compositor), Some(model)) =
                         (&mut state.compositor, &mut state.supervisor_model)
                     {
