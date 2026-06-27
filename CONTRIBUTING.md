@@ -32,7 +32,7 @@ Use GitHub Discussions for feature requests, ideas, questions, contribution prop
 
 Discussions are community input. Upvotes and comments help show demand, but they do not guarantee implementation, priority, maintainer attention, or PR approval. A maintainer may ignore a discussion, reject it, implement it directly, ask for more detail, or convert it into an accepted issue.
 
-Issues that do not use the bug report template may be closed automatically.
+Issues that do not use the bug report template may be closed by a maintainer.
 
 ## First-time contributors
 
