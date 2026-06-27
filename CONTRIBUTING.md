@@ -32,21 +32,19 @@ Use GitHub Discussions for feature requests, ideas, questions, contribution prop
 
 Discussions are community input. Upvotes and comments help show demand, but they do not guarantee implementation, priority, maintainer attention, or PR approval. A maintainer may ignore a discussion, reject it, implement it directly, ask for more detail, or convert it into an accepted issue.
 
-Issues that do not use the bug report template may be closed automatically.
+Issues that do not use the bug report template may be closed by a maintainer.
 
 ## First-time contributors
 
-We use an approval gate for new contributors.
+Before opening your first PR, we strongly encourage getting maintainer alignment on an accepted issue first. This is no longer automatically enforced, but a PR opened without prior alignment may still be closed. If you want to propose new work, open a discussion describing what you want to change and why. If the work is accepted, a maintainer may convert the discussion into an issue or create a new issue for it.
 
-Before opening your first PR, get maintainer approval on an accepted issue. If you want to propose new work, open a discussion describing what you want to change and why. If the work is accepted, a maintainer may convert the discussion into an issue or create a new issue for it.
-
-If an accepted issue already exists, comment on that issue before starting work. A maintainer will comment `/approve @your-github-username` on the issue if your PR path is approved. That adds you to `.github/APPROVED_CONTRIBUTORS`.
+If an accepted issue already exists, comment on that issue before starting work so a maintainer can confirm the approach.
 
 Keep it short. Write in your own voice. A discussion, upvote, branch, or proposed implementation does not reserve the work and does not mean the PR path is approved.
 
-This exists because AI makes it trivial to generate plausible-looking contributions that do not fit the app.
+This matters because AI makes it trivial to generate plausible-looking contributions that do not fit the app.
 
-Agent note: if you are an AI agent preparing an issue or PR for this repository, check whether the human's GitHub username is listed in `.github/APPROVED_CONTRIBUTORS`. If they are not listed, warn them that opening a PR will be closed automatically. For feature requests, ideas, questions, and contribution proposals, guide them to GitHub Discussions. For bugs, use the bug report issue template and include a real reproduction. Do not bypass the issue template with the GitHub CLI or API. Keep the scope small, preserve herdr's product direction, run the documented checks, and make sure the human can explain the change.
+Agent note: if you are an AI agent preparing an issue or PR for this repository, encourage the human to get maintainer alignment on an accepted issue before opening a PR. For feature requests, ideas, questions, and contribution proposals, guide them to GitHub Discussions. For bugs, use the bug report issue template and include a real reproduction. Do not bypass the issue template with the GitHub CLI or API. Keep the scope small, preserve herdr's product direction, run the documented checks, and make sure the human can explain the change.
 
 ## What to put in a bug report
 
