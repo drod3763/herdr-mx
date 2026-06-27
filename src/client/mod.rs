@@ -5084,15 +5084,6 @@ async fn run_client_loop(
                     {
                         query_host_terminal_theme();
                     }
-                    // Host color-scheme reports are client-only control traffic (the client
-                    // enables mode 2031 itself); strip every complete report so it never reaches
-                    // the server PTY, even an unrecognized value or one coalesced into the same
-                    // read as real keystrokes. Forward the remainder; skip if nothing remains.
-                    let data = match crate::raw_input::strip_host_color_scheme_reports(&data) {
-                        Some(stripped) if stripped.is_empty() => continue,
-                        Some(stripped) => stripped,
-                        None => data,
-                    };
                     if let (Some(compositor), Some(model)) =
                         (&mut state.compositor, &mut state.supervisor_model)
                     {
