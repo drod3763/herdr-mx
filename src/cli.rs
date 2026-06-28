@@ -96,6 +96,16 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
+    // mx builds ignore the herdr.dev update channels entirely (self-update is disabled and
+    // stable/preview ship as separate Homebrew tap formulae). Short-circuit before writing
+    // `[update].channel` or consulting the package-manager detectors so a package-managed or
+    // direct mx install is never left with inert channel config followed by a failed update.
+    // Return non-zero so automation does not treat the (deliberate) no-op as an applied switch.
+    if let Some(notice) = mx_channel_set_notice(channel, crate::build_info::is_mx()) {
+        eprintln!("{notice}");
+        return Ok(1);
+    }
+
     if let Some(reason) = channel_set_rejection(
         channel,
         crate::update::preview_channel_rejection_for_current_install(),
@@ -166,6 +176,21 @@ fn parse_channel_set_arg(args: &[String]) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// Notice shown when `herdr channel set` runs on an mx build, or `None` for non-mx builds
+/// (which use the normal channel-set flow). mx ignores the herdr.dev update channels, so the
+/// command does not write `[update].channel`; it points the user at how mx actually updates.
+fn mx_channel_set_notice(channel: &str, is_mx_build: bool) -> Option<&'static str> {
+    if !is_mx_build {
+        return None;
+    }
+    // Both formulae install the executable as `bin/herdr`, so the switch commands uninstall the
+    // current formula before installing the other to avoid a Homebrew link conflict.
+    Some(match channel {
+        "preview" => "herdr-mx ignores herdr.dev update channels; preview builds ship through the separate `herdr-mx-preview` Homebrew formula and as GitHub prereleases. To switch to preview, run `brew uninstall herdr-mx` (if you came from stable) then `brew install drod3763/tap/herdr-mx-preview`, or download a prerelease from https://github.com/drod3763/herdr-mx/releases. The update channel config was not changed.",
+        _ => "herdr-mx ignores herdr.dev update channels; stable builds are the `herdr-mx` Homebrew formula. To switch from preview, run `brew uninstall herdr-mx-preview` then `brew install drod3763/tap/herdr-mx`; if you are already on stable, update in place with `brew update && brew upgrade herdr-mx`, mise (`mise use -g \"ubi:drod3763/herdr-mx[exe=herdr]@latest\"`), or GitHub releases. The update channel config was not changed.",
+    })
 }
 
 fn channel_set_rejection(
@@ -959,6 +984,40 @@ mod tests {
             super::parse_channel_set_arg(&["preview".to_string(), "stable".to_string()]),
             None
         );
+    }
+
+    #[test]
+    fn mx_channel_set_short_circuits_for_mx_builds() {
+        // mx builds: any channel target returns a notice (no config write), preview points at
+        // the preview tap.
+        let preview = super::mx_channel_set_notice("preview", true).expect("mx preview notice");
+        assert!(preview.contains("herdr-mx-preview"));
+        assert!(preview.contains("was not changed"));
+        // stable target tells preview users how to switch formulas, not just upgrade in place,
+        // and uninstalls the old formula before installing the new one (both link `bin/herdr`).
+        let stable = super::mx_channel_set_notice("stable", true).expect("mx stable notice");
+        let uninstall = stable
+            .find("brew uninstall herdr-mx-preview")
+            .expect("uninstall step");
+        let install = stable
+            .find("brew install drod3763/tap/herdr-mx")
+            .expect("install step");
+        assert!(
+            uninstall < install,
+            "must uninstall the preview formula before installing stable"
+        );
+        assert!(stable.contains("was not changed"));
+        // preview target uninstalls stable before installing preview, same link-conflict reason.
+        let pu = preview
+            .find("brew uninstall herdr-mx")
+            .expect("preview uninstall");
+        let pi = preview
+            .find("brew install drod3763/tap/herdr-mx-preview")
+            .expect("preview install");
+        assert!(pu < pi, "must uninstall stable before installing preview");
+        // Non-mx builds are unaffected and fall through to the normal flow.
+        assert_eq!(super::mx_channel_set_notice("preview", false), None);
+        assert_eq!(super::mx_channel_set_notice("stable", false), None);
     }
 
     #[test]

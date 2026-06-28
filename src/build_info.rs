@@ -31,6 +31,12 @@ pub fn is_preview() -> bool {
     channel() == "preview"
 }
 
+/// True for herdr-mx downstream builds (`HERDR_BUILD_CHANNEL=mx`). mx builds disable
+/// self-update and the herdr.dev update channels; they ship through Homebrew/mise/releases.
+pub fn is_mx() -> bool {
+    channel() == "mx"
+}
+
 /// The human-orderable build stamp embedded in a channel-suffixed version —
 /// `…-preview-2026-06-11-2357-<sha>` → `2026.06.11.2357`. This is the SAME
 /// `YYYY.MM.DD.HHMM` number the brew preview formula uses as its package version,
