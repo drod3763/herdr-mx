@@ -1989,6 +1989,11 @@ pub(crate) fn update_install_instruction(install_command: &str) -> String {
         NIX_UPDATE_COMMAND => {
             "detach, update through Nix, then restart this Herdr session when ready".to_string()
         }
+        // MX_RELEASES_UPDATE_COMMAND is a sentence ("install a newer herdr-mx from …"), not a
+        // shell command, so render it inline rather than as "run `…`".
+        MX_RELEASES_UPDATE_COMMAND => {
+            format!("detach, {MX_RELEASES_UPDATE_COMMAND}, then restart this Herdr session when ready")
+        }
         command => format!("detach, run `{command}`, then restart this Herdr session when ready"),
     }
 }
