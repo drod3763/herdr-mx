@@ -32,7 +32,7 @@ upstream herdr attaches to one server at a time (`herdr --remote <host>` per ter
 | settings popup | 76×22 base | 96×32 base | room for the sidebar settings TUI |
 | windows build | preview beta | unavailable | the multi-remote client doesn't compile on windows yet ([#63](https://github.com/drod3763/herdr-mx/issues/63)) |
 
-## not yet re-applied after the v0.6.10 merge
+## not yet re-applied as of upstream v0.7.1
 
 - cline phantom-working guard (#37): upstream's new manifest-based detection defaults cline to "working" again; the mx fix needs a `manifests/cline.toml` override.
 - deferred remote refinements from the #60→#62 merge: upstream keepalive (#355), fish-shell remote bootstrap (#396), mise+preview remote seeding.
