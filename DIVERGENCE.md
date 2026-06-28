@@ -30,7 +30,7 @@ upstream herdr attaches to one server at a time (`herdr --remote <host>` per ter
 | `herdr update` / update channels | herdr.dev manifests | disabled; brew/mise/releases | a stock-herdr download would silently remove multi-remote |
 | version string | `0.6.10` | `0.6.10-mx.1` | so bug reports route to the right tracker |
 | settings popup | 76×22 base | 96×32 base | room for the sidebar settings TUI |
-| windows build | preview beta | unavailable | the multi-remote client doesn't compile on windows yet ([#63](https://github.com/2lab-ai/herdr-mx/issues/63)) |
+| windows build | preview beta | unavailable | the multi-remote client doesn't compile on windows yet ([#63](https://github.com/drod3763/herdr-mx/issues/63)) |
 
 ## not yet re-applied after the v0.6.10 merge
 
