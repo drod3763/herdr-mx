@@ -2142,11 +2142,11 @@ fn setup_terminal_with_capabilities(
         io::stdout().flush()?;
     }
 
-    // Enable host color-scheme reports last, after every other fallible setup write. If an
-    // earlier step fails we return before turning mode 2031 on, so a partial setup failure can
-    // never leave it dangling (there is no fallible write left to fail once it is enabled).
+    // Enable host color-scheme reports last, after every other fallible setup write, and undo it
+    // if its own write fails partway. Combined, an error anywhere in setup can never leave mode
+    // 2031 dangling before a TerminalGuard exists to restore it.
     if enabled_host_color_scheme_reports {
-        set_host_color_scheme_reports(true)?;
+        enable_host_color_scheme_reports(&mut io::stdout())?;
     }
 
     Ok(TerminalGuard {
@@ -6916,6 +6916,17 @@ fn set_host_color_scheme_reports(enabled: bool) -> io::Result<()> {
     write_host_color_scheme_reports(io::stdout(), enabled)
 }
 
+/// Enable host color-scheme reports, attempting a best-effort disable if the enable write fails
+/// partway (e.g. the sequence is written but the flush errors). This keeps a partial setup
+/// failure from leaving mode 2031 dangling before a `TerminalGuard` exists to restore it.
+fn enable_host_color_scheme_reports<W: io::Write>(writer: &mut W) -> io::Result<()> {
+    if let Err(err) = write_host_color_scheme_reports(&mut *writer, true) {
+        let _ = write_host_color_scheme_reports(&mut *writer, false);
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn init_logging() {
     crate::logging::init_file_logging("herdr-client.log");
 }
@@ -7364,6 +7375,39 @@ mod tests {
         assert_eq!(
             disable,
             crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes()
+        );
+    }
+
+    #[test]
+    fn enable_host_color_scheme_reports_cleans_up_on_flush_failure() {
+        // A writer that records bytes but always fails to flush, simulating an enable sequence
+        // that reaches the terminal before the flush errors.
+        struct FlushFails {
+            written: Vec<u8>,
+        }
+        impl io::Write for FlushFails {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("flush boom"))
+            }
+        }
+
+        let mut writer = FlushFails {
+            written: Vec::new(),
+        };
+        let result = enable_host_color_scheme_reports(&mut writer);
+        assert!(result.is_err(), "enable should surface the flush error");
+
+        let enable = crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_ENABLE_SEQUENCE;
+        let disable = crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE;
+        let expected = format!("{enable}{disable}");
+        assert_eq!(
+            writer.written,
+            expected.as_bytes(),
+            "a failed enable must be followed by a best-effort disable"
         );
     }
 
