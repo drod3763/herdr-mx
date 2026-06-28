@@ -187,7 +187,7 @@ fn mx_channel_set_notice(channel: &str, is_mx_build: bool) -> Option<&'static st
     }
     Some(match channel {
         "preview" => "herdr-mx ignores herdr.dev update channels; preview builds ship through a separate Homebrew formula. Install them with `brew install drod3763/tap/herdr-mx-preview`. The update channel config was not changed.",
-        _ => "herdr-mx ignores herdr.dev update channels; it updates through Homebrew (`brew upgrade herdr-mx`), mise (`mise use -g \"ubi:drod3763/herdr-mx[exe=herdr]@latest\"`), or GitHub releases. The update channel config was not changed.",
+        _ => "herdr-mx ignores herdr.dev update channels; it updates through Homebrew (`brew update && brew upgrade herdr-mx`), mise (`mise use -g \"ubi:drod3763/herdr-mx[exe=herdr]@latest\"`), or GitHub releases. The update channel config was not changed.",
     })
 }
 
