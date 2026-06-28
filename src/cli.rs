@@ -186,8 +186,8 @@ fn mx_channel_set_notice(channel: &str, is_mx_build: bool) -> Option<&'static st
         return None;
     }
     Some(match channel {
-        "preview" => "herdr-mx ignores herdr.dev update channels; preview builds ship through a separate Homebrew formula. Install them with `brew install drod3763/tap/herdr-mx-preview`. The update channel config was not changed.",
-        _ => "herdr-mx ignores herdr.dev update channels; it updates through Homebrew (`brew update && brew upgrade herdr-mx`), mise (`mise use -g \"ubi:drod3763/herdr-mx[exe=herdr]@latest\"`), or GitHub releases. The update channel config was not changed.",
+        "preview" => "herdr-mx ignores herdr.dev update channels; preview builds are the separate `herdr-mx-preview` Homebrew formula. To switch to preview, run `brew install drod3763/tap/herdr-mx-preview` (and `brew uninstall herdr-mx` if you came from stable). The update channel config was not changed.",
+        _ => "herdr-mx ignores herdr.dev update channels; stable builds are the `herdr-mx` Homebrew formula. To switch from preview, run `brew install drod3763/tap/herdr-mx` and `brew uninstall herdr-mx-preview`; if you are already on stable, update in place with `brew update && brew upgrade herdr-mx`, mise (`mise use -g \"ubi:drod3763/herdr-mx[exe=herdr]@latest\"`), or GitHub releases. The update channel config was not changed.",
     })
 }
 
@@ -991,7 +991,10 @@ mod tests {
         let preview = super::mx_channel_set_notice("preview", true).expect("mx preview notice");
         assert!(preview.contains("herdr-mx-preview"));
         assert!(preview.contains("was not changed"));
+        // stable target tells preview users how to switch formulas, not just upgrade in place.
         let stable = super::mx_channel_set_notice("stable", true).expect("mx stable notice");
+        assert!(stable.contains("brew install drod3763/tap/herdr-mx"));
+        assert!(stable.contains("brew uninstall herdr-mx-preview"));
         assert!(stable.contains("was not changed"));
         // Non-mx builds are unaffected and fall through to the normal flow.
         assert_eq!(super::mx_channel_set_notice("preview", false), None);
