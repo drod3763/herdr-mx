@@ -1943,11 +1943,17 @@ pub(crate) fn update_install_command() -> &'static str {
     if crate::build_info::channel() == MX_BUILD_CHANNEL {
         return select_mx_update_command(mx_homebrew_formula_for_current_install().as_deref());
     }
-    select_update_command(
-        is_homebrew_managed_install(),
-        is_mise_managed_install(),
-        is_nix_managed_install(),
-    )
+    // Non-mx path: short-circuit so the common Homebrew case does not also run the mise/Nix
+    // detectors (each an extra current_exe()/canonicalize).
+    if is_homebrew_managed_install() {
+        HOMEBREW_UPDATE_COMMAND
+    } else if is_mise_managed_install() {
+        MISE_UPDATE_COMMAND
+    } else if is_nix_managed_install() {
+        NIX_UPDATE_COMMAND
+    } else {
+        HERDR_UPDATE_COMMAND
+    }
 }
 
 /// mx self-update is disabled, so route mx installs to the package manager that owns the
@@ -1965,18 +1971,6 @@ fn select_mx_update_command(homebrew_formula: Option<&str>) -> &'static str {
         // Unknown formula or no Homebrew keg → the always-correct manual releases install,
         // rather than guessing the stable `herdr-mx` upgrade for an unexpected formula.
         _ => MX_RELEASES_UPDATE_COMMAND,
-    }
-}
-
-fn select_update_command(is_homebrew: bool, is_mise: bool, is_nix: bool) -> &'static str {
-    if is_homebrew {
-        HOMEBREW_UPDATE_COMMAND
-    } else if is_mise {
-        MISE_UPDATE_COMMAND
-    } else if is_nix {
-        NIX_UPDATE_COMMAND
-    } else {
-        HERDR_UPDATE_COMMAND
     }
 }
 
@@ -2571,26 +2565,6 @@ mod tests {
         // Anything else (including mise installs, whose exact upgrade selector cannot be
         // recovered) → the always-correct manual GitHub releases install.
         assert_eq!(select_mx_update_command(None), MX_RELEASES_UPDATE_COMMAND);
-    }
-
-    #[test]
-    fn stable_install_command_unchanged_by_mx_routing() {
-        assert_eq!(
-            select_update_command(true, false, false),
-            HOMEBREW_UPDATE_COMMAND
-        );
-        assert_eq!(
-            select_update_command(false, true, false),
-            MISE_UPDATE_COMMAND
-        );
-        assert_eq!(
-            select_update_command(false, false, true),
-            NIX_UPDATE_COMMAND
-        );
-        assert_eq!(
-            select_update_command(false, false, false),
-            HERDR_UPDATE_COMMAND
-        );
     }
 
     fn unique_test_socket_path(name: &str) -> std::path::PathBuf {
