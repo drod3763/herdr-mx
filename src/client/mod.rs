@@ -2122,9 +2122,6 @@ fn setup_terminal_with_capabilities(
         }
         execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
         push_keyboard_enhancement_flags()?;
-        if enabled_host_color_scheme_reports {
-            set_host_color_scheme_reports(true)?;
-        }
     } else if mouse_capture {
         set_mouse_capture(true)?;
     } else {
@@ -2143,6 +2140,13 @@ fn setup_terminal_with_capabilities(
     if let Some(mode) = modify_other_keys_mode {
         io::stdout().write_all(mode.set_sequence())?;
         io::stdout().flush()?;
+    }
+
+    // Enable host color-scheme reports last, after every other fallible setup write. If an
+    // earlier step fails we return before turning mode 2031 on, so a partial setup failure can
+    // never leave it dangling (there is no fallible write left to fail once it is enabled).
+    if enabled_host_color_scheme_reports {
+        set_host_color_scheme_reports(true)?;
     }
 
     Ok(TerminalGuard {
