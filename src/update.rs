@@ -42,8 +42,8 @@ const MX_HOMEBREW_PREVIEW_UPDATE_COMMAND: &str = "brew update && brew upgrade he
 // (mise stores ubi tools under a lossily-sanitized directory and does not accept that directory
 // as an upgrade argument), and a wrong selector is dangerous because `mise upgrade <unknown>`
 // exits "All tools are up to date" without updating. So mise installs fall back to the reliable
-// manual releases instruction; the README documents the explicit `mise upgrade` command for
-// users who know their own tool id.
+// manual releases instruction; the README documents the explicit `mise use -g
+// "ubi:drod3763/herdr-mx[exe=herdr]@latest"` command for users who manage their own mise tool.
 const MX_RELEASES_UPDATE_COMMAND: &str =
     "install a newer herdr-mx from https://github.com/drod3763/herdr-mx/releases";
 const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
@@ -1960,9 +1960,11 @@ pub(crate) fn update_install_command() -> &'static str {
 /// is compile-time, so the live `mx` path is otherwise unreachable from a stable test build.
 fn select_mx_update_command(homebrew_formula: Option<&str>) -> &'static str {
     match homebrew_formula {
+        Some("herdr-mx") => MX_HOMEBREW_UPDATE_COMMAND,
         Some("herdr-mx-preview") => MX_HOMEBREW_PREVIEW_UPDATE_COMMAND,
-        Some(_) => MX_HOMEBREW_UPDATE_COMMAND,
-        None => MX_RELEASES_UPDATE_COMMAND,
+        // Unknown formula or no Homebrew keg → the always-correct manual releases install,
+        // rather than guessing the stable `herdr-mx` upgrade for an unexpected formula.
+        _ => MX_RELEASES_UPDATE_COMMAND,
     }
 }
 
@@ -2559,6 +2561,12 @@ mod tests {
         assert_eq!(
             select_mx_update_command(Some("herdr-mx-preview")),
             MX_HOMEBREW_PREVIEW_UPDATE_COMMAND
+        );
+        // An unexpected formula name (e.g. a plain `herdr` keg) must not be assumed to be the
+        // stable mx formula; it falls back to the releases install.
+        assert_eq!(
+            select_mx_update_command(Some("herdr")),
+            MX_RELEASES_UPDATE_COMMAND
         );
         // Anything else (including mise installs, whose exact upgrade selector cannot be
         // recovered) → the always-correct manual GitHub releases install.
