@@ -188,7 +188,7 @@ fn mx_channel_set_notice(channel: &str, is_mx_build: bool) -> Option<&'static st
     // Both formulae install the executable as `bin/herdr`, so the switch commands uninstall the
     // current formula before installing the other to avoid a Homebrew link conflict.
     Some(match channel {
-        "preview" => "herdr-mx ignores herdr.dev update channels; preview builds are the separate `herdr-mx-preview` Homebrew formula. To switch to preview, run `brew uninstall herdr-mx` (if you came from stable) then `brew install drod3763/tap/herdr-mx-preview`. The update channel config was not changed.",
+        "preview" => "herdr-mx ignores herdr.dev update channels; preview builds ship through the separate `herdr-mx-preview` Homebrew formula and as GitHub prereleases. To switch to preview, run `brew uninstall herdr-mx` (if you came from stable) then `brew install drod3763/tap/herdr-mx-preview`, or download a prerelease from https://github.com/drod3763/herdr-mx/releases. The update channel config was not changed.",
         _ => "herdr-mx ignores herdr.dev update channels; stable builds are the `herdr-mx` Homebrew formula. To switch from preview, run `brew uninstall herdr-mx-preview` then `brew install drod3763/tap/herdr-mx`; if you are already on stable, update in place with `brew update && brew upgrade herdr-mx`, mise (`mise use -g \"ubi:drod3763/herdr-mx[exe=herdr]@latest\"`), or GitHub releases. The update channel config was not changed.",
     })
 }
