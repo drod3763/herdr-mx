@@ -391,9 +391,9 @@ pub(crate) fn events_require_host_surface_redraw(
             .any(|event| matches!(event, RawInputEvent::OuterFocusGained))
 }
 
-// Call site dropped by the v0.7.1 merge; retained pending rewiring (see drod3763/herdr-mx#4).
+/// True when the host reported an OS appearance change, so the client should re-query the
+/// terminal palette to refresh colors live.
 #[cfg(any(not(windows), test))]
-#[allow(dead_code)]
 pub(crate) fn events_require_host_terminal_theme_query(events: &[RawInputEvent]) -> bool {
     events
         .iter()
