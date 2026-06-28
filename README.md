@@ -74,7 +74,7 @@ Press `ctrl+b q` to detach the client. The server and pane processes keep runnin
 herdr-mx updates ship through your package manager, not the built-in updater:
 
 ```bash
-brew upgrade herdr-mx        # Homebrew
+brew update && brew upgrade herdr-mx   # Homebrew
 mise use -g "ubi:drod3763/herdr-mx[exe=herdr]@latest"   # mise
 ```
 
