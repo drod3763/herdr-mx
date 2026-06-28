@@ -2008,7 +2008,8 @@ fn is_homebrew_managed_install() -> bool {
 /// The mx Homebrew formula (`herdr-mx` or `herdr-mx-preview`) that owns the running binary,
 /// or `None` when it is not a Homebrew keg. mx installs under those formulae rather than
 /// `herdr`, and preview vs stable must route to different `brew upgrade` targets — so this
-/// returns the formula name, not a bool. See [`is_mx_mise_managed_install`] for the mise case.
+/// returns the formula name, not a bool. mise installs are handled separately (they fall back
+/// to the manual releases instruction — see the mx-mise note above the consts).
 fn mx_homebrew_formula_for_current_install() -> Option<String> {
     let current_exe = env::current_exe().ok()?;
     mx_homebrew_formula_name(&current_exe).or_else(|| {
