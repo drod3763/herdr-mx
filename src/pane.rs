@@ -450,7 +450,10 @@ fn binary_basename_is_herdr(value: &str) -> bool {
 /// deliberately excluded: it is matched only via the exact `--remote=` prefix, never a
 /// bare `--remote` prefix.
 fn is_remote_launch_token(token: &str) -> bool {
-    token == "--remote" || token.strip_prefix("--remote=").is_some_and(|t| !t.is_empty())
+    token == "--remote"
+        || token
+            .strip_prefix("--remote=")
+            .is_some_and(|t| !t.is_empty())
 }
 
 /// True when this single process is a `herdr --remote …` client: a herdr-like
