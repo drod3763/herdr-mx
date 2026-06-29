@@ -48,7 +48,17 @@ pub fn discover_hosts() -> Vec<SshConfigHost> {
     let mut hosts = Vec::new();
     let mut seen_aliases = HashSet::new();
     let mut visited_files = HashSet::new();
-    parse_file(&path, 0, &mut hosts, &mut seen_aliases, &mut visited_files);
+    // The active `Host` block, shared across `Include` boundaries so a per-host include attributes
+    // its directives to the including file's block (OpenSSH inline-insertion semantics).
+    let mut current_aliases = Vec::new();
+    parse_file(
+        &path,
+        0,
+        &mut hosts,
+        &mut seen_aliases,
+        &mut visited_files,
+        &mut current_aliases,
+    );
     hosts
 }
 
@@ -87,6 +97,11 @@ fn parse_file(
     hosts: &mut Vec<SshConfigHost>,
     seen_aliases: &mut HashSet<String>,
     visited_files: &mut HashSet<PathBuf>,
+    // The aliases of the current `Host` block, awaiting `HostName`/`User` lines beneath them.
+    // Threaded through `Include` so the active block is shared across the include boundary (OpenSSH
+    // inserts included contents inline): a per-host include attributes to the including block, and a
+    // `Host` opened in the include continues as the active block on return. A `Match` clears it.
+    current_aliases: &mut Vec<usize>,
 ) {
     // Canonicalize so the same file reached via different relative paths is only visited once
     // (cycle guard). Fall back to the raw path if canonicalization fails (e.g. file is missing).
@@ -97,10 +112,6 @@ fn parse_file(
     let Ok(contents) = std::fs::read_to_string(path) else {
         return;
     };
-
-    // The aliases of the current `Host` block, awaiting `HostName`/`User` lines beneath them. A
-    // `Match` block clears this so its directives are not attributed to a host.
-    let mut current_aliases: Vec<usize> = Vec::new();
 
     for raw_line in contents.lines() {
         let Some((keyword, rest)) = split_keyword(raw_line) else {
@@ -136,7 +147,7 @@ fn parse_file(
             }
             "hostname" => {
                 if let Some(value) = first_token(rest) {
-                    for &index in &current_aliases {
+                    for &index in current_aliases.iter() {
                         if hosts[index].hostname.is_none() {
                             hosts[index].hostname = Some(value.clone());
                         }
@@ -145,7 +156,7 @@ fn parse_file(
             }
             "user" => {
                 if let Some(value) = first_token(rest) {
-                    for &index in &current_aliases {
+                    for &index in current_aliases.iter() {
                         if hosts[index].user.is_none() {
                             hosts[index].user = Some(value.clone());
                         }
@@ -157,7 +168,14 @@ fn parse_file(
                     continue;
                 }
                 for included in resolve_includes(rest) {
-                    parse_file(&included, depth + 1, hosts, seen_aliases, visited_files);
+                    parse_file(
+                        &included,
+                        depth + 1,
+                        hosts,
+                        seen_aliases,
+                        visited_files,
+                        current_aliases,
+                    );
                 }
             }
             _ => {}
@@ -436,6 +454,33 @@ mod tests {
         let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
         assert!(aliases.contains(&"included".to_string()));
         assert!(aliases.contains(&"main".to_string()));
+    }
+
+    #[test]
+    fn include_attributes_directives_to_the_active_host_block_inline() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // PRRT...oT2: OpenSSH processes an Include as if its contents were inserted inline, so a
+        // per-host include must attribute its HostName/User to the including file's active Host block,
+        // and a Host opened inside the include continues as the active block afterward.
+        let fixture = ConfigFixture::new(
+            "include-inline",
+            "Host prod\n  Include config.d/prod\n\nHost plain\n  HostName p.host\n",
+        );
+        fixture.write_extra(
+            "config.d/prod",
+            "HostName 10.0.0.5\n  User deploy\nHost extra\n  HostName e.host\n",
+        );
+        let hosts = discover_hosts();
+
+        let prod = hosts.iter().find(|h| h.alias == "prod").expect("prod row");
+        assert_eq!(prod.hostname.as_deref(), Some("10.0.0.5"));
+        assert_eq!(prod.user.as_deref(), Some("deploy"));
+        // The include's own trailing Host is captured with its HostName.
+        let extra = hosts.iter().find(|h| h.alias == "extra").expect("extra row");
+        assert_eq!(extra.hostname.as_deref(), Some("e.host"));
+        // After the include returns, the including file's next Host is its own block.
+        let plain = hosts.iter().find(|h| h.alias == "plain").expect("plain row");
+        assert_eq!(plain.hostname.as_deref(), Some("p.host"));
     }
 
     #[test]
