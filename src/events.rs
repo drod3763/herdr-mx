@@ -136,6 +136,13 @@ pub enum AppEvent {
         pane_id: PaneId,
         cwd: std::path::PathBuf,
     },
+    /// The pane's foreground job started or stopped being a nested
+    /// `herdr --remote` client (the "mirror" pane). Volatile runtime fact used
+    /// to hide such panes from the multi-remote client sidebar.
+    ForegroundRemoteClientChanged {
+        pane_id: PaneId,
+        is_remote_client: bool,
+    },
     /// Background git status refresh completed for workspaces.
     GitStatusRefreshed {
         results: Vec<WorkspaceGitStatus>,

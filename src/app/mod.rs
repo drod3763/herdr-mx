@@ -635,6 +635,7 @@ impl App {
             host_banner_rows: Vec::new(),
             host_banner_active: false,
             sidebar_host: config.ui.sidebar.host.clone(),
+            hide_nested_remote_panes: config.ui.hide_nested_remote_panes,
             sidebar_hover: None,
             palette: theme_palette,
             theme_name,
@@ -1372,12 +1373,14 @@ impl App {
                 if self.state.sidebar_space != config.ui.sidebar.spaces
                     || self.state.sidebar_agent != config.ui.sidebar.agents
                     || self.state.sidebar_host != config.ui.sidebar.host
+                    || self.state.hide_nested_remote_panes != config.ui.hide_nested_remote_panes
                 {
                     self.state.request_client_config_reload = true;
                 }
                 self.state.sidebar_space = config.ui.sidebar.spaces.clone();
                 self.state.sidebar_agent = config.ui.sidebar.agents.clone();
                 self.state.sidebar_host = config.ui.sidebar.host.clone();
+                self.state.hide_nested_remote_panes = config.ui.hide_nested_remote_panes;
                 self.state.accent = crate::config::parse_color(&config.ui.accent);
                 if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
                     self.state.request_client_config_reload = true;

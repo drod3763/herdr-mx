@@ -3831,6 +3831,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -4012,6 +4013,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -4202,6 +4204,7 @@ mod tests {
                             pane_label: None,
                             tab_id: String::new(),
                             tab_label: None,
+                            foreground_is_remote_client: false,
                         },
                         AgentSummary {
                             agent_id: "agent-2".into(),
@@ -4212,6 +4215,7 @@ mod tests {
                             pane_label: None,
                             tab_id: String::new(),
                             tab_label: None,
+                            foreground_is_remote_client: false,
                         },
                     ],
                 },
@@ -4280,6 +4284,7 @@ mod tests {
                             pane_label: None,
                             tab_id: String::new(),
                             tab_label: None,
+                            foreground_is_remote_client: false,
                         },
                         AgentSummary {
                             agent_id: "agent-blocked".into(),
@@ -4290,6 +4295,7 @@ mod tests {
                             pane_label: None,
                             tab_id: String::new(),
                             tab_label: None,
+                            foreground_is_remote_client: false,
                         },
                     ],
                 },
@@ -4369,6 +4375,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -4394,6 +4401,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -5606,6 +5614,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -5827,6 +5836,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -6267,6 +6277,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -7169,6 +7180,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -7204,6 +7216,7 @@ mod tests {
                         pane_label: Some("backend".into()),
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -7252,6 +7265,7 @@ mod tests {
                             pane_label: None,
                             tab_id: "t1".into(),
                             tab_label: Some("edit".into()),
+                            foreground_is_remote_client: false,
                         },
                         AgentSummary {
                             agent_id: "a2".into(),
@@ -7262,6 +7276,7 @@ mod tests {
                             pane_label: None,
                             tab_id: "t2".into(),
                             tab_label: Some("logs".into()),
+                            foreground_is_remote_client: false,
                         },
                     ],
                 },
@@ -7325,6 +7340,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -7775,6 +7791,7 @@ mod tests {
                     pane_label: None,
                     tab_id: String::new(),
                     tab_label: None,
+                    foreground_is_remote_client: false,
                 });
             }
         }

@@ -4,6 +4,7 @@
 
 ### Added
 - Added mixed remote headless server support: the thin client can manage secondary local or SSH-backed Herdr servers from the sidebar, persist the remote registry on the main server, show combined workspace and agent summaries, route workspace creation/focus to the selected server, and keep secondary disconnects isolated from the main session.
+- Added `ui.hide_nested_remote_panes` (default on) to auto-hide remote panes that are themselves nested `herdr --remote` clients ("mirror" panes) from the multi-remote sidebar. Detection keys on the foreground process argv, so plain local `herdr` panes and the SSH bridge subprocesses stay visible. (#9)
 
 ### Fixed
 - Fixed mixed remote client sidebar wheel scrolling so overflowed remote spaces can be reached and clicked.

@@ -171,6 +171,26 @@ async fn publish_state_changed_event(
     }
 }
 
+async fn publish_remote_client_change(
+    state_events: &mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    is_remote_client: bool,
+) {
+    if let Err(e) = state_events
+        .send(AppEvent::ForegroundRemoteClientChanged {
+            pane_id,
+            is_remote_client,
+        })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %e,
+            "failed to deliver ForegroundRemoteClientChanged event"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AgentDetectionPublishUpdate {
     state: AgentState,
@@ -405,6 +425,68 @@ struct ProcessProbeResult {
     foreground_is_pane_shell: bool,
     agent: Option<Agent>,
     process_name: Option<String>,
+    /// True when any process in the foreground job is itself a `herdr --remote`
+    /// client (the nested-client "mirror" pane). Keyed purely on the foreground
+    /// argv — target-agnostic, cross-platform. See `job_is_remote_client`.
+    foreground_is_remote_client: bool,
+}
+
+/// Whether the binary basename looks like a herdr executable. Prefix-tolerant so
+/// version-tagged / preview / dev builds (`herdr-<commit>`, `herdr-dev`) match too;
+/// a `--remote` argv token is also required by `process_is_remote_client`, so this
+/// stays low-false-positive.
+fn binary_basename_is_herdr(value: &str) -> bool {
+    let basename = value
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(value)
+        .trim_end_matches(".exe");
+    basename == "herdr" || basename.starts_with("herdr-") || basename.starts_with("herdr.")
+}
+
+/// Whether a single argv/cmdline token is the `--remote` launch flag. The CLI accepts
+/// both the bare `herdr --remote <host>` form and the joined `herdr --remote=<host>`
+/// form (see `src/remote/unix.rs`), so both must count. `--remote-keybindings[=…]` is
+/// deliberately excluded: it is matched only via the exact `--remote=` prefix, never a
+/// bare `--remote` prefix.
+fn is_remote_launch_token(token: &str) -> bool {
+    token == "--remote"
+        || token
+            .strip_prefix("--remote=")
+            .is_some_and(|t| !t.is_empty())
+}
+
+/// True when this single process is a `herdr --remote …` client: a herdr-like
+/// binary basename AND a `--remote`/`--remote=<host>` token in its argv. The bridge
+/// subcommands (`herdr remote-client-bridge` / `remote-api-bridge`) and plain local
+/// `herdr` panes carry no `--remote` token, so they never match.
+fn process_is_remote_client(process: &crate::platform::ForegroundProcess) -> bool {
+    let binary_is_herdr = binary_basename_is_herdr(&process.name)
+        || process
+            .argv0
+            .as_deref()
+            .is_some_and(binary_basename_is_herdr)
+        || process
+            .argv
+            .as_ref()
+            .and_then(|argv| argv.first())
+            .is_some_and(|arg0| binary_basename_is_herdr(arg0));
+    if !binary_is_herdr {
+        return false;
+    }
+    if let Some(argv) = process.argv.as_ref() {
+        return argv.iter().any(|arg| is_remote_launch_token(arg));
+    }
+    // Fall back to whitespace-split cmdline when the kernel argv probe is unavailable.
+    process
+        .cmdline
+        .as_deref()
+        .is_some_and(|cmdline| cmdline.split_whitespace().any(is_remote_launch_token))
+}
+
+/// True when any process in the foreground job is a nested `herdr --remote` client.
+fn job_is_remote_client(job: &crate::platform::ForegroundJob) -> bool {
+    job.processes.iter().any(process_is_remote_client)
 }
 
 fn agent_hint_for_foreground_job_members(
@@ -450,6 +532,7 @@ fn process_probe_result(
         foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
         agent: Some(agent),
         process_name: Some(process_name),
+        foreground_is_remote_client: job_is_remote_client(job),
     }
 }
 
@@ -511,6 +594,7 @@ fn probe_foreground_process_from_jobs(
             foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
             agent: identified.as_ref().map(|(agent, _)| *agent),
             process_name: identified.map(|(_, process_name)| process_name),
+            foreground_is_remote_client: job_is_remote_client(job),
         };
     }
 
@@ -519,6 +603,9 @@ fn probe_foreground_process_from_jobs(
         foreground_is_pane_shell: false,
         agent: None,
         process_name: None,
+        // No usable foreground job was realized, but the group leader job (when
+        // present) still tells us whether this is a nested `herdr --remote` client.
+        foreground_is_remote_client: leader_job.as_ref().is_some_and(job_is_remote_client),
     }
 }
 
@@ -569,6 +656,7 @@ fn spawn_basic_detection_task(
         let mut last_screen_scan_detection_content_seq = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
+        let mut last_remote_client = false;
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -644,6 +732,10 @@ fn spawn_basic_detection_task(
                 let probe = probe_foreground_process(pid, foreground_pgid);
                 let process_group_id = probe.process_group_id;
                 let foreground_is_pane_shell = probe.foreground_is_pane_shell;
+                if probe.foreground_is_remote_client != last_remote_client {
+                    last_remote_client = probe.foreground_is_remote_client;
+                    publish_remote_client_change(&state_events, pane_id, last_remote_client).await;
+                }
                 let mut new_agent = probe.agent;
                 if let Some(suppressed_agent) = suppressed_agent {
                     if new_agent == Some(suppressed_agent) {
@@ -1909,6 +2001,7 @@ impl PaneRuntime {
                 let mut last_screen_scan_detection_content_seq = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
+                let mut last_remote_client = false;
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1996,6 +2089,15 @@ impl PaneRuntime {
                             let process_name = probe.process_name;
                             let process_group_id = probe.process_group_id;
                             let foreground_is_pane_shell = probe.foreground_is_pane_shell;
+                            if probe.foreground_is_remote_client != last_remote_client {
+                                last_remote_client = probe.foreground_is_remote_client;
+                                publish_remote_client_change(
+                                    &state_events,
+                                    pane_id,
+                                    last_remote_client,
+                                )
+                                .await;
+                            }
                             let mut new_agent = probe.agent;
 
                             if let Some(suppressed_agent) = suppressed_agent {
@@ -3114,6 +3216,125 @@ mod tests {
             argv: None,
             cmdline: None,
         }
+    }
+
+    fn foreground_process_argv(pid: u32, argv: &[&str]) -> crate::platform::ForegroundProcess {
+        let argv: Vec<String> = argv.iter().map(|arg| arg.to_string()).collect();
+        crate::platform::ForegroundProcess {
+            pid,
+            name: argv
+                .first()
+                .and_then(|arg0| arg0.rsplit('/').next())
+                .unwrap_or("")
+                .to_string(),
+            argv0: argv.first().cloned(),
+            argv: Some(argv.clone()),
+            cmdline: Some(argv.join(" ")),
+        }
+    }
+
+    #[test]
+    fn process_remote_client_detects_remote_flag() {
+        assert!(process_is_remote_client(&foreground_process_argv(
+            1,
+            &["herdr", "--remote", "host"]
+        )));
+    }
+
+    #[test]
+    fn process_remote_client_detects_equals_form() {
+        // The CLI also accepts `--remote=<target>` (src/remote/unix.rs strip_prefix),
+        // so a nested client launched that way must still be flagged.
+        assert!(process_is_remote_client(&foreground_process_argv(
+            1,
+            &["herdr", "--remote=host"]
+        )));
+    }
+
+    #[test]
+    fn process_remote_client_detects_equals_form_from_cmdline() {
+        let mut process = foreground_process_argv(1, &["herdr", "--remote=user@host"]);
+        // Force the cmdline fallback path (no argv).
+        process.argv = None;
+        assert!(process_is_remote_client(&process));
+    }
+
+    #[test]
+    fn process_remote_client_ignores_remote_keybindings_equals() {
+        // `--remote-keybindings=` starts with `--remote` but is not the remote launch
+        // form; it must not flag the pane.
+        assert!(!process_is_remote_client(&foreground_process_argv(
+            1,
+            &["herdr", "--remote-keybindings=vim"]
+        )));
+    }
+
+    #[test]
+    fn process_remote_client_detects_version_tagged_binary() {
+        assert!(process_is_remote_client(&foreground_process_argv(
+            1,
+            &["/usr/local/bin/herdr-39986ed", "--remote", "host"]
+        )));
+    }
+
+    #[test]
+    fn process_remote_client_ignores_plain_herdr() {
+        assert!(!process_is_remote_client(&foreground_process_argv(
+            1,
+            &["herdr"]
+        )));
+    }
+
+    #[test]
+    fn process_remote_client_ignores_bridge_subcommands() {
+        assert!(!process_is_remote_client(&foreground_process_argv(
+            1,
+            &["herdr", "remote-client-bridge"]
+        )));
+        assert!(!process_is_remote_client(&foreground_process_argv(
+            1,
+            &["herdr", "remote-api-bridge"]
+        )));
+    }
+
+    #[test]
+    fn process_remote_client_ignores_nested_client_subcommand() {
+        assert!(!process_is_remote_client(&foreground_process_argv(
+            1,
+            &["herdr", "client"]
+        )));
+    }
+
+    #[test]
+    fn process_remote_client_ignores_non_herdr_binary_with_remote_flag() {
+        assert!(!process_is_remote_client(&foreground_process_argv(
+            1,
+            &["ssh", "--remote", "host"]
+        )));
+    }
+
+    #[test]
+    fn job_remote_client_finds_parent_launcher_beside_client_child() {
+        // The pane's foreground job holds both the `herdr --remote` parent launcher
+        // and its `herdr client` child; the parent must flag the whole job.
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 1,
+            processes: vec![
+                foreground_process_argv(1, &["herdr", "--remote", "host"]),
+                foreground_process_argv(2, &["herdr", "client", "--socket", "/x"]),
+            ],
+        };
+        assert!(job_is_remote_client(&job));
+    }
+
+    #[test]
+    fn probe_flags_remote_client_job() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![foreground_process_argv(99, &["herdr", "--remote", "host"])],
+        };
+        let result = probe_foreground_process_from_jobs(42, Some(99), Some(job), || None, |_| None);
+        assert!(result.foreground_is_remote_client);
     }
 
     #[test]

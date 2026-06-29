@@ -2541,6 +2541,23 @@ impl AppState {
                 }
                 Vec::new()
             }
+            AppEvent::ForegroundRemoteClientChanged {
+                pane_id,
+                is_remote_client,
+            } => {
+                let Some(terminal_id) = self.workspaces.iter().find_map(|ws| {
+                    ws.pane_state(pane_id)
+                        .map(|pane| pane.attached_terminal_id.clone())
+                }) else {
+                    return Vec::new();
+                };
+                let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+                    return Vec::new();
+                };
+                // Volatile runtime fact — do not mark the session dirty.
+                terminal.set_foreground_is_remote_client(is_remote_client);
+                Vec::new()
+            }
             AppEvent::GitStatusRefreshed {
                 results,
                 cache_updates,
@@ -4670,6 +4687,49 @@ mod tests {
         assert_eq!(state.terminals.get(&terminal_id).unwrap().cwd, cwd);
         assert!(state.session_dirty);
         let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn foreground_remote_client_change_updates_terminal_without_dirtying_session() {
+        // #9 (Codex review iter 3): the flag is a volatile presentation fact. The handler
+        // applies it to `TerminalState`, where `agent_info()` reads it onto the polled
+        // `AgentInfo` (agent.list) the multi-remote client refreshes every 400ms (focused)
+        // / 2s (background) — so no dedicated push event is needed. It must not dirty the
+        // session. This regression covers the apply-and-not-dirty contract; toggling back
+        // to false must clear it too.
+        let mut state = app_with_workspaces(&["active"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state.session_dirty = false;
+
+        let updates = state.handle_app_event(AppEvent::ForegroundRemoteClientChanged {
+            pane_id,
+            is_remote_client: true,
+        });
+        assert!(updates.is_empty());
+        assert!(state
+            .terminals
+            .get(&terminal_id)
+            .unwrap()
+            .foreground_is_remote_client());
+        assert!(
+            !state.session_dirty,
+            "volatile runtime fact must not dirty the session"
+        );
+
+        state.handle_app_event(AppEvent::ForegroundRemoteClientChanged {
+            pane_id,
+            is_remote_client: false,
+        });
+        assert!(!state
+            .terminals
+            .get(&terminal_id)
+            .unwrap()
+            .foreground_is_remote_client());
     }
 
     #[test]

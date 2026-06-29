@@ -2067,6 +2067,9 @@ pub struct AppState {
     pub(crate) host_banner_active: bool,
     /// item 2: host banner config.
     pub sidebar_host: crate::config::model::SidebarHostConfig,
+    /// #9: hide nested `herdr --remote` "mirror" panes from the multi-remote
+    /// sidebar. Projected to clients via `UiSettingsInfo`.
+    pub hide_nested_remote_panes: bool,
     /// item 7: current sidebar hover target.
     pub(crate) sidebar_hover: Option<SidebarHoverTarget>,
     /// UI color palette — all sidebar/UI colors centralized for theming.
@@ -2435,6 +2438,7 @@ impl AppState {
             host_banner_rows: Vec::new(),
             host_banner_active: false,
             sidebar_host: crate::config::model::SidebarHostConfig::default(),
+            hide_nested_remote_panes: true,
             sidebar_hover: None,
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),

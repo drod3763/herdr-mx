@@ -977,6 +977,7 @@ impl App {
             sidebar_spaces: self.state.sidebar_space.clone(),
             sidebar_agents: self.state.sidebar_agent.clone(),
             sidebar_host: self.state.sidebar_host.clone(),
+            hide_nested_remote_panes: self.state.hide_nested_remote_panes,
         }
     }
 

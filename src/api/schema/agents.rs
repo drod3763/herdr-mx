@@ -70,6 +70,11 @@ pub struct AgentInfo {
     pub agent_status: AgentStatus,
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub screen_detection_skipped: bool,
+    /// herdr-mx #9: true when this pane's foreground job is itself a nested
+    /// `herdr --remote` client (a "mirror" pane). The multi-remote client hides
+    /// such panes from its sidebar. Additive + optional (older servers omit it).
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub foreground_is_remote_client: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_status: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

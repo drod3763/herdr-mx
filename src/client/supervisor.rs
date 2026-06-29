@@ -125,6 +125,9 @@ pub(crate) struct AgentSummary {
     /// tabs and render the sidebar "tab name". `tab_label` is `None` for an older server.
     pub(crate) tab_id: String,
     pub(crate) tab_label: Option<String>,
+    /// #9: true when this pane is itself a nested `herdr --remote` client (a "mirror"
+    /// pane). Hidden from the sidebar when `ui.hide_nested_remote_panes` is on.
+    pub(crate) foreground_is_remote_client: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3040,11 +3043,13 @@ impl ClientSupervisorModel {
 
     pub(crate) fn agent_groups(&self) -> Vec<AgentSidebarGroup> {
         let all_filter = self.filter == ServerFilter::All;
+        let hide_nested_remote_panes = self.ui_settings().hide_nested_remote_panes;
         self.visible_servers()
             .into_iter()
             .filter(|server| server.connection_state == ConnectionState::Connected)
             .flat_map(|server| {
-                let mut groups = agent_groups_for_server(server, all_filter);
+                let mut groups =
+                    agent_groups_for_server(server, all_filter, hide_nested_remote_panes);
                 // item 6 (Area 6): apply the optimistic focus override to the optimistically-
                 // focused server's groups only. Other servers are untouched.
                 if let Some((focus_server, target)) = self.optimistic_focus.as_ref() {
@@ -3217,6 +3222,12 @@ impl ClientSupervisorModel {
 }
 
 fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<WorkspaceSidebarRow> {
+    // #9: the nested `herdr --remote` mirror hide is deliberately pane-level only —
+    // it drops mirror panes from `agent_groups_for_server`, not workspaces from the
+    // Spaces list. A workspace is shared session organization and a mirror pane
+    // normally coexists with real panes in it, so every remote workspace stays
+    // listed and navigable here regardless of `hide_nested_remote_panes`. See the
+    // `hide_nested_remote_panes_is_pane_level_not_workspace_level` test.
     // item 4: a row is remote iff its server is a secondary host.
     let is_remote = server.role == ServerRole::Secondary;
 
@@ -3269,7 +3280,11 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
         .collect()
 }
 
-fn agent_groups_for_server(server: &ManagedServer, all_filter: bool) -> Vec<AgentSidebarGroup> {
+fn agent_groups_for_server(
+    server: &ManagedServer,
+    all_filter: bool,
+    hide_nested_remote_panes: bool,
+) -> Vec<AgentSidebarGroup> {
     server
         .summaries
         .workspaces
@@ -3280,6 +3295,8 @@ fn agent_groups_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Agen
                 .agents
                 .iter()
                 .filter(|agent| agent.workspace_id == workspace.workspace_id)
+                // #9: drop nested `herdr --remote` "mirror" panes when the toggle is on.
+                .filter(|agent| !(hide_nested_remote_panes && agent.foreground_is_remote_client))
                 .map(|agent| AgentSidebarRow {
                     agent_id: agent.agent_id.clone(),
                     label: agent.label.clone(),
@@ -3653,6 +3670,7 @@ impl ServerSummary {
                         pane_label: agent.manual_label,
                         tab_id: agent.tab_id,
                         tab_label: agent.tab_label,
+                        foreground_is_remote_client: agent.foreground_is_remote_client,
                     }
                 })
                 .collect(),
@@ -3918,6 +3936,7 @@ mod tests {
             display_agent: None,
             agent_status: status,
             screen_detection_skipped: false,
+            foreground_is_remote_client: false,
             custom_status: None,
             state_labels: std::collections::HashMap::new(),
             agent_session: None,
@@ -4962,6 +4981,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -4986,6 +5006,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -5045,6 +5066,138 @@ mod tests {
                     tab_label: None,
                 }],
             }]
+        );
+    }
+
+    #[test]
+    fn agent_groups_hide_nested_remote_client_panes() {
+        // #9: a flagged "mirror" pane is dropped from the sidebar when the toggle is on,
+        // and a workspace whose only pane is a mirror disappears entirely. With the toggle
+        // off, every pane (and its workspace) is kept.
+        fn summary() -> ServerSummary {
+            let agent = |id: &str, ws: &str, mirror: bool| AgentSummary {
+                agent_id: id.into(),
+                workspace_id: ws.into(),
+                label: "claude".into(),
+                status: "idle".into(),
+                focused: false,
+                pane_label: None,
+                tab_id: String::new(),
+                tab_label: None,
+                foreground_is_remote_client: mirror,
+            };
+            let ws = |id: &str| WorkspaceSummary {
+                workspace_id: id.into(),
+                label: "herdr".into(),
+                branch: None,
+                focused: false,
+                ..Default::default()
+            };
+            ServerSummary {
+                workspaces: vec![ws("keep"), ws("mirror-only")],
+                agents: vec![
+                    agent("normal", "keep", false),
+                    agent("mirror-a", "keep", true),
+                    agent("mirror-b", "mirror-only", true),
+                ],
+            }
+        }
+
+        // Toggle on (default): mirror panes dropped, the mirror-only workspace vanishes.
+        let mut model = ClientSupervisorModel::new("local");
+        model.set_summary(&ServerId::main(), summary()).unwrap();
+        let groups = model.agent_groups();
+        assert_eq!(groups.len(), 1, "mirror-only workspace should be dropped");
+        assert_eq!(groups[0].workspace_id, "keep");
+        let ids: Vec<&str> = groups[0]
+            .agents
+            .iter()
+            .map(|a| a.agent_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["normal"], "only the non-mirror pane is kept");
+
+        // Toggle off: every pane and workspace is kept.
+        model.set_ui_settings(crate::api::schema::UiSettingsInfo {
+            hide_nested_remote_panes: false,
+            ..Default::default()
+        });
+        let groups = model.agent_groups();
+        assert_eq!(groups.len(), 2, "both workspaces kept when toggle is off");
+        let total_agents: usize = groups.iter().map(|g| g.agents.len()).sum();
+        assert_eq!(total_agents, 3, "all panes kept when toggle is off");
+    }
+
+    #[test]
+    fn hide_nested_remote_panes_is_pane_level_not_workspace_level() {
+        // #9 contract: hiding applies to agent/pane rows, not to the Spaces list.
+        // A workspace is shared session organization and a mirror pane normally
+        // coexists with real panes there, so `workspace_rows()` keeps every remote
+        // workspace even when the toggle is on — only the mirror *pane* is dropped
+        // from the agents section. (Codex review iter 2: deliberate scope boundary.)
+        let agent = |id: &str, ws: &str, mirror: bool| AgentSummary {
+            agent_id: id.into(),
+            workspace_id: ws.into(),
+            label: "claude".into(),
+            status: "idle".into(),
+            focused: false,
+            pane_label: None,
+            tab_id: String::new(),
+            tab_label: None,
+            foreground_is_remote_client: mirror,
+        };
+        let ws = |id: &str| WorkspaceSummary {
+            workspace_id: id.into(),
+            label: "herdr".into(),
+            branch: None,
+            focused: false,
+            ..Default::default()
+        };
+
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    // "shared" mixes a real pane with a mirror; "mirror-only" holds just a mirror.
+                    workspaces: vec![ws("shared"), ws("mirror-only")],
+                    agents: vec![
+                        agent("normal", "shared", false),
+                        agent("mirror-a", "shared", true),
+                        agent("mirror-b", "mirror-only", true),
+                    ],
+                },
+            )
+            .unwrap();
+
+        // Toggle on (default): Spaces still lists BOTH workspaces — hiding is pane-level.
+        let spaces: Vec<String> = model
+            .workspace_rows()
+            .into_iter()
+            .filter_map(|row| row.workspace_id)
+            .collect();
+        assert_eq!(
+            spaces,
+            vec!["shared".to_string(), "mirror-only".to_string()],
+            "Spaces is workspace-level: every remote workspace stays even with the toggle on"
+        );
+
+        // Agents section: mirror panes are gone; the mixed workspace keeps its real pane.
+        let groups = model.agent_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "only the workspace with a non-mirror pane has an agent group"
+        );
+        assert_eq!(groups[0].workspace_id, "shared");
+        let ids: Vec<&str> = groups[0]
+            .agents
+            .iter()
+            .map(|a| a.agent_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["normal"],
+            "the mirror pane beside a real pane is dropped"
         );
     }
 
@@ -5117,6 +5270,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -5213,6 +5367,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )

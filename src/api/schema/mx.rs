@@ -67,6 +67,14 @@ pub struct UiSettingsInfo {
     pub sidebar_spaces: crate::config::SidebarSpacesConfig,
     pub sidebar_agents: crate::config::SidebarAgentsConfig,
     pub sidebar_host: crate::config::SidebarHostConfig,
+    /// herdr-mx #9: hide nested `herdr --remote` "mirror" panes from the
+    /// multi-remote sidebar. Defaults true if an older server omits it.
+    #[serde(default = "default_true")]
+    pub hide_nested_remote_panes: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for UiSettingsInfo {
@@ -81,6 +89,7 @@ impl Default for UiSettingsInfo {
             sidebar_spaces: ui.sidebar.spaces,
             sidebar_agents: ui.sidebar.agents,
             sidebar_host: ui.sidebar.host,
+            hide_nested_remote_panes: ui.hide_nested_remote_panes,
         }
     }
 }
