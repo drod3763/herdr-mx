@@ -369,9 +369,10 @@ impl SshTarget {
 }
 
 /// How the `--remote` bridge reaches a host: the built-in `ssh` invocation, or a user-defined
-/// program + arg template from `[remote.transport]`. Resolved once per process by
-/// [`resolved_transport`]; the replacement program must still provide a raw bidirectional binary
-/// stdio channel (the bridge pipes herdr's frame protocol over it unchanged).
+/// program + arg template from `[remote.transport]`. Resolved per command build by
+/// [`resolved_transport`] so live config reloads apply; the replacement program must still provide
+/// a raw bidirectional binary stdio channel (the bridge pipes herdr's frame protocol over it
+/// unchanged).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TransportSpec {
     Ssh,
