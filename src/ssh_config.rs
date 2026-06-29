@@ -29,6 +29,11 @@ const MAX_CONFIG_FILE_BYTES: u64 = 1 << 20;
 /// glob `Include`s fan out into a large directory tree.
 const MAX_CONFIG_FILES: usize = 256;
 
+/// Directory entries a single glob `Include` will examine before giving up. Bounds the `read_dir`
+/// scan so a pattern like `Include config.d/*` pointed at a huge directory cannot pin the loop
+/// iterating/sorting unboundedly. Set well above any realistic `~/.ssh/config.d`.
+const MAX_GLOB_SCAN_ENTRIES: usize = 8192;
+
 /// A single connectable ssh alias discovered in the config, with its resolved display fields.
 ///
 /// Doubles as the `remote.ssh_config_hosts` wire payload (referenced from `ResponseResult`), so it
@@ -308,8 +313,14 @@ fn glob_expand(pattern: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return Vec::new();
     };
+    // Bound the scan: stop after examining MAX_GLOB_SCAN_ENTRIES, or once we've collected enough
+    // matches to exhaust the total file budget. A pathological huge directory can't pin the loop
+    // iterating/collecting/sorting unboundedly. discover_hosts runs synchronously on the app loop.
     let mut matched = Vec::new();
-    for entry in entries.flatten() {
+    for (scanned, entry) in entries.flatten().enumerate() {
+        if scanned >= MAX_GLOB_SCAN_ENTRIES || matched.len() >= MAX_CONFIG_FILES {
+            break;
+        }
         if let Some(name) = entry.file_name().to_str() {
             if glob_match(file_pattern, name) {
                 matched.push(entry.path());
