@@ -7,9 +7,6 @@
 - Added `ui.hide_nested_remote_panes` (default on) to auto-hide remote panes that are themselves nested `herdr --remote` clients ("mirror" panes) from the multi-remote sidebar. Detection keys on the foreground process argv, so plain local `herdr` panes and the SSH bridge subprocesses stay visible. (#9)
 - Added a "pick from ~/.ssh/config" browser to the Add Remote flow: the client reads the host's `~/.ssh/config` (following `Include` directives, skipping wildcard/pattern hosts) through a new read-only `remote.ssh_config_hosts` API method and offers the discovered aliases as a mouse-first multi-select list, showing each alias with its resolved `HostName`/`User`. Selected aliases are added in one batch as bare ssh targets so ssh resolves the rest at connect time, and aliases already in the registry are marked and skipped. (#11)
 
-### Changed
-- Bumped the client/server protocol version to 15 for the additive `remote.ssh_config_hosts` method. (#11)
-
 ### Fixed
 - Fixed mixed remote client sidebar wheel scrolling so overflowed remote spaces can be reached and clicked.
 - Fixed SSH-backed mixed remote sidebar actions timing out too aggressively, so clicking remote spaces can route focus over slower remote API bridges.
