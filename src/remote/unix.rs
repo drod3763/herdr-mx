@@ -10,7 +10,7 @@ use std::process::{Command, Output, Stdio};
 use serde::Deserialize;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -399,13 +399,33 @@ impl TransportSpec {
     }
 }
 
-/// The transport spec, resolved fresh from config for each command build. Like the client's
-/// keybinding resolution (`client_navigation_keybinds`), this re-reads `Config::load()` rather than
-/// caching so a live config reload (`herdr server reload-config`) is naturally picked up by
-/// subsequent remote operations and reconnects. Command builds are rare relative to ssh spawn cost,
-/// so the per-build config read is negligible.
+/// The transport spec, resolved from the live config for each command build so a config reload
+/// (`herdr server reload-config`) is picked up by subsequent remote operations and reconnects.
+///
+/// Uses `load_live_config` (not `Config::load`) on purpose: `Config::load` silently substitutes
+/// `Config::default()` on a parse/read error, which would drop a configured `[remote.transport]`
+/// and downgrade an active custom transport to plain ssh after a transient bad edit. Instead we
+/// remember the last successfully-resolved spec and keep it when the config currently fails to
+/// parse, matching the app-level contract to retain the current config on invalid TOML. Command
+/// builds are rare relative to ssh spawn cost, so the per-build config read is negligible.
 fn resolved_transport() -> TransportSpec {
-    TransportSpec::from_config(&crate::config::Config::load().config.remote)
+    static LAST_VALID: OnceLock<Mutex<TransportSpec>> = OnceLock::new();
+    let last_valid = LAST_VALID.get_or_init(|| Mutex::new(TransportSpec::Ssh));
+    match crate::config::load_live_config() {
+        Ok(loaded) => {
+            let spec = TransportSpec::from_config(&loaded.config.remote);
+            if let Ok(mut guard) = last_valid.lock() {
+                *guard = spec.clone();
+            }
+            spec
+        }
+        // Config currently fails to parse/read: keep the last spec we resolved successfully rather
+        // than falling back to ssh. Defaults to ssh only if no valid config was ever seen.
+        Err(_) => last_valid
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or(TransportSpec::Ssh),
+    }
 }
 
 /// How `prepare_remote_herdr` / `ensure_remote_server_ready` resolve the install + restart
@@ -2861,6 +2881,36 @@ mod tests {
                 args: vec!["{host}".into()],
             }
         );
+    }
+
+    #[test]
+    fn resolved_transport_keeps_last_valid_on_config_parse_error() {
+        // nextest runs each test in its own process, so the HERDR_CONFIG_PATH env var and the
+        // last-valid static inside resolved_transport are isolated from other tests.
+        let dir = std::env::temp_dir().join(format!("herdr-transport-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+
+        let valid = TransportSpec::Custom {
+            program: "autossh".into(),
+            args: vec!["{host}".into()],
+        };
+        // A valid custom transport resolves and is remembered as last-valid.
+        assert_eq!(resolved_transport(), valid);
+
+        // A later malformed edit must not silently downgrade the active transport to ssh:
+        // resolution keeps the last valid spec instead of falling back to config defaults.
+        std::fs::write(&cfg, "this is = not [[[ valid toml").expect("write broken config");
+        assert_eq!(resolved_transport(), valid);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn probe_lines(version: &str, protocol: u32, bridge_ok: bool) -> String {
