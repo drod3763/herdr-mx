@@ -500,15 +500,18 @@ fn resolve_transport() -> io::Result<TransportSpec> {
             Ok(spec)
         }
         // A custom transport is configured but invalid (e.g. template missing `{remote_command}`):
-        // keep a previously valid transport, but fail closed when none exists rather than routing
-        // remote operations over built-in ssh and bypassing the intended custom transport.
-        TransportResolution::Invalid => previous().ok_or_else(|| {
-            io::Error::new(
+        // keep a previously valid *custom* transport, but fail closed otherwise rather than routing
+        // remote operations over built-in ssh and bypassing the intended custom transport. A cached
+        // default ssh (from an earlier no-transport config) must NOT satisfy this fallback — that
+        // would silently route over ssh exactly when the user has now configured a custom transport.
+        TransportResolution::Invalid => match previous() {
+            Some(spec @ TransportSpec::Custom { .. }) => Ok(spec),
+            _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "[remote.transport] is configured but invalid (args must include a \
                  {remote_command} placeholder); refusing to fall back to built-in ssh",
-            )
-        }),
+            )),
+        },
     }
 }
 
@@ -3143,6 +3146,33 @@ mod tests {
 
         assert!(resolve_transport().is_err());
         assert!(crate::remote::SshTarget::resolved("iq-64", Vec::new()).is_err());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_errors_on_invalid_custom_after_default_ssh() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-dflt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // First resolve under a no-transport config: valid result is built-in ssh.
+        std::fs::write(&cfg, "[remote]\nmanage_ssh_config = true\n").expect("write default config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(
+            resolve_transport().expect("default resolves"),
+            TransportSpec::Ssh
+        );
+
+        // Now add an invalid custom transport. A cached default ssh must NOT satisfy the fallback:
+        // the operation fails closed instead of silently routing the new custom config over ssh.
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"ssh\"\nargs = [\"{host}\"]\n",
+        )
+        .expect("write invalid-template config");
+        assert!(resolve_transport().is_err());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
