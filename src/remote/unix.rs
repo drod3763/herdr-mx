@@ -454,6 +454,17 @@ fn resolved_transport() -> TransportSpec {
     let Ok(loaded) = crate::config::load_live_config() else {
         return keep_last();
     };
+    // `load_live_config` returns Ok even when the `[remote]` section fails to deserialize: it
+    // records the section in `invalid_sections` and leaves `config.remote` at its default. Deriving
+    // a transport from that default would silently drop a configured custom transport, so treat an
+    // invalid `[remote]` section like a parse error and keep the last valid transport.
+    if loaded
+        .invalid_sections
+        .iter()
+        .any(|section| section == "remote")
+    {
+        return keep_last();
+    }
     match TransportSpec::from_config(&loaded.config.remote) {
         TransportResolution::Spec(spec) => {
             if let Ok(mut guard) = last_valid.lock() {
@@ -3018,6 +3029,37 @@ mod tests {
             "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\"]\n",
         )
         .expect("write invalid-template config");
+        assert_eq!(resolved_transport(), valid);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolved_transport_keeps_last_valid_on_invalid_remote_section() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir =
+            std::env::temp_dir().join(format!("herdr-transport-section-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+
+        let valid = TransportSpec::Custom {
+            program: "autossh".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
+        assert_eq!(resolved_transport(), valid);
+
+        // Valid TOML whose `[remote]` section fails to deserialize (bool field given a string):
+        // load_live_config returns Ok with `remote` in invalid_sections and config.remote default.
+        // The transport must be kept, not overwritten with ssh derived from the default section.
+        std::fs::write(&cfg, "[remote]\nmanage_ssh_config = \"nope\"\n")
+            .expect("write invalid remote section");
         assert_eq!(resolved_transport(), valid);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
