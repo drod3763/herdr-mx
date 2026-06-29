@@ -3222,6 +3222,12 @@ impl ClientSupervisorModel {
 }
 
 fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<WorkspaceSidebarRow> {
+    // #9: the nested `herdr --remote` mirror hide is deliberately pane-level only —
+    // it drops mirror panes from `agent_groups_for_server`, not workspaces from the
+    // Spaces list. A workspace is shared session organization and a mirror pane
+    // normally coexists with real panes in it, so every remote workspace stays
+    // listed and navigable here regardless of `hide_nested_remote_panes`. See the
+    // `hide_nested_remote_panes_is_pane_level_not_workspace_level` test.
     // item 4: a row is remote iff its server is a secondary host.
     let is_remote = server.role == ServerRole::Secondary;
 
@@ -5119,6 +5125,80 @@ mod tests {
         assert_eq!(groups.len(), 2, "both workspaces kept when toggle is off");
         let total_agents: usize = groups.iter().map(|g| g.agents.len()).sum();
         assert_eq!(total_agents, 3, "all panes kept when toggle is off");
+    }
+
+    #[test]
+    fn hide_nested_remote_panes_is_pane_level_not_workspace_level() {
+        // #9 contract: hiding applies to agent/pane rows, not to the Spaces list.
+        // A workspace is shared session organization and a mirror pane normally
+        // coexists with real panes there, so `workspace_rows()` keeps every remote
+        // workspace even when the toggle is on — only the mirror *pane* is dropped
+        // from the agents section. (Codex review iter 2: deliberate scope boundary.)
+        let agent = |id: &str, ws: &str, mirror: bool| AgentSummary {
+            agent_id: id.into(),
+            workspace_id: ws.into(),
+            label: "claude".into(),
+            status: "idle".into(),
+            focused: false,
+            pane_label: None,
+            tab_id: String::new(),
+            tab_label: None,
+            foreground_is_remote_client: mirror,
+        };
+        let ws = |id: &str| WorkspaceSummary {
+            workspace_id: id.into(),
+            label: "herdr".into(),
+            branch: None,
+            focused: false,
+            ..Default::default()
+        };
+
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    // "shared" mixes a real pane with a mirror; "mirror-only" holds just a mirror.
+                    workspaces: vec![ws("shared"), ws("mirror-only")],
+                    agents: vec![
+                        agent("normal", "shared", false),
+                        agent("mirror-a", "shared", true),
+                        agent("mirror-b", "mirror-only", true),
+                    ],
+                },
+            )
+            .unwrap();
+
+        // Toggle on (default): Spaces still lists BOTH workspaces — hiding is pane-level.
+        let spaces: Vec<String> = model
+            .workspace_rows()
+            .into_iter()
+            .filter_map(|row| row.workspace_id)
+            .collect();
+        assert_eq!(
+            spaces,
+            vec!["shared".to_string(), "mirror-only".to_string()],
+            "Spaces is workspace-level: every remote workspace stays even with the toggle on"
+        );
+
+        // Agents section: mirror panes are gone; the mixed workspace keeps its real pane.
+        let groups = model.agent_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "only the workspace with a non-mirror pane has an agent group"
+        );
+        assert_eq!(groups[0].workspace_id, "shared");
+        let ids: Vec<&str> = groups[0]
+            .agents
+            .iter()
+            .map(|a| a.agent_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["normal"],
+            "the mirror pane beside a real pane is dropped"
+        );
     }
 
     #[test]
