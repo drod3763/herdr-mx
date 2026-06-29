@@ -3685,7 +3685,9 @@ fn spawn_client_ssh_hosts_add(
                 let result = submit_remote_add_to_main_api(
                     &mut main_api,
                     supervisor::AddRemoteDraft {
-                        target: alias.clone(),
+                        // codex-1-1: force ssh semantics so an alias like `localhost`/`local:prod`
+                        // registers as an ssh destination, not herdr's local session target.
+                        target: supervisor::ssh_config_alias_target(&alias),
                         name: None,
                         keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
                     },

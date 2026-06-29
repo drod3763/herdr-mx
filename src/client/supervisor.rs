@@ -1841,6 +1841,8 @@ impl ClientSupervisorModel {
         &self.synced_remotes
     }
 
+    // (helper defined at module scope below; see `ssh_config_alias_target`.)
+
     /// Open the multi-select ssh-host picker from a fetched `~/.ssh/config` host list. Each row's
     /// `already_added` flag is computed by parsing the alias into a target and comparing its
     /// `canonical_key()` against `existing` (the registry remotes) — already-registered hosts render
@@ -1857,10 +1859,11 @@ impl ClientSupervisorModel {
         let rows: Vec<SshHostRow> = hosts
             .into_iter()
             .map(|host| {
-                let already_added =
-                    crate::remote_registry::RemoteTargetSnapshot::parse(&host.alias)
-                        .map(|target| existing_keys.contains(&target.canonical_key()))
-                        .unwrap_or(false);
+                let already_added = crate::remote_registry::RemoteTargetSnapshot::parse(
+                    &ssh_config_alias_target(&host.alias),
+                )
+                .map(|target| existing_keys.contains(&target.canonical_key()))
+                .unwrap_or(false);
                 SshHostRow {
                     alias: host.alias,
                     hostname: host.hostname,
@@ -3600,6 +3603,18 @@ fn unavailable_reason(connection_state: &ConnectionState) -> &'static str {
 fn trimmed_optional(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// #11 (codex-1-1): map a discovered `~/.ssh/config` `Host` alias to its remote target string,
+/// forcing SSH semantics. A bare alias handed to `RemoteTargetSnapshot::parse` would hit the
+/// `localhost` / `local:*` special cases first, so a legitimate ssh `Host localhost` would be
+/// rejected as the local target and `Host local:prod` would be stored as a local session. Prefixing
+/// `ssh ` routes the alias through `parse_ssh`, yielding `Ssh { target: <alias> }`. ssh `Host` alias
+/// tokens never contain whitespace (whitespace separates patterns) and wildcard tokens are already
+/// filtered out during discovery, so the bare prefix needs no quoting. The submit path and the
+/// `already_added` dedup both call this so they agree on one canonical key.
+pub(crate) fn ssh_config_alias_target(alias: &str) -> String {
+    format!("ssh {alias}")
 }
 
 /// #44: format the host context-menu version-readout label and whether the remote's wire protocol
@@ -6023,6 +6038,49 @@ mod tests {
         );
         assert!(overlay.checked.is_empty());
         assert_eq!(overlay.selected, 0);
+    }
+
+    #[test]
+    fn open_ssh_host_picker_treats_localhost_alias_as_ssh_not_local() {
+        // codex-1-1: a discovered ssh `Host localhost` (or `Host local:prod`) is an ssh destination,
+        // NOT herdr's local session target. It must be deduped/added with forced-ssh semantics, so a
+        // registry that only holds the implicit local session must not mark these ssh aliases (added).
+        let mut model = ClientSupervisorModel::new("local");
+        let existing = vec![local_remote("r-local", "local", None)];
+        let hosts = vec![
+            ssh_host("localhost", Some("me"), Some("127.0.0.1")),
+            ssh_host("local:prod", None, Some("10.0.0.9")),
+        ];
+
+        model.open_ssh_host_picker(hosts, &existing);
+
+        let overlay = model.ssh_host_picker().expect("picker is open");
+        assert!(
+            !overlay.rows[0].already_added,
+            "ssh `Host localhost` (key ssh:localhost) must not dedup against the local session"
+        );
+        assert!(
+            !overlay.rows[1].already_added,
+            "ssh `Host local:prod` (key ssh:local:prod) must not be treated as a local session"
+        );
+
+        // Selecting both must submit forced-ssh targets, not bare aliases the generic parser would
+        // route to Local. The submit list carries aliases; the batch-add maps them through
+        // `ssh_config_alias_target`, which must yield ssh targets.
+        for alias in ["localhost", "local:prod"] {
+            let target = crate::remote_registry::RemoteTargetSnapshot::parse(
+                &ssh_config_alias_target(alias),
+            )
+            .expect("forced-ssh target parses");
+            assert_eq!(
+                target,
+                crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                    target: alias.into(),
+                    args: Vec::new(),
+                },
+                "ssh-config alias `{alias}` must register as an ssh target"
+            );
+        }
     }
 
     #[test]
