@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, IsTerminal, Write as _};
+use std::io::{self, IsTerminal, Read as _, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -2241,28 +2241,43 @@ trap - EXIT
             )
         })?;
 
-    let mut source = File::open(source_path)?;
-    let copy_result = match child.stdin.take() {
-        Some(mut stdin) => io::copy(&mut source, &mut stdin).map(|_| ()),
-        None => Err(io::Error::new(
+    let mut child_stdin = child.stdin.take().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::BrokenPipe, "install transport stdin missing")
+    })?;
+    // Drain stderr on its own thread while we stream the ~11 MB binary to stdin. A custom
+    // `[remote.transport]` may be a verbose wrapper/autossh, and the old "stderr stays tiny"
+    // assumption no longer holds: if the child filled its stderr pipe buffer it would stop reading
+    // stdin, and our blocking write of the binary would deadlock against it.
+    let mut child_stderr = child.stderr.take().ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::BrokenPipe,
-            "install transport stdin missing",
-        )),
-    };
-    // The ~11 MB binary went to stdin above; stderr stays tiny (one ssh warning at most), so
-    // wait_with_output cannot deadlock on a full pipe.
-    let output = child.wait_with_output()?;
+            "install transport stderr missing",
+        )
+    })?;
+    let stderr_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = child_stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    let mut source = File::open(source_path)?;
+    let copy_result = io::copy(&mut source, &mut child_stdin).map(|_| ());
+    // Close stdin so the remote `cat` sees EOF and the child can exit.
+    drop(child_stdin);
+
+    let status = child.wait()?;
+    let stderr = stderr_reader.join().unwrap_or_default();
     copy_result?;
 
-    if output.status.success() {
+    if status.success() {
         Ok(())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&stderr);
         let stderr = stderr.trim();
         Err(io::Error::other(if stderr.is_empty() {
-            format!("remote install exited with {}", output.status)
+            format!("remote install exited with {status}")
         } else {
-            format!("remote install exited with {}: {stderr}", output.status)
+            format!("remote install exited with {status}: {stderr}")
         }))
     }
 }
