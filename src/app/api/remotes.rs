@@ -424,6 +424,9 @@ mod tests {
     fn ssh_config_hosts_enumerates_aliases_without_marking_dirty() {
         // #11: the read-only discovery method returns the config's concrete aliases (with display
         // fields) and must not dirty the session. Point it at a temp config via the env override.
+        // Share the ssh_config tests' lock so the process-global `HERDR_SSH_CONFIG_PATH`/`HOME`
+        // mutations can't race those tests under plain `cargo test`.
+        let _env_lock = crate::ssh_config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("herdr-api-ssh-cfg");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

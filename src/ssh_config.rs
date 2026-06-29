@@ -297,6 +297,13 @@ fn glob_match_inner(pat: &[char], text: &[char]) -> bool {
     }
 }
 
+/// Process-wide serialization for every test that mutates `HOME` / `HERDR_SSH_CONFIG_PATH` (which is
+/// global). Shared so the `ssh_config` unit tests and the `remote.ssh_config_hosts` API handler test
+/// (`src/app/api/remotes.rs`) cannot clobber each other's env under plain `cargo test` (nextest, the
+/// repo's `just test`, already isolates each test in its own process).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,9 +375,6 @@ mod tests {
         let mut file = std::fs::File::create(path).unwrap();
         file.write_all(body.as_bytes()).unwrap();
     }
-
-    // Env-var mutation is process-global; serialize the tests that touch HOME / the config path.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn enumerates_concrete_hosts_with_hostname_and_user() {
