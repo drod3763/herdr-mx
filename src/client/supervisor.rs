@@ -1806,6 +1806,18 @@ impl ClientSupervisorModel {
         }
     }
 
+    /// Surface an error on the Add Remote overlay's error line ONLY when that overlay is still open —
+    /// used by the off-loop ssh-config fetch so a user-initiated failure is visible, while a late
+    /// result that arrives after the overlay closed stays log-only. Returns whether it surfaced.
+    pub(crate) fn set_add_remote_error_if_open(&mut self, error: impl Into<String>) -> bool {
+        if self.add_remote_form().is_some() {
+            self.set_add_remote_error(error);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Mark the add-remote submission as in flight: clears any prior error/progress and switches the
     /// status row to the animated progress line.
     pub(crate) fn set_add_remote_in_progress(&mut self) {
@@ -6063,6 +6075,23 @@ mod tests {
         );
         assert!(overlay.checked.is_empty());
         assert_eq!(overlay.selected, 0);
+    }
+
+    #[test]
+    fn set_add_remote_error_if_open_only_surfaces_while_the_overlay_is_open() {
+        // PRRT...3fS: a user-initiated ssh-config fetch failure is shown on the Add Remote overlay's
+        // error line while it is open, but a late result after it closed stays log-only (no-op).
+        let mut idle = ClientSupervisorModel::new("local");
+        assert!(!idle.set_add_remote_error_if_open("boom"));
+        assert!(idle.add_remote_form().is_none());
+
+        let mut adding = ClientSupervisorModel::new("local");
+        adding.open_add_remote_form();
+        assert!(adding.set_add_remote_error_if_open("couldn't read ~/.ssh/config"));
+        assert_eq!(
+            adding.add_remote_form().and_then(|f| f.error.as_deref()),
+            Some("couldn't read ~/.ssh/config")
+        );
     }
 
     #[test]

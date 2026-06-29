@@ -6183,7 +6183,16 @@ async fn run_client_loop(
                             model.open_ssh_host_picker_if_adding(hosts, &existing);
                         }
                     }
-                    Err(err) => warn!(err = %err, "failed to fetch ssh-config hosts"),
+                    Err(err) => {
+                        warn!(err = %err, "failed to fetch ssh-config hosts");
+                        // Surface the failure on the Add Remote overlay if it's still open (the user
+                        // launched this fetch from it); a late result after it closed stays log-only.
+                        if let Some(model) = &mut state.supervisor_model {
+                            model.set_add_remote_error_if_open(format!(
+                                "couldn't read ~/.ssh/config: {err}"
+                            ));
+                        }
+                    }
                 }
                 state.request_full_redraw();
                 render_cached_composited_frame(&mut state);
