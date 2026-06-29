@@ -390,10 +390,29 @@ impl TransportSpec {
         match &remote.transport {
             // An empty program is treated as "no transport" so a stray `[remote.transport]`
             // header can't break every connection by spawning a nameless command.
-            Some(transport) if !transport.program.trim().is_empty() => Self::Custom {
-                program: transport.program.trim().to_string(),
-                args: transport.args.clone(),
-            },
+            Some(transport) if !transport.program.trim().is_empty() => {
+                // The bridge/install path runs an arbitrary remote command (the herdr payload) over
+                // the transport. A template that omits `{remote_command}` would spawn the transport
+                // and stream that payload (including the ~11 MB binary on install) into the remote
+                // login shell or wrapper stdin instead of a command runner. Reject such templates up
+                // front and fall back to ssh rather than make remote-side changes through a footgun
+                // config. `{host}` is intentionally not required: a wrapper may embed its destination.
+                if !transport
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains("{remote_command}"))
+                {
+                    tracing::warn!(
+                        program = %transport.program,
+                        "[remote.transport] args must include a {{remote_command}} placeholder; falling back to built-in ssh"
+                    );
+                    return Self::Ssh;
+                }
+                Self::Custom {
+                    program: transport.program.trim().to_string(),
+                    args: transport.args.clone(),
+                }
+            }
             _ => Self::Ssh,
         }
     }
@@ -2865,7 +2884,7 @@ mod tests {
         let remote = crate::config::model::RemoteConfig {
             transport: Some(crate::config::model::RemoteTransportConfig {
                 program: "autossh".into(),
-                args: vec!["{host}".into()],
+                args: vec!["{host}".into(), "{remote_command}".into()],
             }),
             ..Default::default()
         };
@@ -2873,7 +2892,7 @@ mod tests {
             TransportSpec::from_config(&remote),
             TransportSpec::Custom {
                 program: "autossh".into(),
-                args: vec!["{host}".into()],
+                args: vec!["{host}".into(), "{remote_command}".into()],
             }
         );
     }
@@ -2885,7 +2904,7 @@ mod tests {
         let remote = crate::config::model::RemoteConfig {
             transport: Some(crate::config::model::RemoteTransportConfig {
                 program: "  autossh  ".into(),
-                args: vec!["{host}".into()],
+                args: vec!["{host}".into(), "{remote_command}".into()],
             }),
             ..Default::default()
         };
@@ -2893,9 +2912,23 @@ mod tests {
             TransportSpec::from_config(&remote),
             TransportSpec::Custom {
                 program: "autossh".into(),
-                args: vec!["{host}".into()],
+                args: vec!["{host}".into(), "{remote_command}".into()],
             }
         );
+    }
+
+    #[test]
+    fn transport_spec_from_config_rejects_template_without_remote_command() {
+        // A template that never runs the remote command would stream the herdr payload (incl. the
+        // install binary) into a bare shell/wrapper stdin; reject it and fall back to ssh.
+        let remote = crate::config::model::RemoteConfig {
+            transport: Some(crate::config::model::RemoteTransportConfig {
+                program: "ssh".into(),
+                args: vec!["{host}".into()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(TransportSpec::from_config(&remote), TransportSpec::Ssh);
     }
 
     #[test]
@@ -2907,14 +2940,14 @@ mod tests {
         let cfg = dir.join("config.toml");
         std::fs::write(
             &cfg,
-            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\"]\n",
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
         )
         .expect("write valid config");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
 
         let valid = TransportSpec::Custom {
             program: "autossh".into(),
-            args: vec!["{host}".into()],
+            args: vec!["{host}".into(), "{remote_command}".into()],
         };
         // A valid custom transport resolves and is remembered as last-valid.
         assert_eq!(resolved_transport(), valid);
