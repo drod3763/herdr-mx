@@ -69,6 +69,35 @@ Native Windows `herdr --remote` is not part of the Windows beta. From Windows, S
 
 By default, `herdr --remote` runs the bridge through a temporary SSH config that includes your SSH config first, then adds fallback keepalive settings. Existing user keepalive settings win. Set `[remote].manage_ssh_config = false` to use plain `ssh` without Herdr's generated bridge config.
 
+### Custom transport
+
+By default Herdr reaches a remote with its built-in `ssh -T` invocation. You can swap in a different program — for example `autossh`, or a wrapper script — with `[remote.transport]`:
+
+```toml
+[remote.transport]
+program = "autossh"
+args = ["-M", "0", "{options}", "-T", "{host}", "{remote_command}"]
+```
+
+Herdr spawns `program` with `args`, expanding three placeholders:
+
+- `{host}` — the remote destination (substituted within a token).
+- `{remote_command}` — the command Herdr runs on the remote (substituted within a token).
+- `{options}` — a standalone token that expands to each resolved SSH option (`-p`, `-J`, `-o …`, etc.) as its own argument. Drop it if your transport takes no SSH options.
+
+A custom transport owns its full argument list: Herdr does **not** inject `-T`, `ConnectTimeout`, or `ClearAllForwardings`, so include whatever your program needs. The setting is global (it applies to every remote).
+
+The replacement program must provide a clean **raw bidirectional binary stdio channel** that runs an arbitrary remote command — Herdr pipes its binary frame protocol over the transport's stdin/stdout unchanged. Terminal-emulating transports such as **mosh** and **Eternal Terminal** carry a rendered terminal, not a raw byte stream, so they cannot serve as the bridge transport.
+
+#### Roaming across sleep and network changes
+
+For a connection that recovers after laptop sleep or an IP change while keeping Herdr's unified remote view, keep the SSH bridge and make SSH itself recover:
+
+- Point `[remote.transport]` at `autossh` (as above) to auto-restart the SSH process on drop.
+- Or stay on plain `ssh` and lean on SSH-native options through your SSH config or the remote spec: `ControlMaster=auto` with `ControlPersist`, `ServerAliveInterval`/`ServerAliveCountMax`, and `ProxyJump`/`ProxyCommand`.
+
+Because the remote `herdr` server is persistent, a dropped connection reconnects in about a second and the remote's panes and agents repopulate in place.
+
 By default, remote attach uses the normal restart/stop flow if it needs to replace or restart a running remote server. To opt into experimental live handoff for a supported running remote server, pass `--handoff`:
 
 ```bash

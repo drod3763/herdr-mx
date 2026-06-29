@@ -1328,14 +1328,35 @@ pub struct RemoteConfig {
     /// Add a keepalive fallback under the user's ssh config for the `--remote`
     /// bridge. Set false to run plain ssh unchanged. Default: true.
     pub manage_ssh_config: bool,
+    /// Override the program herdr spawns to reach a remote. When unset (default),
+    /// herdr uses its built-in `ssh -T` invocation. When set, the bridge spawns
+    /// `program` with `args`, expanding the `{host}`, `{remote_command}`, and
+    /// `{options}` placeholders. The replacement program must provide a clean raw
+    /// bidirectional binary stdio channel running an arbitrary remote command;
+    /// terminal-emulating transports (mosh, Eternal Terminal) cannot satisfy this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<RemoteTransportConfig>,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             manage_ssh_config: true,
+            transport: None,
         }
     }
+}
+
+/// A user-defined transport command for the `--remote` bridge. `program` is the
+/// binary to spawn (e.g. `ssh`, `autossh`, or a wrapper script); `args` is the
+/// argv template. In `args`, the standalone token `{options}` expands to each of
+/// the resolved ssh options as its own argument, while `{host}` and
+/// `{remote_command}` are substring-substituted within a token.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RemoteTransportConfig {
+    pub program: String,
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

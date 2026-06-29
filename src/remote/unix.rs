@@ -10,7 +10,7 @@ use std::process::{Command, Output, Stdio};
 use serde::Deserialize;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -288,11 +288,25 @@ impl SshTarget {
         &self.destination
     }
 
+    /// Build the transport command for `remote_command`, resolving the process-wide transport
+    /// spec from config once. Defaults to the built-in `ssh` transport; a `[remote.transport]`
+    /// config entry swaps in a user-defined program + arg template instead.
+    fn command(&self, remote_command: &str) -> Command {
+        self.build_command(remote_command, resolved_transport())
+    }
+
     /// Build `ssh <options...> -T <destination> <remote_command>`. `-T` (disable pseudo-tty) is
     /// inserted before the destination unless the user already supplied it; the herdr payload is
     /// always the trailing positional so it runs on the remote rather than being parsed as an
     /// ssh option.
-    fn command(&self, remote_command: &str) -> Command {
+    ///
+    /// `transport` selects the program: the built-in `Ssh` behavior (the default) or a
+    /// user-defined `Custom` template. Split out from `command` so tests can pass an explicit
+    /// spec without depending on the caller's real config file.
+    fn build_command(&self, remote_command: &str, transport: &TransportSpec) -> Command {
+        let TransportSpec::Ssh = transport else {
+            return self.build_custom_command(remote_command, transport);
+        };
         let mut command = Command::new("ssh");
         // Bound the connect phase so an unreachable host fails fast instead of stalling for the OS
         // TCP timeout. Skip if the user already pinned a ConnectTimeout in their own options.
@@ -327,6 +341,64 @@ impl SshTarget {
         command.arg(remote_command);
         command
     }
+
+    /// Build a user-defined transport command. Unlike the `Ssh` path, no `-T`/timeout/forwarding
+    /// options are injected — the template owns the full argv. The standalone token `{options}`
+    /// expands to each resolved ssh option as its own argument; `{host}` and `{remote_command}`
+    /// are substring-substituted within a token.
+    fn build_custom_command(&self, remote_command: &str, transport: &TransportSpec) -> Command {
+        let TransportSpec::Custom { program, args } = transport else {
+            // Unreachable: callers only route here for `Custom`. Fall back to the program name so
+            // a future variant can never silently spawn nothing.
+            return Command::new("ssh");
+        };
+        let mut command = Command::new(program);
+        for token in args {
+            if token == "{options}" {
+                command.args(&self.options);
+            } else {
+                command.arg(
+                    token
+                        .replace("{host}", &self.destination)
+                        .replace("{remote_command}", remote_command),
+                );
+            }
+        }
+        command
+    }
+}
+
+/// How the `--remote` bridge reaches a host: the built-in `ssh` invocation, or a user-defined
+/// program + arg template from `[remote.transport]`. Resolved once per process by
+/// [`resolved_transport`]; the replacement program must still provide a raw bidirectional binary
+/// stdio channel (the bridge pipes herdr's frame protocol over it unchanged).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransportSpec {
+    Ssh,
+    Custom { program: String, args: Vec<String> },
+}
+
+impl TransportSpec {
+    fn from_config(remote: &crate::config::model::RemoteConfig) -> Self {
+        match &remote.transport {
+            // An empty program is treated as "no transport" so a stray `[remote.transport]`
+            // header can't break every connection by spawning a nameless command.
+            Some(transport) if !transport.program.trim().is_empty() => Self::Custom {
+                program: transport.program.clone(),
+                args: transport.args.clone(),
+            },
+            _ => Self::Ssh,
+        }
+    }
+}
+
+/// The transport spec for this process, resolved from config on first use. Transport selection is
+/// a launch-time concern that does not change mid-session, so caching avoids re-reading config on
+/// every remote command while still letting all `SshTarget` call sites (including reconnects)
+/// share one spec.
+fn resolved_transport() -> &'static TransportSpec {
+    static SPEC: OnceLock<TransportSpec> = OnceLock::new();
+    SPEC.get_or_init(|| TransportSpec::from_config(&crate::config::Config::load().config.remote))
 }
 
 /// How `prepare_remote_herdr` / `ensure_remote_server_ready` resolve the install + restart
@@ -2542,11 +2614,36 @@ mod tests {
     use super::*;
 
     fn ssh_argv(target: &SshTarget, remote_command: &str) -> Vec<String> {
+        argv_with(target, remote_command, &TransportSpec::Ssh)
+    }
+
+    /// Args of the built command under an explicit transport spec (hermetic: never reads the
+    /// caller's real config).
+    fn argv_with(
+        target: &SshTarget,
+        remote_command: &str,
+        transport: &TransportSpec,
+    ) -> Vec<String> {
         target
-            .command(remote_command)
+            .build_command(remote_command, transport)
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// `(program, args)` of the built command under an explicit transport spec.
+    fn program_and_argv(
+        target: &SshTarget,
+        remote_command: &str,
+        transport: &TransportSpec,
+    ) -> (String, Vec<String>) {
+        let command = target.build_command(remote_command, transport);
+        let program = command.get_program().to_string_lossy().into_owned();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        (program, args)
     }
 
     #[test]
@@ -2648,6 +2745,88 @@ mod tests {
                 "iq-64",
                 "x"
             ]
+        );
+    }
+
+    #[test]
+    fn custom_transport_swaps_program_and_expands_placeholders() {
+        let transport = TransportSpec::Custom {
+            program: "autossh".into(),
+            args: vec![
+                "-M".into(),
+                "0".into(),
+                "{options}".into(),
+                "-T".into(),
+                "{host}".into(),
+                "{remote_command}".into(),
+            ],
+        };
+        let target = SshTarget::new("iq-64", vec!["-p".into(), "2222".into()]);
+        let (program, argv) = program_and_argv(&target, "uname -s", &transport);
+        assert_eq!(program, "autossh");
+        // {options} expands inline to each option as its own arg; no -T/timeout/forwarding
+        // options are injected for a custom transport — the template owns the argv.
+        assert_eq!(argv, ["-M", "0", "-p", "2222", "-T", "iq-64", "uname -s"]);
+    }
+
+    #[test]
+    fn custom_transport_options_token_expands_to_zero_args_when_empty() {
+        let transport = TransportSpec::Custom {
+            program: "ssh".into(),
+            args: vec![
+                "{options}".into(),
+                "{host}".into(),
+                "{remote_command}".into(),
+            ],
+        };
+        let argv = argv_with(&SshTarget::bare("iq-64"), "x", &transport);
+        assert_eq!(argv, ["iq-64", "x"]);
+    }
+
+    #[test]
+    fn custom_transport_substitutes_within_a_token() {
+        // {host}/{remote_command} are substring-substituted, so a template can wrap them.
+        let transport = TransportSpec::Custom {
+            program: "wrapper".into(),
+            args: vec!["ssh://{host}".into(), "exec {remote_command}".into()],
+        };
+        let argv = argv_with(&SshTarget::bare("iq-64"), "herdr bridge", &transport);
+        assert_eq!(argv, ["ssh://iq-64", "exec herdr bridge"]);
+    }
+
+    #[test]
+    fn transport_spec_from_config_defaults_to_ssh() {
+        let remote = crate::config::model::RemoteConfig::default();
+        assert_eq!(TransportSpec::from_config(&remote), TransportSpec::Ssh);
+    }
+
+    #[test]
+    fn transport_spec_from_config_ignores_blank_program() {
+        let remote = crate::config::model::RemoteConfig {
+            transport: Some(crate::config::model::RemoteTransportConfig {
+                program: "   ".into(),
+                args: vec!["{host}".into()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(TransportSpec::from_config(&remote), TransportSpec::Ssh);
+    }
+
+    #[test]
+    fn transport_spec_from_config_uses_custom_program() {
+        let remote = crate::config::model::RemoteConfig {
+            transport: Some(crate::config::model::RemoteTransportConfig {
+                program: "autossh".into(),
+                args: vec!["{host}".into()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            TransportSpec::from_config(&remote),
+            TransportSpec::Custom {
+                program: "autossh".into(),
+                args: vec!["{host}".into()],
+            }
         );
     }
 
