@@ -2214,14 +2214,19 @@ trap - EXIT
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh install: {err}")))?;
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("failed to start install transport: {err}"),
+            )
+        })?;
 
     let mut source = File::open(source_path)?;
     let copy_result = match child.stdin.take() {
         Some(mut stdin) => io::copy(&mut source, &mut stdin).map(|_| ()),
         None => Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
-            "ssh install stdin missing",
+            "install transport stdin missing",
         )),
     };
     // The ~11 MB binary went to stdin above; stderr stays tiny (one ssh warning at most), so
@@ -2417,17 +2422,18 @@ fn bridge_connection(
         // connection-setup errors are already reported by the detect/install phase.
         .stderr(Stdio::null());
 
-    let mut child = command
-        .spawn()
-        .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdin missing"))?;
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
+    let mut child = command.spawn().map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("failed to start transport bridge: {err}"),
+        )
+    })?;
+    let mut child_stdin = child.stdin.take().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::BrokenPipe, "transport bridge stdin missing")
+    })?;
+    let mut child_stdout = child.stdout.take().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::BrokenPipe, "transport bridge stdout missing")
+    })?;
     let mut stream_to_child = stream.try_clone()?;
     let mut child_to_stream = stream;
 
@@ -2448,7 +2454,7 @@ fn bridge_connection(
     } else {
         Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
-            format!("ssh bridge exited with {status}"),
+            format!("transport bridge exited with {status}"),
         ))
     }
 }
