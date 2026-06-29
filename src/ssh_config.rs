@@ -180,7 +180,10 @@ fn split_keyword(line: &str) -> Option<(String, &str)> {
 }
 
 /// Tokenize the argument portion of a line, honoring double quotes (ssh_config allows quoted
-/// patterns/paths with spaces). Falls back to whitespace splitting.
+/// patterns/paths with spaces). Falls back to whitespace splitting. An unquoted `#` that begins a
+/// token starts a trailing comment — the rest of the line is dropped so a comment like
+/// `Host prod # main` does not surface `#`/`main` as bogus aliases. A `#` inside a token
+/// (`web#1`) or inside quotes is preserved.
 fn tokenize(rest: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -188,6 +191,7 @@ fn tokenize(rest: &str) -> Vec<String> {
     for ch in rest.chars() {
         match ch {
             '"' => in_quotes = !in_quotes,
+            '#' if !in_quotes && current.is_empty() => break,
             c if c.is_whitespace() && !in_quotes => {
                 if !current.is_empty() {
                     tokens.push(std::mem::take(&mut current));
@@ -498,6 +502,22 @@ mod tests {
         assert_eq!(hosts[0].alias, "prod");
         assert_eq!(hosts[0].hostname.as_deref(), Some("10.0.0.9"));
         assert_eq!(hosts[0].user.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn inline_comment_is_stripped_but_hash_inside_a_token_is_kept() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _fixture = ConfigFixture::new(
+            "inline-comment",
+            "Host prod # main\n  HostName 10.0.0.5 # the box\n  User deploy # primary\n\nHost web#1\n  HostName w.host\n",
+        );
+        let hosts = discover_hosts();
+        let aliases: Vec<_> = hosts.iter().map(|h| h.alias.clone()).collect();
+        // `# main` is a trailing comment, not extra aliases; `web#1` keeps its in-token `#`.
+        assert_eq!(aliases, vec!["prod".to_string(), "web#1".to_string()]);
+        assert_eq!(hosts[0].hostname.as_deref(), Some("10.0.0.5"));
+        assert_eq!(hosts[0].user.as_deref(), Some("deploy"));
+        assert_eq!(hosts[1].hostname.as_deref(), Some("w.host"));
     }
 
     #[test]
