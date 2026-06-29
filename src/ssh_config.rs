@@ -21,6 +21,14 @@ pub const SSH_CONFIG_PATH_ENV_VAR: &str = "HERDR_SSH_CONFIG_PATH";
 /// caught by the visited-path set, but a deep legitimate chain is also not worth following).
 const MAX_INCLUDE_DEPTH: usize = 16;
 
+/// Per-file byte cap. The API handler runs `discover_hosts()` synchronously on the server loop, so a
+/// huge config/include must not be slurped into memory there. Files larger than this are skipped.
+const MAX_CONFIG_FILE_BYTES: u64 = 1 << 20;
+
+/// Total files (default config + all includes) read in one discovery pass. Bounds a config whose
+/// glob `Include`s fan out into a large directory tree.
+const MAX_CONFIG_FILES: usize = 256;
+
 /// A single connectable ssh alias discovered in the config, with its resolved display fields.
 ///
 /// Doubles as the `remote.ssh_config_hosts` wire payload (referenced from `ResponseResult`), so it
@@ -107,6 +115,18 @@ fn parse_file(
     // (cycle guard). Fall back to the raw path if canonicalization fails (e.g. file is missing).
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if !visited_files.insert(canonical) {
+        return;
+    }
+    // Bound discovery: it runs synchronously on the server loop. Cap the total files read across a
+    // glob-fanned `Include` tree, require a regular file (a FIFO/device would block `read_to_string`
+    // forever; a directory/socket is not a config), and skip files larger than the per-file cap.
+    if visited_files.len() > MAX_CONFIG_FILES {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if !meta.is_file() || meta.len() > MAX_CONFIG_FILE_BYTES {
         return;
     }
     let Ok(contents) = std::fs::read_to_string(path) else {
@@ -554,6 +574,27 @@ mod tests {
         let hosts = discover_hosts();
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].hostname.as_deref(), Some("first.host"));
+    }
+
+    #[test]
+    fn skips_oversized_include_files() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex-1-2: a config/include larger than MAX_CONFIG_FILE_BYTES must be skipped so the
+        // synchronous discovery on the server loop can't slurp a huge file into memory.
+        let fixture = ConfigFixture::new("oversized", "Host real\n  HostName r.host\nInclude big\n");
+        let mut big = String::with_capacity((MAX_CONFIG_FILE_BYTES as usize) + 4096);
+        big.push_str("Host toobig\n  HostName b.host\n");
+        while (big.len() as u64) <= MAX_CONFIG_FILE_BYTES {
+            big.push_str("# padding padding padding padding padding padding padding\n");
+        }
+        fixture.write_extra("big", &big);
+
+        let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
+        assert_eq!(
+            aliases,
+            vec!["real".to_string()],
+            "the oversized include's hosts must be skipped"
+        );
     }
 
     #[test]
