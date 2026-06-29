@@ -581,7 +581,8 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         // codex-1-2: a config/include larger than MAX_CONFIG_FILE_BYTES must be skipped so the
         // synchronous discovery on the server loop can't slurp a huge file into memory.
-        let fixture = ConfigFixture::new("oversized", "Host real\n  HostName r.host\nInclude big\n");
+        let fixture =
+            ConfigFixture::new("oversized", "Host real\n  HostName r.host\nInclude big\n");
         let mut big = String::with_capacity((MAX_CONFIG_FILE_BYTES as usize) + 4096);
         big.push_str("Host toobig\n  HostName b.host\n");
         while (big.len() as u64) <= MAX_CONFIG_FILE_BYTES {
