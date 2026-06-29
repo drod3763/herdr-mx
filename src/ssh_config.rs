@@ -228,10 +228,16 @@ fn first_token(rest: &str) -> Option<String> {
     tokenize(rest).into_iter().next()
 }
 
-/// A `Host` token is connectable only if it is a literal alias: no glob wildcards (`*`/`?`) and no
-/// negated pattern (`!...`). Those match-only patterns aren't destinations ssh can connect to.
+/// A `Host` token is connectable only if it is a literal alias: no glob wildcards (`*`/`?`), no
+/// negated pattern (`!...`), and no embedded whitespace. Those match-only patterns aren't
+/// destinations ssh can connect to, and a whitespace alias (from a quoted `Host "a b"` pattern)
+/// would make the picker's `ssh <alias>` target ambiguous, so it is dropped at discovery.
 fn is_connectable_alias(token: &str) -> bool {
-    !token.is_empty() && !token.starts_with('!') && !token.contains('*') && !token.contains('?')
+    !token.is_empty()
+        && !token.starts_with('!')
+        && !token.contains('*')
+        && !token.contains('?')
+        && !token.chars().any(char::is_whitespace)
 }
 
 /// Resolve the path tokens of an `Include` line to concrete files. Relative paths are resolved
@@ -417,6 +423,19 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn skips_aliases_containing_whitespace() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // PRRT...3e8: a quoted Host pattern yields a token with embedded spaces; such an alias is not
+        // a single ssh destination (the picker builds `ssh <alias>`), so it must be dropped.
+        let _fixture = ConfigFixture::new(
+            "ws-alias",
+            "Host \"my host\"\n  HostName 10.0.0.5\n\nHost real\n  HostName r.host\n",
+        );
+        let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
+        assert_eq!(aliases, vec!["real".to_string()]);
     }
 
     #[test]
