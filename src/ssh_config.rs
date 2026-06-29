@@ -333,23 +333,39 @@ fn glob_expand(pattern: &Path) -> Vec<PathBuf> {
 
 /// Minimal glob matcher supporting `*` (any run) and `?` (single char) — enough for the typical
 /// `Include ~/.ssh/config.d/*` form. No character classes or `**`.
+///
+/// Iterative two-pointer matching with single-star backtracking: linear-ish (`O(n*m)` worst case)
+/// and non-recursive, so a pathological pattern from a local `Include` (e.g. `*a*a*a*b`) applied to
+/// a long filename cannot blow up CPU/stack the way naive recursive backtracking would, while
+/// discovery runs synchronously on the app loop.
 fn glob_match(pattern: &str, candidate: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = candidate.chars().collect();
-    glob_match_inner(&pat, &text)
-}
-
-fn glob_match_inner(pat: &[char], text: &[char]) -> bool {
-    match pat.first() {
-        None => text.is_empty(),
-        Some('*') => {
-            // Match zero or more characters: try consuming nothing, then one more each step.
-            glob_match_inner(&pat[1..], text)
-                || (!text.is_empty() && glob_match_inner(pat, &text[1..]))
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // Last `*` position and the text index it was matched against, for backtracking.
+    let mut star: Option<usize> = None;
+    let mut star_text = 0usize;
+    while ti < text.len() {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star = Some(pi);
+            star_text = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            // Backtrack: let the last `*` swallow one more text char and retry.
+            pi = s + 1;
+            star_text += 1;
+            ti = star_text;
+        } else {
+            return false;
         }
-        Some('?') => !text.is_empty() && glob_match_inner(&pat[1..], &text[1..]),
-        Some(&c) => !text.is_empty() && text[0] == c && glob_match_inner(&pat[1..], &text[1..]),
     }
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 /// Process-wide serialization for every test that mutates `HOME` / `HERDR_SSH_CONFIG_PATH` (which is
@@ -654,5 +670,24 @@ mod tests {
         assert!(glob_match("a?c", "abc"));
         assert!(!glob_match("a?c", "ac"));
         assert!(!glob_match("config-*", "other"));
+        // Multiple stars and trailing literals.
+        assert!(glob_match("*.conf", "site.conf"));
+        assert!(glob_match("a*b*c", "axxbyyc"));
+        assert!(!glob_match("a*b*c", "axxbyy"));
+        assert!(glob_match("**", "anything"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+    }
+
+    #[test]
+    fn glob_match_adversarial_pattern_terminates() {
+        // codex-1-1 (iter 2): the old recursive matcher was exponential on patterns like `*a*a...`
+        // against a long non-matching name. The iterative matcher returns quickly and correctly.
+        let pattern = "*a".repeat(32); // 64-char pattern, many stars
+        let non_matching = "b".repeat(2048); // long, ends in 'b' so the trailing `a` never matches
+        assert!(!glob_match(&pattern, &non_matching));
+        let matching = format!("{}a", "x".repeat(2048));
+        assert!(glob_match("*a", &matching));
     }
 }
