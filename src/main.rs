@@ -373,8 +373,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # expanding placeholders: the standalone token "{options}" becomes each resolved
 # ssh option as its own argument, while "{host}" and "{remote_command}" are
 # substituted within a token. "{remote_command}" is required; an invalid template
-# keeps the last valid transport this session (using built-in ssh only if none was
-# ever valid), and the same holds when config fails to parse. The replacement must give a raw bidirectional binary
+# keeps the last valid transport this session, or fails the remote operation if none
+# was ever valid (it does not fall back to ssh). The replacement must give a raw bidirectional binary
 # stdio channel — terminal transports like mosh/Eternal Terminal cannot. A custom
 # template owns its full argv (no -T/ConnectTimeout is injected). Example: autossh
 # for auto-reconnect roaming —

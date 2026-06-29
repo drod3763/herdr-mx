@@ -226,7 +226,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     );
     // The CLI `--remote <host>` path is always a bare destination (leading-`-` is rejected by
     // `validate_remote_target`), so there are no extra ssh options to carry.
-    let ssh_target = SshTarget::bare(&remote.target);
+    let ssh_target = SshTarget::resolved(&remote.target, Vec::new())?;
     // CLI path: echo each provisioning stage to stderr so a slow seed reads as progress.
     let progress = |stage: RemoteProvisionStage| eprintln!("herdr: {}", stage.label());
     let prepared_remote = prepare_remote_herdr(
@@ -288,17 +288,24 @@ impl SshTarget {
 
     /// Construct with the transport snapshotted from current config. Used at the start of a logical
     /// remote operation / reconnect so every command the operation builds shares one transport.
-    pub(crate) fn resolved(destination: impl Into<String>, options: Vec<String>) -> Self {
-        Self {
-            transport: resolved_transport(),
+    /// Returns an error when `[remote.transport]` is configured but invalid and no valid transport
+    /// has ever been resolved, so a misconfigured custom transport fails closed instead of silently
+    /// connecting over built-in ssh.
+    pub(crate) fn resolved(
+        destination: impl Into<String>,
+        options: Vec<String>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            transport: resolve_transport()?,
             ..Self::new(destination, options)
-        }
+        })
     }
 
-    /// A bare destination with no extra ssh options, transport snapshotted from current config
-    /// (the `herdr --remote <host>` CLI path).
+    /// A bare destination with no extra ssh options and the built-in ssh transport. Test-only;
+    /// production attach paths use [`SshTarget::resolved`] to snapshot the configured transport.
+    #[cfg(test)]
     pub(crate) fn bare(destination: impl Into<String>) -> Self {
-        Self::resolved(destination, Vec::new())
+        Self::new(destination, Vec::new())
     }
 
     pub(crate) fn destination(&self) -> &str {
@@ -446,29 +453,35 @@ impl TransportSpec {
     }
 }
 
-/// The transport spec, resolved from the live config for each command build so a config reload
-/// (`herdr server reload-config`) is picked up by subsequent remote operations and reconnects.
+/// Resolve the transport from the live config, snapshotted once per remote operation (see
+/// [`SshTarget::resolved`]) so a config reload (`herdr server reload-config`) applies at the next
+/// operation / reconnect boundary.
 ///
 /// Uses `load_live_config` (not `Config::load`) on purpose: `Config::load` silently substitutes
 /// `Config::default()` on a parse/read error, which would drop a configured `[remote.transport]`
 /// and downgrade an active custom transport to plain ssh after a transient bad edit. Instead we
-/// remember the last successfully-resolved spec and keep it whenever the current config fails to
-/// parse or configures a custom transport that is invalid, matching the app-level contract to
-/// retain the current config on invalid TOML and failing closed rather than routing over ssh.
-/// Command builds are rare relative to ssh spawn cost, so the per-build config read is negligible.
-fn resolved_transport() -> TransportSpec {
-    static LAST_VALID: OnceLock<Mutex<TransportSpec>> = OnceLock::new();
-    let last_valid = LAST_VALID.get_or_init(|| Mutex::new(TransportSpec::Ssh));
-    let keep_last = || {
-        last_valid
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or(TransportSpec::Ssh)
+/// remember the last *successfully resolved* spec (`LAST_VALID`, `None` until one exists) and keep
+/// it when the config currently fails to parse, the `[remote]` section is invalid, or
+/// `[remote.transport]` is configured but invalid (e.g. missing `{remote_command}`).
+///
+/// When `[remote.transport]` is configured-but-invalid and no valid transport was ever resolved,
+/// return an error so the remote operation fails closed rather than silently routing over built-in
+/// ssh — a custom transport may be the user's trust/routing boundary. The process-default ssh is
+/// never treated as a "last valid" value for an invalid custom config.
+fn resolve_transport() -> io::Result<TransportSpec> {
+    static LAST_VALID: OnceLock<Mutex<Option<TransportSpec>>> = OnceLock::new();
+    let last_valid = LAST_VALID.get_or_init(|| Mutex::new(None));
+    let previous = || last_valid.lock().ok().and_then(|guard| guard.clone());
+    let remember = |spec: &TransportSpec| {
+        if let Ok(mut guard) = last_valid.lock() {
+            *guard = Some(spec.clone());
+        }
     };
-    // Config currently fails to parse/read: keep the last spec we resolved successfully rather than
-    // failing open to ssh. Defaults to ssh only if no valid config was ever seen.
+
+    // Config currently fails to parse/read: keep the last spec we resolved successfully. With no
+    // prior valid spec we cannot tell a custom transport was configured, so use built-in ssh.
     let Ok(loaded) = crate::config::load_live_config() else {
-        return keep_last();
+        return Ok(previous().unwrap_or(TransportSpec::Ssh));
     };
     // `load_live_config` returns Ok even when the `[remote]` section fails to deserialize: it
     // records the section in `invalid_sections` and leaves `config.remote` at its default. Deriving
@@ -479,18 +492,23 @@ fn resolved_transport() -> TransportSpec {
         .iter()
         .any(|section| section == "remote")
     {
-        return keep_last();
+        return Ok(previous().unwrap_or(TransportSpec::Ssh));
     }
     match TransportSpec::from_config(&loaded.config.remote) {
         TransportResolution::Spec(spec) => {
-            if let Ok(mut guard) = last_valid.lock() {
-                *guard = spec.clone();
-            }
-            spec
+            remember(&spec);
+            Ok(spec)
         }
         // A custom transport is configured but invalid (e.g. template missing `{remote_command}`):
-        // keep the last valid transport instead of routing remote operations over built-in ssh.
-        TransportResolution::Invalid => keep_last(),
+        // keep a previously valid transport, but fail closed when none exists rather than routing
+        // remote operations over built-in ssh and bypassing the intended custom transport.
+        TransportResolution::Invalid => previous().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "[remote.transport] is configured but invalid (args must include a \
+                 {remote_command} placeholder); refusing to fall back to built-in ssh",
+            )
+        }),
     }
 }
 
@@ -3032,12 +3050,12 @@ mod tests {
             args: vec!["{host}".into(), "{remote_command}".into()],
         };
         // A valid custom transport resolves and is remembered as last-valid.
-        assert_eq!(resolved_transport(), valid);
+        assert_eq!(resolve_transport().expect("transport resolves"), valid);
 
         // A later malformed edit must not silently downgrade the active transport to ssh:
         // resolution keeps the last valid spec instead of falling back to config defaults.
         std::fs::write(&cfg, "this is = not [[[ valid toml").expect("write broken config");
-        assert_eq!(resolved_transport(), valid);
+        assert_eq!(resolve_transport().expect("transport resolves"), valid);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3060,7 +3078,7 @@ mod tests {
             program: "autossh".into(),
             args: vec!["{host}".into(), "{remote_command}".into()],
         };
-        assert_eq!(resolved_transport(), valid);
+        assert_eq!(resolve_transport().expect("transport resolves"), valid);
 
         // A syntactically valid edit whose transport template drops `{remote_command}` is a
         // configured-but-invalid transport: keep the last valid spec rather than failing open to
@@ -3070,7 +3088,7 @@ mod tests {
             "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\"]\n",
         )
         .expect("write invalid-template config");
-        assert_eq!(resolved_transport(), valid);
+        assert_eq!(resolve_transport().expect("transport resolves"), valid);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3094,14 +3112,37 @@ mod tests {
             program: "autossh".into(),
             args: vec!["{host}".into(), "{remote_command}".into()],
         };
-        assert_eq!(resolved_transport(), valid);
+        assert_eq!(resolve_transport().expect("transport resolves"), valid);
 
         // Valid TOML whose `[remote]` section fails to deserialize (bool field given a string):
         // load_live_config returns Ok with `remote` in invalid_sections and config.remote default.
         // The transport must be kept, not overwritten with ssh derived from the default section.
         std::fs::write(&cfg, "[remote]\nmanage_ssh_config = \"nope\"\n")
             .expect("write invalid remote section");
-        assert_eq!(resolved_transport(), valid);
+        assert_eq!(resolve_transport().expect("transport resolves"), valid);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_errors_on_invalid_template_without_prior_valid() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-err-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // A custom transport configured but invalid (no `{remote_command}`) with no prior valid
+        // transport must fail closed — refuse the operation rather than silently using ssh and
+        // bypassing the configured transport.
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"ssh\"\nargs = [\"{host}\"]\n",
+        )
+        .expect("write invalid-template config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+
+        assert!(resolve_transport().is_err());
+        assert!(crate::remote::SshTarget::resolved("iq-64", Vec::new()).is_err());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
