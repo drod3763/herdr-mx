@@ -295,18 +295,24 @@ impl SshTarget {
         self.build_command(remote_command, &resolved_transport())
     }
 
+    /// Dispatch to the program selected by `transport`: the built-in `Ssh` behavior (the default)
+    /// or a user-defined `Custom` template. The exhaustive match means a future `TransportSpec`
+    /// variant is a compile error here rather than a silent fallback. Split out from `command` so
+    /// tests can pass an explicit spec without depending on the caller's real config file.
+    fn build_command(&self, remote_command: &str, transport: &TransportSpec) -> Command {
+        match transport {
+            TransportSpec::Ssh => self.build_ssh_command(remote_command),
+            TransportSpec::Custom { program, args } => {
+                self.build_custom_command(remote_command, program, args)
+            }
+        }
+    }
+
     /// Build `ssh <options...> -T <destination> <remote_command>`. `-T` (disable pseudo-tty) is
     /// inserted before the destination unless the user already supplied it; the herdr payload is
     /// always the trailing positional so it runs on the remote rather than being parsed as an
     /// ssh option.
-    ///
-    /// `transport` selects the program: the built-in `Ssh` behavior (the default) or a
-    /// user-defined `Custom` template. Split out from `command` so tests can pass an explicit
-    /// spec without depending on the caller's real config file.
-    fn build_command(&self, remote_command: &str, transport: &TransportSpec) -> Command {
-        let TransportSpec::Ssh = transport else {
-            return self.build_custom_command(remote_command, transport);
-        };
+    fn build_ssh_command(&self, remote_command: &str) -> Command {
         let mut command = Command::new("ssh");
         // Bound the connect phase so an unreachable host fails fast instead of stalling for the OS
         // TCP timeout. Skip if the user already pinned a ConnectTimeout in their own options.
@@ -346,12 +352,12 @@ impl SshTarget {
     /// options are injected — the template owns the full argv. The standalone token `{options}`
     /// expands to each resolved ssh option as its own argument; `{host}` and `{remote_command}`
     /// are substring-substituted within a token.
-    fn build_custom_command(&self, remote_command: &str, transport: &TransportSpec) -> Command {
-        let TransportSpec::Custom { program, args } = transport else {
-            // Unreachable: callers only route here for `Custom`. Fall back to the built-in `ssh`
-            // transport so a future variant can never silently spawn nothing.
-            return Command::new("ssh");
-        };
+    fn build_custom_command(
+        &self,
+        remote_command: &str,
+        program: &str,
+        args: &[String],
+    ) -> Command {
         let mut command = Command::new(program);
         for token in args {
             if token == "{options}" {
