@@ -1883,6 +1883,23 @@ impl ClientSupervisorModel {
         });
     }
 
+    /// Open the picker from a completed `remote.ssh_config_hosts` fetch, but ONLY when the Add Remote
+    /// overlay is still the active overlay — i.e. this is the fetch the user launched from its button.
+    /// A late or duplicate fetch result (the user already closed the overlay, or a picker is already
+    /// open from a double-click) is dropped so the picker never pops up unexpectedly or resets an
+    /// in-progress selection. Returns whether it opened.
+    pub(crate) fn open_ssh_host_picker_if_adding(
+        &mut self,
+        hosts: Vec<crate::ssh_config::SshConfigHost>,
+        existing: &[crate::remote_registry::RemoteDefinitionSnapshot],
+    ) -> bool {
+        if !matches!(self.client_overlay, ClientOverlayState::AddRemote(_)) {
+            return false;
+        }
+        self.open_ssh_host_picker(hosts, existing);
+        true
+    }
+
     pub(crate) fn ssh_host_picker(&self) -> Option<&SshHostPickerOverlay> {
         match &self.client_overlay {
             ClientOverlayState::SshHostPicker(overlay) => Some(overlay),
@@ -6038,6 +6055,30 @@ mod tests {
         );
         assert!(overlay.checked.is_empty());
         assert_eq!(overlay.selected, 0);
+    }
+
+    #[test]
+    fn open_ssh_host_picker_if_adding_only_opens_over_the_add_remote_overlay() {
+        // PRRT...WGY: a late/duplicate fetch result must not pop the picker when the user already
+        // closed the Add Remote overlay (or a picker is already open). Only the fetch launched from
+        // the still-open Add Remote overlay opens the picker.
+        let hosts = vec![ssh_host("alpha", None, Some("a.example.com"))];
+
+        // No overlay open → the result is dropped.
+        let mut idle = ClientSupervisorModel::new("local");
+        assert!(!idle.open_ssh_host_picker_if_adding(hosts.clone(), &[]));
+        assert!(idle.ssh_host_picker().is_none());
+
+        // Add Remote overlay open → the picker opens.
+        let mut adding = ClientSupervisorModel::new("local");
+        adding.open_add_remote_form();
+        assert!(adding.open_ssh_host_picker_if_adding(hosts.clone(), &[]));
+        assert!(adding.ssh_host_picker().is_some());
+
+        // A second (duplicate) result now finds the picker — not the Add Remote overlay — open, so it
+        // is dropped and does not reset the first picker.
+        assert!(!adding.open_ssh_host_picker_if_adding(hosts, &[]));
+        assert!(adding.ssh_host_picker().is_some());
     }
 
     #[test]

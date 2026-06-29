@@ -6178,7 +6178,9 @@ async fn run_client_loop(
                     Ok(hosts) => {
                         if let Some(model) = &mut state.supervisor_model {
                             let existing = model.synced_remotes().to_vec();
-                            model.open_ssh_host_picker(hosts, &existing);
+                            // Only open if the Add Remote overlay the fetch was launched from is still
+                            // active — a late/duplicate result must not pop the picker unexpectedly.
+                            model.open_ssh_host_picker_if_adding(hosts, &existing);
                         }
                     }
                     Err(err) => warn!(err = %err, "failed to fetch ssh-config hosts"),
