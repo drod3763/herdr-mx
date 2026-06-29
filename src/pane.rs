@@ -444,10 +444,19 @@ fn binary_basename_is_herdr(value: &str) -> bool {
     basename == "herdr" || basename.starts_with("herdr-") || basename.starts_with("herdr.")
 }
 
+/// Whether a single argv/cmdline token is the `--remote` launch flag. The CLI accepts
+/// both the bare `herdr --remote <host>` form and the joined `herdr --remote=<host>`
+/// form (see `src/remote/unix.rs`), so both must count. `--remote-keybindings[=…]` is
+/// deliberately excluded: it is matched only via the exact `--remote=` prefix, never a
+/// bare `--remote` prefix.
+fn is_remote_launch_token(token: &str) -> bool {
+    token == "--remote" || token.strip_prefix("--remote=").is_some_and(|t| !t.is_empty())
+}
+
 /// True when this single process is a `herdr --remote …` client: a herdr-like
-/// binary basename AND a bare `--remote` token in its argv. The bridge subcommands
-/// (`herdr remote-client-bridge` / `remote-api-bridge`) and plain local `herdr`
-/// panes carry no `--remote` token, so they never match.
+/// binary basename AND a `--remote`/`--remote=<host>` token in its argv. The bridge
+/// subcommands (`herdr remote-client-bridge` / `remote-api-bridge`) and plain local
+/// `herdr` panes carry no `--remote` token, so they never match.
 fn process_is_remote_client(process: &crate::platform::ForegroundProcess) -> bool {
     let binary_is_herdr = binary_basename_is_herdr(&process.name)
         || process
@@ -463,13 +472,13 @@ fn process_is_remote_client(process: &crate::platform::ForegroundProcess) -> boo
         return false;
     }
     if let Some(argv) = process.argv.as_ref() {
-        return argv.iter().any(|arg| arg == "--remote");
+        return argv.iter().any(|arg| is_remote_launch_token(arg));
     }
     // Fall back to whitespace-split cmdline when the kernel argv probe is unavailable.
     process
         .cmdline
         .as_deref()
-        .is_some_and(|cmdline| cmdline.split_whitespace().any(|tok| tok == "--remote"))
+        .is_some_and(|cmdline| cmdline.split_whitespace().any(is_remote_launch_token))
 }
 
 /// True when any process in the foreground job is a nested `herdr --remote` client.
@@ -3226,6 +3235,34 @@ mod tests {
         assert!(process_is_remote_client(&foreground_process_argv(
             1,
             &["herdr", "--remote", "host"]
+        )));
+    }
+
+    #[test]
+    fn process_remote_client_detects_equals_form() {
+        // The CLI also accepts `--remote=<target>` (src/remote/unix.rs strip_prefix),
+        // so a nested client launched that way must still be flagged.
+        assert!(process_is_remote_client(&foreground_process_argv(
+            1,
+            &["herdr", "--remote=host"]
+        )));
+    }
+
+    #[test]
+    fn process_remote_client_detects_equals_form_from_cmdline() {
+        let mut process = foreground_process_argv(1, &["herdr", "--remote=user@host"]);
+        // Force the cmdline fallback path (no argv).
+        process.argv = None;
+        assert!(process_is_remote_client(&process));
+    }
+
+    #[test]
+    fn process_remote_client_ignores_remote_keybindings_equals() {
+        // `--remote-keybindings=` starts with `--remote` but is not the remote launch
+        // form; it must not flag the pane.
+        assert!(!process_is_remote_client(&foreground_process_argv(
+            1,
+            &["herdr", "--remote-keybindings=vim"]
         )));
     }
 
