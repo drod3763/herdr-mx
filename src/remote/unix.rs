@@ -265,10 +265,16 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
 /// precede it (e.g. `-L`, `-J`, `-p`, `-o`). The destination alone is the dedup / socket-path /
 /// display key; the options are emitted on every ssh invocation so port-forwards and jump hosts
 /// from a full ssh add-remote spec actually take effect.
+///
+/// `transport` is the program used to reach the host, snapshotted at construction. A logical remote
+/// operation (detect → check → install → start → bridge) reuses one `SshTarget`, so every step runs
+/// the same transport even if `[remote.transport]` is edited mid-flow; a live config change applies
+/// to the next operation / reconnect, which builds a fresh `SshTarget`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SshTarget {
     destination: String,
     options: Vec<String>,
+    transport: TransportSpec,
 }
 
 impl SshTarget {
@@ -276,23 +282,33 @@ impl SshTarget {
         Self {
             destination: destination.into(),
             options,
+            transport: TransportSpec::Ssh,
         }
     }
 
-    /// A bare destination with no extra ssh options (the `herdr --remote <host>` CLI path).
+    /// Construct with the transport snapshotted from current config. Used at the start of a logical
+    /// remote operation / reconnect so every command the operation builds shares one transport.
+    pub(crate) fn resolved(destination: impl Into<String>, options: Vec<String>) -> Self {
+        Self {
+            transport: resolved_transport(),
+            ..Self::new(destination, options)
+        }
+    }
+
+    /// A bare destination with no extra ssh options, transport snapshotted from current config
+    /// (the `herdr --remote <host>` CLI path).
     pub(crate) fn bare(destination: impl Into<String>) -> Self {
-        Self::new(destination, Vec::new())
+        Self::resolved(destination, Vec::new())
     }
 
     pub(crate) fn destination(&self) -> &str {
         &self.destination
     }
 
-    /// Build the transport command for `remote_command`, resolving the transport spec from config
-    /// for this build. Defaults to the built-in `ssh` transport; a `[remote.transport]` config
-    /// entry swaps in a user-defined program + arg template instead.
+    /// Build the transport command for `remote_command` using this target's snapshotted transport
+    /// (the built-in `ssh` behavior by default, or a `[remote.transport]` custom program).
     fn command(&self, remote_command: &str) -> Command {
-        self.build_command(remote_command, &resolved_transport())
+        self.build_command(remote_command, &self.transport)
     }
 
     /// Dispatch to the program selected by `transport`: the built-in `Ssh` behavior (the default)
@@ -2890,6 +2906,31 @@ mod tests {
         };
         let argv = argv_with(&SshTarget::bare("iq-64"), "herdr bridge", &transport);
         assert_eq!(argv, ["ssh://iq-64", "exec herdr bridge"]);
+    }
+
+    #[test]
+    fn ssh_target_command_uses_snapshotted_transport() {
+        // `command()` must use the transport snapshotted on the target, not re-resolve config each
+        // build, so every step of one remote operation runs the same transport.
+        let target = SshTarget {
+            destination: "iq-64".into(),
+            options: vec!["-p".into(), "2222".into()],
+            transport: TransportSpec::Custom {
+                program: "autossh".into(),
+                args: vec![
+                    "{options}".into(),
+                    "{host}".into(),
+                    "{remote_command}".into(),
+                ],
+            },
+        };
+        let command = target.command("uname -s");
+        assert_eq!(command.get_program().to_string_lossy(), "autossh");
+        let argv: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(argv, ["-p", "2222", "iq-64", "uname -s"]);
     }
 
     #[test]

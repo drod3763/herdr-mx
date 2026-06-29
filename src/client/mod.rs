@@ -2975,7 +2975,7 @@ fn connect_secondary_client_stream_for_plan_detached(
                 path
             } else {
                 let ssh_target =
-                    crate::remote::SshTarget::new(destination.clone(), options.clone());
+                    crate::remote::SshTarget::resolved(destination.clone(), options.clone());
                 // Provisioning rides the retry sweep (the non-modal add-remote flow): stages are
                 // forwarded to the host's banner sub-lines, and the whole bring-up is bounded by
                 // the per-stage idle window so a stuck host fails instead of hanging the retry.
@@ -3465,7 +3465,7 @@ fn spawn_remote_update_for(
     let ssh_target = state.supervisor_model.as_ref().and_then(|model| {
         model
             .server_ssh_target(server_id)
-            .map(|(destination, options)| crate::remote::SshTarget::new(destination, options))
+            .map(|(destination, options)| crate::remote::SshTarget::resolved(destination, options))
     });
     match ssh_target {
         Some(ssh_target) => {
@@ -4423,7 +4423,7 @@ fn refetch_secondary_runtime_status(
     let Some(ssh_target) = state.supervisor_model.as_ref().and_then(|model| {
         model
             .server_ssh_target(server_id)
-            .map(|(destination, options)| crate::remote::SshTarget::new(destination, options))
+            .map(|(destination, options)| crate::remote::SshTarget::resolved(destination, options))
     }) else {
         return;
     };
