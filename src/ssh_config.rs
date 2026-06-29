@@ -34,6 +34,12 @@ const MAX_CONFIG_FILES: usize = 256;
 /// iterating/sorting unboundedly. Set well above any realistic `~/.ssh/config.d`.
 const MAX_GLOB_SCAN_ENTRIES: usize = 8192;
 
+/// Request-wide budget on total directory entries examined across ALL glob `Include`s in one
+/// discovery pass. The per-glob cap alone does not stop a root file with tens of thousands of
+/// `Include config.d/*` lines from re-scanning a directory for every line; this bounds the
+/// multiplicative work so a pathological config cannot pin the synchronous app-loop discovery.
+const MAX_TOTAL_GLOB_SCANS: usize = 65536;
+
 /// Hard cap on discovered aliases. The per-file (1 MiB) and total-file (256) caps bound the input,
 /// but a fan-out of many small files could still push tens of millions of `Host` aliases into one
 /// synchronously-served response. Stop discovery once this many aliases are collected (truncated).
@@ -70,6 +76,8 @@ pub fn discover_hosts() -> Vec<SshConfigHost> {
     // The active `Host` block, shared across `Include` boundaries so a per-host include attributes
     // its directives to the including file's block (OpenSSH inline-insertion semantics).
     let mut current_aliases = Vec::new();
+    // Request-wide remaining glob-scan budget, decremented across every glob `Include`.
+    let mut glob_scans_remaining = MAX_TOTAL_GLOB_SCANS;
     parse_file(
         &path,
         0,
@@ -77,6 +85,7 @@ pub fn discover_hosts() -> Vec<SshConfigHost> {
         &mut seen_aliases,
         &mut visited_files,
         &mut current_aliases,
+        &mut glob_scans_remaining,
     );
     hosts
 }
@@ -121,6 +130,8 @@ fn parse_file(
     // inserts included contents inline): a per-host include attributes to the including block, and a
     // `Host` opened in the include continues as the active block on return. A `Match` clears it.
     current_aliases: &mut Vec<usize>,
+    // Request-wide remaining glob-scan budget (see `MAX_TOTAL_GLOB_SCANS`).
+    glob_scans_remaining: &mut usize,
 ) {
     // Canonicalize so the same file reached via different relative paths is only visited once
     // (cycle guard). Fall back to the raw path if canonicalization fails (e.g. file is missing).
@@ -205,7 +216,13 @@ fn parse_file(
                 if depth >= MAX_INCLUDE_DEPTH {
                     continue;
                 }
-                for included in resolve_includes(rest) {
+                // Once no further file can be read or the request-wide glob-scan budget is spent,
+                // stop processing Include lines entirely — expanding more would be wasted work that
+                // could pin the synchronous app-loop discovery.
+                if visited_files.len() >= MAX_CONFIG_FILES || *glob_scans_remaining == 0 {
+                    break;
+                }
+                for included in resolve_includes(rest, glob_scans_remaining) {
                     parse_file(
                         &included,
                         depth + 1,
@@ -213,6 +230,7 @@ fn parse_file(
                         seen_aliases,
                         visited_files,
                         current_aliases,
+                        glob_scans_remaining,
                     );
                 }
             }
@@ -281,7 +299,7 @@ fn is_connectable_alias(token: &str) -> bool {
 /// Resolve the path tokens of an `Include` line to concrete files. Relative paths are resolved
 /// against `~/.ssh/`; `~` is expanded to the home directory. Single-level glob patterns (`*`/`?`)
 /// are expanded best-effort via `read_dir`. Missing/unreadable entries are silently skipped.
-fn resolve_includes(rest: &str) -> Vec<PathBuf> {
+fn resolve_includes(rest: &str, glob_scans_remaining: &mut usize) -> Vec<PathBuf> {
     let mut resolved = Vec::new();
     for token in tokenize(rest) {
         let expanded = expand_tilde(&token);
@@ -293,7 +311,7 @@ fn resolve_includes(rest: &str) -> Vec<PathBuf> {
             continue;
         };
         if has_glob(&token) {
-            resolved.extend(glob_expand(&base));
+            resolved.extend(glob_expand(&base, glob_scans_remaining));
         } else {
             resolved.push(base);
         }
@@ -316,7 +334,7 @@ fn has_glob(token: &str) -> bool {
 
 /// Best-effort single-directory glob: matches the final path component (which may contain `*`/`?`)
 /// against the entries of its parent directory. Does not recurse into `**`.
-fn glob_expand(pattern: &Path) -> Vec<PathBuf> {
+fn glob_expand(pattern: &Path, glob_scans_remaining: &mut usize) -> Vec<PathBuf> {
     let Some(parent) = pattern.parent() else {
         return Vec::new();
     };
@@ -326,14 +344,19 @@ fn glob_expand(pattern: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return Vec::new();
     };
-    // Bound the scan: stop after examining MAX_GLOB_SCAN_ENTRIES, or once we've collected enough
-    // matches to exhaust the total file budget. A pathological huge directory can't pin the loop
-    // iterating/collecting/sorting unboundedly. discover_hosts runs synchronously on the app loop.
+    // Bound the scan three ways: this single glob examines at most MAX_GLOB_SCAN_ENTRIES, the whole
+    // discovery examines at most MAX_TOTAL_GLOB_SCANS (shared `glob_scans_remaining`), and we stop
+    // collecting once matches could exhaust the total file budget. discover_hosts runs synchronously
+    // on the app loop, so a pathological directory or a flood of glob Includes can't pin it.
     let mut matched = Vec::new();
     for (scanned, entry) in entries.flatten().enumerate() {
-        if scanned >= MAX_GLOB_SCAN_ENTRIES || matched.len() >= MAX_CONFIG_FILES {
+        if scanned >= MAX_GLOB_SCAN_ENTRIES
+            || *glob_scans_remaining == 0
+            || matched.len() >= MAX_CONFIG_FILES
+        {
             break;
         }
+        *glob_scans_remaining -= 1;
         if let Some(name) = entry.file_name().to_str() {
             if glob_match(file_pattern, name) {
                 matched.push(entry.path());
