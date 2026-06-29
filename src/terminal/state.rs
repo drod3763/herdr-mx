@@ -1188,6 +1188,11 @@ impl TerminalState {
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
         self.pending_agent_resume_plan = None;
+        // #9: the respawn spawns a fresh detection task whose `last_remote_client`
+        // starts false and so never publishes the true->false transition for this
+        // reused terminal. Clear the stale flag here, alongside the rest of the
+        // runtime identity, so a later real agent in this pane is not hidden.
+        self.foreground_is_remote_client = false;
         self.clear_agent_name();
     }
 
@@ -4189,6 +4194,25 @@ mod tests {
         assert!(terminal.agent_name.is_none());
         assert!(terminal.persisted_agent_session.is_none());
         assert!(!terminal.respawn_shell_on_exit);
+    }
+
+    #[test]
+    fn respawn_cleanup_clears_nested_remote_client_flag() {
+        // #9 (Codex review iter 4): respawn spawns a fresh detection task whose local
+        // `last_remote_client` starts false, so it never publishes the true->false
+        // transition for the reused TerminalState. If the flag is not cleared here, a
+        // pane that ran `herdr --remote` and then respawned a shell keeps
+        // `foreground_is_remote_client = true`, hiding any later real agent in that pane.
+        let mut terminal = test_terminal();
+        assert!(terminal.set_foreground_is_remote_client(true));
+        assert!(terminal.foreground_is_remote_client());
+
+        terminal.clear_agent_runtime_identity_after_respawn();
+
+        assert!(
+            !terminal.foreground_is_remote_client(),
+            "respawn cleanup must clear the stale nested-remote-client flag"
+        );
     }
 
     #[test]
