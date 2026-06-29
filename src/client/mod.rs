@@ -8099,6 +8099,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )
@@ -11278,6 +11279,7 @@ mod tests {
                         pane_label: None,
                         tab_id: String::new(),
                         tab_label: None,
+                        foreground_is_remote_client: false,
                     }],
                 },
             )

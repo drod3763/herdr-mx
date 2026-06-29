@@ -2541,6 +2541,23 @@ impl AppState {
                 }
                 Vec::new()
             }
+            AppEvent::ForegroundRemoteClientChanged {
+                pane_id,
+                is_remote_client,
+            } => {
+                let Some(terminal_id) = self.workspaces.iter().find_map(|ws| {
+                    ws.pane_state(pane_id)
+                        .map(|pane| pane.attached_terminal_id.clone())
+                }) else {
+                    return Vec::new();
+                };
+                let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+                    return Vec::new();
+                };
+                // Volatile runtime fact — do not mark the session dirty.
+                terminal.set_foreground_is_remote_client(is_remote_client);
+                Vec::new()
+            }
             AppEvent::GitStatusRefreshed {
                 results,
                 cache_updates,

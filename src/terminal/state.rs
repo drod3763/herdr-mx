@@ -98,6 +98,10 @@ pub struct TerminalState {
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
+    /// True when this pane's foreground job is itself a nested `herdr --remote`
+    /// client. Volatile runtime fact (not session-persisted) used to hide the
+    /// "mirror" pane from the multi-remote client sidebar.
+    foreground_is_remote_client: bool,
 }
 
 impl TerminalState {
@@ -126,7 +130,22 @@ impl TerminalState {
             launch_argv: None,
             respawn_shell_on_exit: false,
             pending_agent_resume_plan: None,
+            foreground_is_remote_client: false,
         }
+    }
+
+    /// Whether the pane's foreground job is a nested `herdr --remote` client.
+    pub fn foreground_is_remote_client(&self) -> bool {
+        self.foreground_is_remote_client
+    }
+
+    /// Update the nested-remote-client flag. Returns true when the value changed.
+    pub fn set_foreground_is_remote_client(&mut self, is_remote_client: bool) -> bool {
+        if self.foreground_is_remote_client == is_remote_client {
+            return false;
+        }
+        self.foreground_is_remote_client = is_remote_client;
+        true
     }
 
     pub fn with_launch_argv(mut self, argv: Vec<String>) -> Self {

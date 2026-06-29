@@ -310,6 +310,7 @@ prompt_new_tab_name = true
 pane_borders = true
 pane_gaps = true
 show_agent_labels_on_pane_borders = false
+hide_nested_remote_panes = true
 agent_panel_sort = "spaces"
 accent = "cyan"
 ```
@@ -333,6 +334,8 @@ Set `mouse_scroll_lines` to change how many pane scrollback lines each mouse whe
 Set `pane_borders = false` to remove split pane borders. Set `pane_gaps = false` to make split panes share compact divider borders. With borders disabled, pane gaps use one blank terminal cell between panes. Terminal cells are usually taller than they are wide, so a one-row gap between top/bottom panes can look larger than a one-column gap between left/right panes.
 
 Set `show_agent_labels_on_pane_borders = true` if you want detected agent labels in split pane borders when no manual pane label is set.
+
+`hide_nested_remote_panes` controls whether the multi-remote sidebar hides remote panes that are themselves running a `herdr --remote` client (a nested "mirror" view of another host). These panes are bounded and harmless but add clutter and keep a live client streaming on the remote. The default is `true`. Set it to `false` to show them. Plain local `herdr` panes are never hidden.
 
 ## Notifications
 

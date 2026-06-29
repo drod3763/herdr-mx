@@ -792,6 +792,9 @@ pub struct UiConfig {
     pub sound: SoundConfig,
     /// Sidebar navigation display preferences.
     pub sidebar: SidebarConfig,
+    /// Hide remote panes that are themselves nested `herdr --remote` clients
+    /// ("mirror" panes) from the multi-remote sidebar. Default: true.
+    pub hide_nested_remote_panes: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1468,6 +1471,7 @@ impl Default for UiConfig {
             toast: ToastConfig::default(),
             sound: SoundConfig::default(),
             sidebar: SidebarConfig::default(),
+            hide_nested_remote_panes: true,
         }
     }
 }

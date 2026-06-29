@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 /// Current protocol version. Bumped when wire format changes incompatibly.
 /// v14: `FrameDelta` carries `base_checksum` and clients may send `RequestFullFrame` (delta-desync
 /// recovery); upstream v14 also adds `pane.move` (relocate a running pane across tabs/workspaces).
-pub const PROTOCOL_VERSION: u32 = 14;
+/// v15 (herdr-mx #9): additive `AgentInfo.foreground_is_remote_client` +
+/// `UiSettingsInfo.hide_nested_remote_panes` for auto-hiding nested `herdr --remote` mirror panes.
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
