@@ -385,36 +385,48 @@ enum TransportSpec {
     Custom { program: String, args: Vec<String> },
 }
 
+/// Outcome of resolving `[remote.transport]`: a usable spec, or a configured-but-invalid template.
+/// `Invalid` is kept distinct from `Spec(Ssh)` so the resolver can fail closed (keep the last valid
+/// transport) instead of silently routing remote operations over built-in ssh when the user clearly
+/// intended a custom transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransportResolution {
+    Spec(TransportSpec),
+    Invalid,
+}
+
 impl TransportSpec {
-    fn from_config(remote: &crate::config::model::RemoteConfig) -> Self {
-        match &remote.transport {
-            // An empty program is treated as "no transport" so a stray `[remote.transport]`
-            // header can't break every connection by spawning a nameless command.
-            Some(transport) if !transport.program.trim().is_empty() => {
-                // The bridge/install path runs an arbitrary remote command (the herdr payload) over
-                // the transport. A template that omits `{remote_command}` would spawn the transport
-                // and stream that payload (including the ~11 MB binary on install) into the remote
-                // login shell or wrapper stdin instead of a command runner. Reject such templates up
-                // front and fall back to ssh rather than make remote-side changes through a footgun
-                // config. `{host}` is intentionally not required: a wrapper may embed its destination.
-                if !transport
-                    .args
-                    .iter()
-                    .any(|arg| arg.contains("{remote_command}"))
-                {
-                    tracing::warn!(
-                        program = %transport.program,
-                        "[remote.transport] args must include a {{remote_command}} placeholder; falling back to built-in ssh"
-                    );
-                    return Self::Ssh;
-                }
-                Self::Custom {
-                    program: transport.program.trim().to_string(),
-                    args: transport.args.clone(),
-                }
-            }
-            _ => Self::Ssh,
+    fn from_config(remote: &crate::config::model::RemoteConfig) -> TransportResolution {
+        let Some(transport) = &remote.transport else {
+            // No `[remote.transport]` override configured: use built-in ssh.
+            return TransportResolution::Spec(TransportSpec::Ssh);
+        };
+        // An empty program is treated as "no transport" so a stray `[remote.transport]` header
+        // can't break every connection by spawning a nameless command.
+        if transport.program.trim().is_empty() {
+            return TransportResolution::Spec(TransportSpec::Ssh);
         }
+        // The bridge/install path runs an arbitrary remote command (the herdr payload) over the
+        // transport. A template that omits `{remote_command}` would spawn the transport and stream
+        // that payload (including the ~11 MB binary on install) into the remote login shell or
+        // wrapper stdin instead of a command runner. Report it invalid so the resolver keeps the
+        // last valid transport rather than failing open to ssh. `{host}` is intentionally not
+        // required: a wrapper may embed its destination.
+        if !transport
+            .args
+            .iter()
+            .any(|arg| arg.contains("{remote_command}"))
+        {
+            tracing::warn!(
+                program = %transport.program,
+                "[remote.transport] args must include a {{remote_command}} placeholder; keeping the last valid transport"
+            );
+            return TransportResolution::Invalid;
+        }
+        TransportResolution::Spec(TransportSpec::Custom {
+            program: transport.program.trim().to_string(),
+            args: transport.args.clone(),
+        })
     }
 }
 
@@ -424,26 +436,34 @@ impl TransportSpec {
 /// Uses `load_live_config` (not `Config::load`) on purpose: `Config::load` silently substitutes
 /// `Config::default()` on a parse/read error, which would drop a configured `[remote.transport]`
 /// and downgrade an active custom transport to plain ssh after a transient bad edit. Instead we
-/// remember the last successfully-resolved spec and keep it when the config currently fails to
-/// parse, matching the app-level contract to retain the current config on invalid TOML. Command
-/// builds are rare relative to ssh spawn cost, so the per-build config read is negligible.
+/// remember the last successfully-resolved spec and keep it whenever the current config fails to
+/// parse or configures a custom transport that is invalid, matching the app-level contract to
+/// retain the current config on invalid TOML and failing closed rather than routing over ssh.
+/// Command builds are rare relative to ssh spawn cost, so the per-build config read is negligible.
 fn resolved_transport() -> TransportSpec {
     static LAST_VALID: OnceLock<Mutex<TransportSpec>> = OnceLock::new();
     let last_valid = LAST_VALID.get_or_init(|| Mutex::new(TransportSpec::Ssh));
-    match crate::config::load_live_config() {
-        Ok(loaded) => {
-            let spec = TransportSpec::from_config(&loaded.config.remote);
+    let keep_last = || {
+        last_valid
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or(TransportSpec::Ssh)
+    };
+    // Config currently fails to parse/read: keep the last spec we resolved successfully rather than
+    // failing open to ssh. Defaults to ssh only if no valid config was ever seen.
+    let Ok(loaded) = crate::config::load_live_config() else {
+        return keep_last();
+    };
+    match TransportSpec::from_config(&loaded.config.remote) {
+        TransportResolution::Spec(spec) => {
             if let Ok(mut guard) = last_valid.lock() {
                 *guard = spec.clone();
             }
             spec
         }
-        // Config currently fails to parse/read: keep the last spec we resolved successfully rather
-        // than falling back to ssh. Defaults to ssh only if no valid config was ever seen.
-        Err(_) => last_valid
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or(TransportSpec::Ssh),
+        // A custom transport is configured but invalid (e.g. template missing `{remote_command}`):
+        // keep the last valid transport instead of routing remote operations over built-in ssh.
+        TransportResolution::Invalid => keep_last(),
     }
 }
 
@@ -2864,7 +2884,10 @@ mod tests {
     #[test]
     fn transport_spec_from_config_defaults_to_ssh() {
         let remote = crate::config::model::RemoteConfig::default();
-        assert_eq!(TransportSpec::from_config(&remote), TransportSpec::Ssh);
+        assert_eq!(
+            TransportSpec::from_config(&remote),
+            TransportResolution::Spec(TransportSpec::Ssh)
+        );
     }
 
     #[test]
@@ -2876,7 +2899,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(TransportSpec::from_config(&remote), TransportSpec::Ssh);
+        assert_eq!(
+            TransportSpec::from_config(&remote),
+            TransportResolution::Spec(TransportSpec::Ssh)
+        );
     }
 
     #[test]
@@ -2890,10 +2916,10 @@ mod tests {
         };
         assert_eq!(
             TransportSpec::from_config(&remote),
-            TransportSpec::Custom {
+            TransportResolution::Spec(TransportSpec::Custom {
                 program: "autossh".into(),
                 args: vec!["{host}".into(), "{remote_command}".into()],
-            }
+            })
         );
     }
 
@@ -2910,17 +2936,18 @@ mod tests {
         };
         assert_eq!(
             TransportSpec::from_config(&remote),
-            TransportSpec::Custom {
+            TransportResolution::Spec(TransportSpec::Custom {
                 program: "autossh".into(),
                 args: vec!["{host}".into(), "{remote_command}".into()],
-            }
+            })
         );
     }
 
     #[test]
     fn transport_spec_from_config_rejects_template_without_remote_command() {
         // A template that never runs the remote command would stream the herdr payload (incl. the
-        // install binary) into a bare shell/wrapper stdin; reject it and fall back to ssh.
+        // install binary) into a bare shell/wrapper stdin; report it invalid so the resolver keeps
+        // the last valid transport rather than failing open to ssh.
         let remote = crate::config::model::RemoteConfig {
             transport: Some(crate::config::model::RemoteTransportConfig {
                 program: "ssh".into(),
@@ -2928,7 +2955,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(TransportSpec::from_config(&remote), TransportSpec::Ssh);
+        assert_eq!(
+            TransportSpec::from_config(&remote),
+            TransportResolution::Invalid
+        );
     }
 
     #[test]
@@ -2955,6 +2985,39 @@ mod tests {
         // A later malformed edit must not silently downgrade the active transport to ssh:
         // resolution keeps the last valid spec instead of falling back to config defaults.
         std::fs::write(&cfg, "this is = not [[[ valid toml").expect("write broken config");
+        assert_eq!(resolved_transport(), valid);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolved_transport_keeps_last_valid_on_invalid_template() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-tmpl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+
+        let valid = TransportSpec::Custom {
+            program: "autossh".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
+        assert_eq!(resolved_transport(), valid);
+
+        // A syntactically valid edit whose transport template drops `{remote_command}` is a
+        // configured-but-invalid transport: keep the last valid spec rather than failing open to
+        // ssh, so a wrapper/fixed-host transport used as a routing boundary is not bypassed.
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\"]\n",
+        )
+        .expect("write invalid-template config");
         assert_eq!(resolved_transport(), valid);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
