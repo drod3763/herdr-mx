@@ -348,8 +348,8 @@ impl SshTarget {
     /// are substring-substituted within a token.
     fn build_custom_command(&self, remote_command: &str, transport: &TransportSpec) -> Command {
         let TransportSpec::Custom { program, args } = transport else {
-            // Unreachable: callers only route here for `Custom`. Fall back to the program name so
-            // a future variant can never silently spawn nothing.
+            // Unreachable: callers only route here for `Custom`. Fall back to the built-in `ssh`
+            // transport so a future variant can never silently spawn nothing.
             return Command::new("ssh");
         };
         let mut command = Command::new(program);
