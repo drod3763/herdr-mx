@@ -384,7 +384,7 @@ impl TransportSpec {
             // An empty program is treated as "no transport" so a stray `[remote.transport]`
             // header can't break every connection by spawning a nameless command.
             Some(transport) if !transport.program.trim().is_empty() => Self::Custom {
-                program: transport.program.clone(),
+                program: transport.program.trim().to_string(),
                 args: transport.args.clone(),
             },
             _ => Self::Ssh,
@@ -2817,6 +2817,26 @@ mod tests {
         let remote = crate::config::model::RemoteConfig {
             transport: Some(crate::config::model::RemoteTransportConfig {
                 program: "autossh".into(),
+                args: vec!["{host}".into()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            TransportSpec::from_config(&remote),
+            TransportSpec::Custom {
+                program: "autossh".into(),
+                args: vec!["{host}".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn transport_spec_from_config_trims_program() {
+        // The empty-program guard trims, so a padded-but-nonblank program must be stored trimmed
+        // too — otherwise `program = "autossh "` passes the guard then fails to spawn.
+        let remote = crate::config::model::RemoteConfig {
+            transport: Some(crate::config::model::RemoteTransportConfig {
+                program: "  autossh  ".into(),
                 args: vec!["{host}".into()],
             }),
             ..Default::default()
