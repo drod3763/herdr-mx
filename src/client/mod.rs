@@ -1756,19 +1756,19 @@ fn enter_key() -> crate::input::TerminalKey {
     crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty())
 }
 
-/// Map an `SshHostPickerOutcome` into a dispatch. A non-empty `Submit` becomes the off-loop batch
-/// `remote.add`; an empty `Submit` (nothing checked) just repaints (the overlay stays open).
+/// Map an `SshHostPickerOutcome` into a dispatch. `Submit` always carries at least one alias (Enter
+/// with nothing checked closes the overlay and yields `Redraw`), so it becomes the off-loop batch
+/// `remote.add`. The empty guard stays as defensive belt-and-suspenders.
 fn dispatch_for_ssh_host_picker_outcome(
     outcome: supervisor::SshHostPickerOutcome,
 ) -> ClientInputDispatch {
     match outcome {
         supervisor::SshHostPickerOutcome::Redraw => ClientInputDispatch::Redraw,
+        supervisor::SshHostPickerOutcome::Submit(aliases) if aliases.is_empty() => {
+            ClientInputDispatch::Redraw
+        }
         supervisor::SshHostPickerOutcome::Submit(aliases) => {
-            if aliases.is_empty() {
-                ClientInputDispatch::Redraw
-            } else {
-                ClientInputDispatch::AddSshHosts(aliases)
-            }
+            ClientInputDispatch::AddSshHosts(aliases)
         }
     }
 }

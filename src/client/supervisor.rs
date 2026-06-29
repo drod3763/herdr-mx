@@ -386,8 +386,9 @@ pub(crate) struct SshHostPickerOverlay {
 }
 
 /// The typed outcome of a key press in the ssh-host picker. `Submit` carries the checked,
-/// not-already-added aliases the client turns into a batch of `remote.add` round-trips. An empty
-/// `Submit` is allowed and just closes the overlay. Mirrors `AddRemoteFormOutcome`.
+/// not-already-added aliases (always at least one) the client turns into a batch of `remote.add`
+/// round-trips. Enter with nothing checked closes the overlay and yields `Redraw` instead — it is
+/// never an empty `Submit`. Mirrors `AddRemoteFormOutcome`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SshHostPickerOutcome {
     Redraw,
@@ -2022,7 +2023,14 @@ impl ClientSupervisorModel {
                     .filter(|(index, row)| !row.already_added && overlay.checked.contains(index))
                     .map(|(_, row)| row.alias.clone())
                     .collect();
-                SshHostPickerOutcome::Submit(aliases)
+                // Enter with nothing checked is a close, not a no-op confirm — matches the worktree
+                // picker and the `SshHostPickerOutcome` doc. A non-empty selection submits.
+                if aliases.is_empty() {
+                    self.close_client_overlay();
+                    SshHostPickerOutcome::Redraw
+                } else {
+                    SshHostPickerOutcome::Submit(aliases)
+                }
             }
             _ => SshHostPickerOutcome::Redraw,
         }
@@ -6164,6 +6172,24 @@ mod tests {
         // Esc closes the overlay.
         model.handle_ssh_host_picker_key(picker_key(KeyCode::Esc));
         assert!(model.ssh_host_picker().is_none());
+    }
+
+    #[test]
+    fn handle_ssh_host_picker_key_enter_with_nothing_checked_closes() {
+        use crossterm::event::KeyCode;
+        // PRRT...oTZ: Enter with no rows checked is not a no-op confirm — it closes the overlay,
+        // matching the `SshHostPickerOutcome` doc and the worktree picker's Enter behavior.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_ssh_host_picker(vec![ssh_host("alpha", None, Some("a.example.com"))], &[]);
+
+        assert_eq!(
+            model.handle_ssh_host_picker_key(picker_key(KeyCode::Enter)),
+            SshHostPickerOutcome::Redraw
+        );
+        assert!(
+            model.ssh_host_picker().is_none(),
+            "Enter with nothing checked closes the picker"
+        );
     }
 
     #[test]
