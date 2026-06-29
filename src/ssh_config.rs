@@ -34,6 +34,12 @@ const MAX_CONFIG_FILES: usize = 256;
 /// iterating/sorting unboundedly. Set well above any realistic `~/.ssh/config.d`.
 const MAX_GLOB_SCAN_ENTRIES: usize = 8192;
 
+/// Hard cap on discovered aliases. The per-file (1 MiB) and total-file (256) caps bound the input,
+/// but a fan-out of many small files could still push tens of millions of `Host` aliases into one
+/// synchronously-served response. Stop discovery once this many aliases are collected (truncated).
+/// Far above any realistic personal ssh config.
+const MAX_HOSTS: usize = 4096;
+
 /// A single connectable ssh alias discovered in the config, with its resolved display fields.
 ///
 /// Doubles as the `remote.ssh_config_hosts` wire payload (referenced from `ResponseResult`), so it
@@ -134,6 +140,10 @@ fn parse_file(
     if !meta.is_file() || meta.len() > MAX_CONFIG_FILE_BYTES {
         return;
     }
+    // Output cap: once enough aliases are collected, stop traversing (don't read/parse more files).
+    if hosts.len() >= MAX_HOSTS {
+        return;
+    }
     let Ok(contents) = std::fs::read_to_string(path) else {
         return;
     };
@@ -146,6 +156,9 @@ fn parse_file(
             "host" => {
                 current_aliases.clear();
                 for token in tokenize(rest) {
+                    if hosts.len() >= MAX_HOSTS {
+                        break;
+                    }
                     if !is_connectable_alias(&token) {
                         continue;
                     }
@@ -623,6 +636,20 @@ mod tests {
             vec!["real".to_string()],
             "the oversized include's hosts must be skipped"
         );
+    }
+
+    #[test]
+    fn caps_total_discovered_hosts() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex-2-2 (iter 2): a fan-out of many Host lines must not allocate an unbounded alias list
+        // for one synchronous response. Discovery truncates at MAX_HOSTS.
+        let mut body = String::new();
+        for i in 0..(MAX_HOSTS + 100) {
+            body.push_str(&format!("Host h{i}\n"));
+        }
+        let _fixture = ConfigFixture::new("many-hosts", &body);
+        let hosts = discover_hosts();
+        assert_eq!(hosts.len(), MAX_HOSTS, "discovery must cap at MAX_HOSTS");
     }
 
     #[test]
