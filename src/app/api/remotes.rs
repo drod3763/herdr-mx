@@ -81,6 +81,19 @@ impl App {
         }
     }
 
+    /// #11: read-only enumeration of connectable `Host` aliases from the user's `~/.ssh/config`
+    /// (following `Include`s, skipping wildcard/pattern hosts), with resolved `HostName`/`User` for
+    /// display. Discovery only — never writes the ssh config and does not touch session state, so it
+    /// does NOT `mark_session_dirty`. The client turns chosen aliases into `remote.add` calls.
+    pub(super) fn handle_remote_ssh_config_hosts(&mut self, id: String) -> String {
+        encode_success(
+            id,
+            ResponseResult::SshConfigHosts {
+                hosts: crate::ssh_config::discover_hosts(),
+            },
+        )
+    }
+
     /// #61: persist a remote's per-remote auto-update flag. Mirrors `handle_remote_set_enabled`;
     /// reuses the `RemoteEnabledChanged` success body (it just carries the updated definition — the
     /// client re-syncs the flag off the periodic `remote.list`, not this response).
@@ -176,6 +189,29 @@ mod tests {
     }
 
     impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    struct SetEnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl SetEnvGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for SetEnvGuard {
         fn drop(&mut self) {
             if let Some(value) = self.previous.take() {
                 std::env::set_var(self.key, value);
@@ -382,6 +418,40 @@ mod tests {
             ),
             "remote_not_found"
         );
+    }
+
+    #[test]
+    fn ssh_config_hosts_enumerates_aliases_without_marking_dirty() {
+        // #11: the read-only discovery method returns the config's concrete aliases (with display
+        // fields) and must not dirty the session. Point it at a temp config via the env override.
+        let dir = std::env::temp_dir().join("herdr-api-ssh-cfg");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config");
+        std::fs::write(
+            &config_path,
+            "Host prod\n  HostName 10.0.0.5\n  User deploy\n\nHost *\n  User everyone\n",
+        )
+        .unwrap();
+        let _guard = SetEnvGuard::set(crate::ssh_config::SSH_CONFIG_PATH_ENV_VAR, &config_path);
+
+        let mut app = test_app();
+        app.state.session_dirty = false;
+
+        let response = call(
+            &mut app,
+            r#"{"id":"hosts","method":"remote.ssh_config_hosts","params":{}}"#,
+        );
+
+        assert_eq!(response["result"]["type"], "ssh_config_hosts");
+        let hosts = response["result"]["hosts"].as_array().unwrap();
+        assert_eq!(hosts.len(), 1, "wildcard host must be excluded: {hosts:?}");
+        assert_eq!(hosts[0]["alias"], "prod");
+        assert_eq!(hosts[0]["hostname"], "10.0.0.5");
+        assert_eq!(hosts[0]["user"], "deploy");
+        assert!(!app.state.session_dirty, "discovery must not dirty session");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

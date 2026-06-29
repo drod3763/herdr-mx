@@ -360,6 +360,40 @@ pub(crate) enum AddRemoteFormOutcome {
     Submit(AddRemoteDraft),
 }
 
+/// One row of the "pick from ~/.ssh/config" multi-select picker: a host alias plus its resolved
+/// `hostname`/`user` from the ssh config. `already_added` marks an alias that is already a remote
+/// in the registry — those rows render as "(added)" and are not selectable/are skipped on submit.
+/// Mirrors the data-only shape of `WorktreePickerItem`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshHostRow {
+    pub(crate) alias: String,
+    pub(crate) hostname: Option<String>,
+    pub(crate) user: Option<String>,
+    pub(crate) already_added: bool,
+}
+
+/// The multi-select "pick ssh hosts" overlay: the parsed `~/.ssh/config` rows, the highlighted
+/// row, the set of checked rows, the scroll hint, and an error line. Mouse-first: a click toggles a
+/// row's checkmark, Space toggles the highlighted row, ↑/↓ move the highlight, Enter confirms,
+/// Esc cancels. Mirrors `RemoteManageOverlay`'s selectable-list shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshHostPickerOverlay {
+    pub(crate) rows: Vec<SshHostRow>,
+    pub(crate) selected: usize,
+    pub(crate) checked: std::collections::HashSet<usize>,
+    pub(crate) scroll: usize,
+    pub(crate) error: Option<String>,
+}
+
+/// The typed outcome of a key press in the ssh-host picker. `Submit` carries the checked,
+/// not-already-added aliases the client turns into a batch of `remote.add` round-trips. An empty
+/// `Submit` is allowed and just closes the overlay. Mirrors `AddRemoteFormOutcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SshHostPickerOutcome {
+    Redraw,
+    Submit(Vec<String>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClientOverlayState {
     None,
@@ -378,6 +412,9 @@ enum ClientOverlayState {
     NewWorktree(NewWorktreeForm),
     ConfirmDeleteWorktree(ConfirmDeleteWorktree),
     WorktreePicker(WorktreePicker),
+    // The mouse-first multi-select "pick from ~/.ssh/config" overlay, promoted from the add-remote
+    // form's "pick" button after the ssh hosts are fetched off the UI loop.
+    SshHostPicker(SshHostPickerOverlay),
 }
 
 /// #23: the inline rename text overlay. Mirrors `AddRemoteForm` (a single editable text field +
@@ -691,6 +728,10 @@ pub(crate) struct ClientSupervisorModel {
     /// vanishing. Set by `set_update_outcome`; the client loop expires it on a timer (the model holds
     /// no clock). Threaded into `host_banner_specs` and takes precedence over `update_progress`.
     update_outcomes: std::collections::HashMap<ServerId, crate::app::state::HostUpdateOutcome>,
+    /// The last registry snapshot applied via `sync_remote_registry`, kept so the ssh-host picker
+    /// can dedup its rows against the already-registered remotes (`already_added`) without a fresh
+    /// `remote.list` round-trip. This is the SAME source `remote_manage_rows` derives from.
+    synced_remotes: Vec<crate::remote_registry::RemoteDefinitionSnapshot>,
 }
 
 const SUPERVISOR_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -774,6 +815,7 @@ impl ClientSupervisorModel {
             optimistic_focus: None,
             update_progress: std::collections::HashMap::new(),
             update_outcomes: std::collections::HashMap::new(),
+            synced_remotes: Vec::new(),
         }
     }
 
@@ -889,6 +931,9 @@ impl ClientSupervisorModel {
         &mut self,
         remotes: Vec<crate::remote_registry::RemoteDefinitionSnapshot>,
     ) {
+        // Keep the applied registry snapshot so the ssh-host picker can dedup against it without a
+        // fresh `remote.list` round-trip (captured before `remotes` is consumed by the rebuild).
+        self.synced_remotes = remotes.clone();
         // #40: capture the current client-local host ordering BEFORE the rebuild so a user's
         // host drag-reorder survives this registry-driven sync. Secondaries are re-sorted by their
         // prior position below; genuinely-new remotes (absent from this map) sort last in the
@@ -1376,7 +1421,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -1390,7 +1436,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -1411,6 +1458,7 @@ impl ClientSupervisorModel {
             || self.remote_manage_overlay().is_some()
             || self.rename_workspace_form().is_some()
             || self.confirm_close_workspace().is_some()
+            || self.ssh_host_picker().is_some()
     }
 
     /// #47: the first selectable row — the initial highlight, so a menu never opens on a
@@ -1662,7 +1710,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -1784,6 +1833,181 @@ impl ClientSupervisorModel {
         self.close_client_overlay();
     }
 
+    // ----- ssh-host picker overlay ("pick from ~/.ssh/config") --------------------------------
+
+    /// The last registry snapshot applied via `sync_remote_registry`. Used by the client loop to
+    /// build the ssh-host picker's `already_added` dedup source (mirrors the ManageRemotes source).
+    pub(crate) fn synced_remotes(&self) -> &[crate::remote_registry::RemoteDefinitionSnapshot] {
+        &self.synced_remotes
+    }
+
+    /// Open the multi-select ssh-host picker from a fetched `~/.ssh/config` host list. Each row's
+    /// `already_added` flag is computed by parsing the alias into a target and comparing its
+    /// `canonical_key()` against `existing` (the registry remotes) — already-registered hosts render
+    /// as "(added)" and are not selectable/are skipped on submit. Mirrors `open_add_remote_form`.
+    pub(crate) fn open_ssh_host_picker(
+        &mut self,
+        hosts: Vec<crate::ssh_config::SshConfigHost>,
+        existing: &[crate::remote_registry::RemoteDefinitionSnapshot],
+    ) {
+        let existing_keys: std::collections::HashSet<String> = existing
+            .iter()
+            .map(|remote| remote.target.canonical_key())
+            .collect();
+        let rows: Vec<SshHostRow> = hosts
+            .into_iter()
+            .map(|host| {
+                let already_added =
+                    crate::remote_registry::RemoteTargetSnapshot::parse(&host.alias)
+                        .map(|target| existing_keys.contains(&target.canonical_key()))
+                        .unwrap_or(false);
+                SshHostRow {
+                    alias: host.alias,
+                    hostname: host.hostname,
+                    user: host.user,
+                    already_added,
+                }
+            })
+            .collect();
+        self.new_workspace_picker = None;
+        self.overlay_drag_offset = (0, 0);
+        self.client_overlay = ClientOverlayState::SshHostPicker(SshHostPickerOverlay {
+            rows,
+            selected: 0,
+            checked: std::collections::HashSet::new(),
+            scroll: 0,
+            error: None,
+        });
+    }
+
+    pub(crate) fn ssh_host_picker(&self) -> Option<&SshHostPickerOverlay> {
+        match &self.client_overlay {
+            ClientOverlayState::SshHostPicker(overlay) => Some(overlay),
+            _ => None,
+        }
+    }
+
+    fn ssh_host_picker_mut(&mut self) -> Option<&mut SshHostPickerOverlay> {
+        match &mut self.client_overlay {
+            ClientOverlayState::SshHostPicker(overlay) => Some(overlay),
+            _ => None,
+        }
+    }
+
+    /// Mark every picker row matching `alias` as already-added (renders "(added)", no longer
+    /// selectable) and clear its check, so a partial-failure re-submit skips the hosts that already
+    /// landed in the registry. No-op when the picker is closed.
+    pub(crate) fn mark_ssh_host_added(&mut self, alias: &str) {
+        if let Some(overlay) = self.ssh_host_picker_mut() {
+            let indices: Vec<usize> = overlay
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.alias == alias)
+                .map(|(index, _)| index)
+                .collect();
+            for index in indices {
+                if let Some(row) = overlay.rows.get_mut(index) {
+                    row.already_added = true;
+                }
+                overlay.checked.remove(&index);
+            }
+        }
+    }
+
+    /// Surface a per-host failure on the picker's error line (mirrors `set_add_remote_error`).
+    pub(crate) fn set_ssh_host_picker_error(&mut self, error: impl Into<String>) {
+        if let Some(overlay) = self.ssh_host_picker_mut() {
+            overlay.error = Some(error.into());
+        }
+    }
+
+    /// Toggle the checkmark for row `index` (mouse click), ignoring already-added rows. Out-of-range
+    /// indices are ignored. Mirrors `set_remote_manage_selected` + a toggle.
+    pub(crate) fn toggle_ssh_host_picker_row(&mut self, index: usize) {
+        if let Some(overlay) = self.ssh_host_picker_mut() {
+            let selectable = overlay
+                .rows
+                .get(index)
+                .is_some_and(|row| !row.already_added);
+            if !selectable {
+                return;
+            }
+            overlay.selected = index;
+            overlay.error = None;
+            if !overlay.checked.remove(&index) {
+                overlay.checked.insert(index);
+            }
+        }
+    }
+
+    /// Esc closes; ↑/↓ move the highlight (clamped); Space toggles the highlighted row's checkmark
+    /// (ignored for already-added rows); Enter submits the checked, not-already-added aliases.
+    /// Mirrors `handle_add_remote_key` / `handle_worktree_picker_key`.
+    pub(crate) fn handle_ssh_host_picker_key(
+        &mut self,
+        key: crate::input::TerminalKey,
+    ) -> SshHostPickerOutcome {
+        use crossterm::event::{KeyCode, KeyEventKind};
+
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return SshHostPickerOutcome::Redraw;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_client_overlay();
+                SshHostPickerOutcome::Redraw
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(overlay) = self.ssh_host_picker_mut() {
+                    overlay.selected = overlay.selected.saturating_sub(1);
+                }
+                SshHostPickerOutcome::Redraw
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(overlay) = self.ssh_host_picker_mut() {
+                    if overlay.selected + 1 < overlay.rows.len() {
+                        overlay.selected += 1;
+                    }
+                }
+                SshHostPickerOutcome::Redraw
+            }
+            KeyCode::Char(' ') => {
+                if let Some(overlay) = self.ssh_host_picker_mut() {
+                    let selected = overlay.selected;
+                    let selectable = overlay
+                        .rows
+                        .get(selected)
+                        .is_some_and(|row| !row.already_added);
+                    if selectable {
+                        overlay.error = None;
+                        if !overlay.checked.remove(&selected) {
+                            overlay.checked.insert(selected);
+                        }
+                    }
+                }
+                SshHostPickerOutcome::Redraw
+            }
+            KeyCode::Enter => {
+                let Some(overlay) = self.ssh_host_picker() else {
+                    return SshHostPickerOutcome::Redraw;
+                };
+                // Preserve row order so the batch-add reads top-to-bottom; skip already-added rows
+                // (the server dedup also protects against a stale check).
+                let aliases: Vec<String> = overlay
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, row)| !row.already_added && overlay.checked.contains(index))
+                    .map(|(_, row)| row.alias.clone())
+                    .collect();
+                SshHostPickerOutcome::Submit(aliases)
+            }
+            _ => SshHostPickerOutcome::Redraw,
+        }
+    }
+
     // ----- item 3 (Area 5): remote-management overlay -----------------------------------------
 
     /// Open the management overlay with a fresh selection clamped to the current secondary rows.
@@ -1808,7 +2032,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -1822,7 +2047,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -2328,7 +2554,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -2342,7 +2569,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -3181,7 +3409,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -5751,6 +5980,91 @@ mod tests {
                 keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             })
         );
+    }
+
+    fn ssh_host(
+        alias: &str,
+        user: Option<&str>,
+        hostname: Option<&str>,
+    ) -> crate::ssh_config::SshConfigHost {
+        crate::ssh_config::SshConfigHost {
+            alias: alias.into(),
+            hostname: hostname.map(str::to_string),
+            user: user.map(str::to_string),
+        }
+    }
+
+    fn picker_key(code: crossterm::event::KeyCode) -> crate::input::TerminalKey {
+        crate::input::TerminalKey::new(code, crossterm::event::KeyModifiers::empty())
+    }
+
+    #[test]
+    fn open_ssh_host_picker_marks_already_added_by_canonical_key() {
+        let mut model = ClientSupervisorModel::new("local");
+        // An ssh remote whose target alias is `prod` — canonical key `ssh:prod`, the SAME key the
+        // host alias `prod` parses to, so its picker row must come up already-added.
+        let existing = vec![ssh_remote("r1", "prod", "prod")];
+        let hosts = vec![
+            ssh_host("prod", Some("deploy"), Some("10.0.0.5")),
+            ssh_host("staging", None, Some("10.0.0.6")),
+        ];
+
+        model.open_ssh_host_picker(hosts, &existing);
+
+        let overlay = model.ssh_host_picker().expect("picker is open");
+        assert_eq!(overlay.rows.len(), 2);
+        assert!(
+            overlay.rows[0].already_added,
+            "an alias matching an existing remote's canonical key is (added)"
+        );
+        assert!(
+            !overlay.rows[1].already_added,
+            "an unregistered alias is selectable"
+        );
+        assert!(overlay.checked.is_empty());
+        assert_eq!(overlay.selected, 0);
+    }
+
+    #[test]
+    fn handle_ssh_host_picker_key_space_toggles_and_enter_submits() {
+        use crossterm::event::KeyCode;
+
+        let mut model = ClientSupervisorModel::new("local");
+        let hosts = vec![
+            ssh_host("alpha", Some("root"), Some("a.example.com")),
+            ssh_host("beta", None, Some("b.example.com")),
+            ssh_host("gamma", None, None),
+        ];
+        // `gamma` is already a remote → its row is (added) and must be skipped by Space + Enter.
+        let existing = vec![ssh_remote("r-gamma", "gamma", "gamma")];
+        model.open_ssh_host_picker(hosts, &existing);
+
+        // Space toggles the highlighted (first) row on.
+        assert_eq!(
+            model.handle_ssh_host_picker_key(picker_key(KeyCode::Char(' '))),
+            SshHostPickerOutcome::Redraw
+        );
+        assert!(model.ssh_host_picker().unwrap().checked.contains(&0));
+
+        // Down moves the highlight, Space toggles the second row on too.
+        model.handle_ssh_host_picker_key(picker_key(KeyCode::Down));
+        model.handle_ssh_host_picker_key(picker_key(KeyCode::Char(' ')));
+        assert!(model.ssh_host_picker().unwrap().checked.contains(&1));
+
+        // Space on the already-added `gamma` row is a no-op (not selectable).
+        model.handle_ssh_host_picker_key(picker_key(KeyCode::Down));
+        model.handle_ssh_host_picker_key(picker_key(KeyCode::Char(' ')));
+        assert!(!model.ssh_host_picker().unwrap().checked.contains(&2));
+
+        // Enter submits the checked, not-already-added aliases in row order.
+        assert_eq!(
+            model.handle_ssh_host_picker_key(picker_key(KeyCode::Enter)),
+            SshHostPickerOutcome::Submit(vec!["alpha".into(), "beta".into()])
+        );
+
+        // Esc closes the overlay.
+        model.handle_ssh_host_picker_key(picker_key(KeyCode::Esc));
+        assert!(model.ssh_host_picker().is_none());
     }
 
     #[test]

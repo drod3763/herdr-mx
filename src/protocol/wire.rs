@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 /// Current protocol version. Bumped when wire format changes incompatibly.
 /// v14: `FrameDelta` carries `base_checksum` and clients may send `RequestFullFrame` (delta-desync
 /// recovery); upstream v14 also adds `pane.move` (relocate a running pane across tabs/workspaces).
-pub const PROTOCOL_VERSION: u32 = 14;
+/// v15 (mx, #11): adds the read-only `remote.ssh_config_hosts` method (enumerate `~/.ssh/config`
+/// aliases for the add-remote picker).
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.

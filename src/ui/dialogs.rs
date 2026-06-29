@@ -880,6 +880,13 @@ pub(crate) fn add_remote_inner_rect(area: Rect) -> Option<Rect> {
     })
 }
 
+/// The rect for the add-remote overlay's "pick from ~/.ssh/config" affordance — the gap row
+/// (third inner row, between the `name` field and the error/action rows). Used by BOTH the renderer
+/// and the compositor's hit-test so render geometry == hit-test geometry.
+pub(crate) fn add_remote_pick_button_rect(inner: Rect) -> Rect {
+    Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 1)
+}
+
 pub(crate) fn add_remote_button_rects(inner: Rect) -> (Rect, Rect) {
     let rects = action_button_row_rects(
         inner,
@@ -1001,6 +1008,17 @@ pub(crate) fn render_add_remote_overlay(
         view.name,
         !view.focused_is_target,
         palette,
+    );
+
+    // A click-to-open affordance for the multi-select ssh-config picker. Lives on the gap row so the
+    // existing field/error/action geometry is unchanged; the hit rect comes from the SAME helper.
+    frame.render_widget(
+        Paragraph::new(" + pick from ~/.ssh/config").style(
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        add_remote_pick_button_rect(inner),
     );
 
     if view.in_progress {
@@ -1722,6 +1740,197 @@ pub(crate) fn render_worktree_picker_overlay(
             inner.width,
             1,
         ),
+    );
+}
+
+/// One ui-owned row of the multi-select "pick from ~/.ssh/config" picker: the host alias, its
+/// resolved `user@hostname` detail (if any), whether it is checked, and whether it is already a
+/// remote (rendered "(added)", not selectable). Holds only ui primitives (no supervisor types).
+pub(crate) struct SshHostRowView<'a> {
+    pub alias: &'a str,
+    pub detail: Option<&'a str>,
+    pub checked: bool,
+    pub already_added: bool,
+}
+
+/// The ssh-host picker popup height for `count` rows, derived from the row budget (header, one row
+/// per host, the error line, the footer hint, and vertical margins) clamped to a sane band. Used by
+/// BOTH the inner-rect helper and the renderer so they cannot diverge. Mirrors
+/// `remote_manage_popup_height`.
+fn ssh_host_picker_popup_height(count: usize) -> u16 {
+    (count as u16).saturating_add(5).clamp(8, 20)
+}
+
+/// The outer popup rect for the ssh-host picker — footer-anchored (bottom-left of `area`, opening
+/// upward) like the manage overlay. Width 64, height derived from `count`. Used by BOTH the
+/// renderer and the compositor's content-copy exclusion / hit-test.
+pub(crate) fn ssh_host_picker_popup_rect(area: Rect, count: usize) -> Option<Rect> {
+    bottom_left_popup_rect(area, 64, ssh_host_picker_popup_height(count))
+}
+
+/// Test-only oracle (see `add_remote_inner_rect`): production reads the inner rect from the cached
+/// popup via `popup_inner`. Asserts render geometry == hit-test geometry in unit tests.
+#[cfg(test)]
+pub(crate) fn ssh_host_picker_inner_rect(area: Rect, count: usize) -> Option<Rect> {
+    ssh_host_picker_popup_rect(area, count).map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
+}
+
+/// The maximum number of host rows that fit in the picker's inner rect (header + error + footer
+/// reserve three lines). Used by BOTH render and hit-test so the visible window matches.
+pub(crate) fn ssh_host_picker_max_rows(inner: Rect) -> usize {
+    inner.height.saturating_sub(3) as usize
+}
+
+/// The shared scroll-window start for the picker, derived from the stored `scroll` hint and the
+/// `selected` row exactly the way `render_remote_manage_overlay` clamps it (so the selected row is
+/// always visible). Used by BOTH render and hit-test.
+pub(crate) fn ssh_host_picker_scroll_start(
+    scroll: usize,
+    selected: usize,
+    row_count: usize,
+    max_rows: usize,
+) -> usize {
+    scroll
+        .min(row_count.saturating_sub(max_rows.max(1)))
+        .min(selected)
+        .max(selected.saturating_sub(max_rows.max(1).saturating_sub(1)))
+}
+
+/// The rect for the `visible_idx`-th VISIBLE host row inside the picker's inner rect. Rows start one
+/// line below the inner top (header). Used by BOTH render and hit-test.
+pub(crate) fn ssh_host_picker_row_rect(inner: Rect, visible_idx: usize) -> Rect {
+    let y = inner.y.saturating_add(1 + visible_idx as u16);
+    Rect::new(inner.x, y, inner.width, 1)
+}
+
+pub(crate) fn ssh_host_picker_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "add",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
+/// Render the multi-select ssh-host picker — a header, one selectable/checkable row per host
+/// (`✓` checked, `›` highlighted, `(added)` for already-registered aliases), an error line, and
+/// add/cancel action buttons. Geometry comes from the `ssh_host_picker_*` helpers so it matches
+/// `hit_test`. Mirrors `render_remote_manage_overlay`.
+pub(crate) fn render_ssh_host_picker_overlay(
+    palette: &Palette,
+    rows: &[SshHostRowView<'_>],
+    selected: usize,
+    scroll: usize,
+    error: Option<&str>,
+    frame: &mut Frame,
+    popup: Rect,
+) {
+    let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
+        return;
+    };
+    if inner.height < 4 {
+        return;
+    }
+
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "pick ssh hosts",
+        palette,
+    );
+
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" no hosts found in ~/.ssh/config")
+                .style(Style::default().fg(palette.overlay0)),
+            ssh_host_picker_row_rect(inner, 0),
+        );
+    } else {
+        let max_rows = ssh_host_picker_max_rows(inner);
+        let selected = selected.min(rows.len().saturating_sub(1));
+        let start = ssh_host_picker_scroll_start(scroll, selected, rows.len(), max_rows);
+        for (visible_idx, (row_index, row)) in rows
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(max_rows)
+            .enumerate()
+        {
+            let is_selected = row_index == selected;
+            let marker = if is_selected { "›" } else { " " };
+            let check = if row.checked { "✓" } else { " " };
+            let detail = match row.detail {
+                Some(detail) => format!(" → {detail}"),
+                None => String::new(),
+            };
+            let suffix = if row.already_added { "  (added)" } else { "" };
+            let text = format!(" {marker} {check} {}{detail}{suffix}", row.alias);
+            let style = if is_selected {
+                Style::default()
+                    .fg(palette.text)
+                    .bg(palette.surface0)
+                    .add_modifier(Modifier::BOLD)
+            } else if row.already_added {
+                Style::default().fg(palette.overlay0)
+            } else {
+                Style::default().fg(palette.subtext0)
+            };
+            frame.render_widget(
+                Paragraph::new(truncate_text(&text, inner.width as usize)).style(style),
+                ssh_host_picker_row_rect(inner, visible_idx),
+            );
+        }
+    }
+
+    if let Some(error) = error {
+        frame.render_widget(
+            Paragraph::new(format!(" {error}")).style(Style::default().fg(palette.red)),
+            Rect::new(
+                inner.x,
+                inner.y + inner.height.saturating_sub(2),
+                inner.width,
+                1,
+            ),
+        );
+    }
+
+    let (add_rect, cancel_rect) = ssh_host_picker_button_rects(inner);
+    render_action_button(
+        frame,
+        add_rect,
+        Some("↵"),
+        "add",
+        Style::default()
+            .fg(panel_contrast_fg(palette))
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.surface0)
+            .add_modifier(Modifier::BOLD),
     );
 }
 

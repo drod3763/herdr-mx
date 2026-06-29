@@ -412,6 +412,16 @@ pub(crate) enum SidebarHitTarget {
     // item 1: composited-modal action buttons (centered ratatui modals).
     AddRemoteSubmit,
     AddRemoteCancel,
+    /// The add-remote overlay's "pick from ~/.ssh/config" affordance — fetches ssh hosts and opens
+    /// the multi-select picker.
+    OpenSshHostPicker,
+    // The multi-select ssh-host picker overlay targets: a row click toggles its checkmark, the
+    // confirm button batch-adds the checked hosts, cancel closes.
+    SshHostPickerRow {
+        index: usize,
+    },
+    SshHostPickerConfirm,
+    SshHostPickerCancel,
     NewWorkspacePickerConfirm,
     NewWorkspacePickerCancel,
     // item 3 (Area 5): remote-management overlay targets.
@@ -480,6 +490,10 @@ struct ClientSidebarSnapshot {
     new_worktree: Option<crate::client::supervisor::NewWorktreeForm>,
     confirm_delete_worktree: Option<crate::client::supervisor::ConfirmDeleteWorktree>,
     worktree_picker: Option<crate::client::supervisor::WorktreePicker>,
+    // The multi-select ssh-host picker overlay, cloned out of the model. The render closure maps its
+    // rows into ui-owned `SshHostRowView`s before drawing (layering rule); hit-test reads the same
+    // clone's rows + scroll/selection for the shared visible-window geometry.
+    ssh_host_picker: Option<crate::client::supervisor::SshHostPickerOverlay>,
     // #47: the one drag offset (cols, rows) shared by EVERY overlay, cloned from the model. Render,
     // hit-test, and the content-exclusion rect shift the open overlay's default popup by this.
     overlay_drag_offset: (i16, i16),
@@ -1450,7 +1464,8 @@ impl ClientCompositor {
             || model.confirm_close_workspace().is_some()
             || model.new_worktree_form().is_some()
             || model.confirm_delete_worktree().is_some()
-            || model.worktree_picker().is_some();
+            || model.worktree_picker().is_some()
+            || model.ssh_host_picker().is_some();
 
         ComposedShell {
             frame,
@@ -1573,6 +1588,11 @@ impl ClientCompositor {
             // a sidebar workspace row while the overlay is open never resolves to a `Workspace` hit).
             if snapshot.remote_manage.is_some() {
                 return hit_test_remote_manage(&snapshot, popup, anchor_area, x, y);
+            }
+            // The ssh-host picker is modal too: while open it owns the host rect (a miss resolves to
+            // nothing rather than a row beneath it).
+            if snapshot.ssh_host_picker.is_some() {
+                return hit_test_ssh_host_picker(&snapshot, popup, x, y);
             }
         }
         // #47: the open client menu (launcher / workspace / host) is modal — when open it owns the
@@ -1746,6 +1766,7 @@ impl ClientCompositor {
         if model.client_menu().is_some()
             || model.add_remote_form().is_some()
             || model.remote_manage_overlay().is_some()
+            || model.ssh_host_picker().is_some()
         {
             return None;
         }
@@ -2386,6 +2407,7 @@ impl ClientSidebarSnapshot {
             new_worktree: model.new_worktree_form().cloned(),
             confirm_delete_worktree: model.confirm_delete_worktree().cloned(),
             worktree_picker: model.worktree_picker().cloned(),
+            ssh_host_picker: model.ssh_host_picker().cloned(),
         };
         // #53: ONE computation of the open overlay's geometry, from the just-built view. Every read
         // site (render / hit-test / hover-test / exclusion / drag / #56 hover overlay) reads this
@@ -2403,6 +2425,17 @@ fn client_menu_header_rows(menu: &crate::client::supervisor::ClientMenu) -> u16 
         2
     } else {
         1
+    }
+}
+
+/// Compose the right-side `user@hostname` detail for one ssh-host picker row from its resolved
+/// `user`/`hostname`, or `None` when the alias has no resolved destination (alias-only host).
+fn ssh_host_detail(row: &crate::client::supervisor::SshHostRow) -> Option<String> {
+    match (row.user.as_deref(), row.hostname.as_deref()) {
+        (Some(user), Some(host)) => Some(format!("{user}@{host}")),
+        (None, Some(host)) => Some(host.to_string()),
+        (Some(user), None) => Some(format!("{user}@{}", row.alias)),
+        (None, None) => None,
     }
 }
 
@@ -2633,6 +2666,34 @@ fn render_client_shell(
                     );
                 }
             }
+            // The multi-select ssh-host picker — map the supervisor rows into ui-owned views (the
+            // detail string is composed here so no supervisor type reaches `ui`).
+            if let Some(overlay) = &snapshot.ssh_host_picker {
+                if let Some(popup) = overlay_popup {
+                    let details: Vec<Option<String>> =
+                        overlay.rows.iter().map(ssh_host_detail).collect();
+                    let rows: Vec<crate::ui::SshHostRowView> = overlay
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .map(|(index, row)| crate::ui::SshHostRowView {
+                            alias: &row.alias,
+                            detail: details[index].as_deref(),
+                            checked: overlay.checked.contains(&index),
+                            already_added: row.already_added,
+                        })
+                        .collect();
+                    crate::ui::render_ssh_host_picker_overlay(
+                        &snapshot.app.palette,
+                        &rows,
+                        overlay.selected,
+                        overlay.scroll,
+                        overlay.error.as_deref(),
+                        frame,
+                        popup,
+                    );
+                }
+            }
         })
         .expect("render to TestBackend should not fail");
 
@@ -2798,12 +2859,60 @@ fn hit_test_add_remote(
 ) -> Option<SidebarHitTarget> {
     snapshot.add_remote_form.as_ref()?;
     let inner = popup_inner(popup);
+    if rect_contains(crate::ui::add_remote_pick_button_rect(inner), x, y) {
+        return Some(SidebarHitTarget::OpenSshHostPicker);
+    }
     let (submit_rect, cancel_rect) = crate::ui::add_remote_button_rects(inner);
     if rect_contains(submit_rect, x, y) {
         return Some(SidebarHitTarget::AddRemoteSubmit);
     }
     if rect_contains(cancel_rect, x, y) {
         return Some(SidebarHitTarget::AddRemoteCancel);
+    }
+    None
+}
+
+/// Hit-test the multi-select ssh-host picker. The confirm/cancel buttons and any rendered host row
+/// are hittable; geometry comes from the SAME `ssh_host_picker_*` helpers the renderer uses, so
+/// render == hit_test. A click that misses every target returns `None` (the modal owns input).
+fn hit_test_ssh_host_picker(
+    snapshot: &ClientSidebarSnapshot,
+    popup: Rect,
+    x: u16,
+    y: u16,
+) -> Option<SidebarHitTarget> {
+    let overlay = snapshot.ssh_host_picker.as_ref()?;
+    let inner = popup_inner(popup);
+    if inner.height < 4 {
+        return None;
+    }
+
+    let (add_rect, cancel_rect) = crate::ui::ssh_host_picker_button_rects(inner);
+    if rect_contains(add_rect, x, y) {
+        return Some(SidebarHitTarget::SshHostPickerConfirm);
+    }
+    if rect_contains(cancel_rect, x, y) {
+        return Some(SidebarHitTarget::SshHostPickerCancel);
+    }
+
+    // rows — same visible-window clamp the renderer applies.
+    let max_rows = crate::ui::ssh_host_picker_max_rows(inner);
+    let row_count = overlay.rows.len();
+    let selected = overlay.selected.min(row_count.saturating_sub(1));
+    let start =
+        crate::ui::ssh_host_picker_scroll_start(overlay.scroll, selected, row_count, max_rows);
+    for (visible_idx, (row_index, _)) in overlay
+        .rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(max_rows)
+        .enumerate()
+    {
+        let rect = crate::ui::ssh_host_picker_row_rect(inner, visible_idx);
+        if rect_contains(rect, x, y) {
+            return Some(SidebarHitTarget::SshHostPickerRow { index: row_index });
+        }
     }
     None
 }
@@ -2967,6 +3076,8 @@ fn open_overlay_popup_rect(
         crate::ui::confirm_delete_worktree_popup_rect(anchor_area)
     } else if let Some(picker) = snapshot.worktree_picker.as_ref() {
         crate::ui::worktree_picker_popup_rect(anchor_area, picker.items.len())
+    } else if let Some(overlay) = snapshot.ssh_host_picker.as_ref() {
+        crate::ui::ssh_host_picker_popup_rect(anchor_area, overlay.rows.len())
     } else {
         None
     }?;
@@ -6222,6 +6333,60 @@ mod tests {
         assert_eq!(
             compositor.hit_test(&model, cancel.x, cancel.y, 80, 24),
             Some(SidebarHitTarget::AddRemoteCancel)
+        );
+    }
+
+    #[test]
+    fn ssh_host_picker_hit_test_matches_render_geometry() {
+        let mut model = ClientSupervisorModel::new("local");
+        let compositor = ClientCompositor::new(26);
+
+        // The add-remote overlay's "pick from ~/.ssh/config" affordance resolves to OpenSshHostPicker.
+        model.open_add_remote_form();
+        let add_inner = crate::ui::add_remote_inner_rect(anchor_area(&model, &compositor, 80, 24))
+            .expect("modal fits");
+        let pick = crate::ui::add_remote_pick_button_rect(add_inner);
+        assert_eq!(
+            compositor.hit_test(&model, pick.x, pick.y, 80, 24),
+            Some(SidebarHitTarget::OpenSshHostPicker)
+        );
+
+        // Open the picker; its row + button hit geometry must equal the shared render geometry.
+        let hosts = vec![
+            crate::ssh_config::SshConfigHost {
+                alias: "alpha".into(),
+                hostname: Some("a.example.com".into()),
+                user: Some("root".into()),
+            },
+            crate::ssh_config::SshConfigHost {
+                alias: "beta".into(),
+                hostname: Some("b.example.com".into()),
+                user: None,
+            },
+        ];
+        model.open_ssh_host_picker(hosts, &[]);
+
+        let inner =
+            crate::ui::ssh_host_picker_inner_rect(anchor_area(&model, &compositor, 80, 24), 2)
+                .expect("modal fits");
+        let row0 = crate::ui::ssh_host_picker_row_rect(inner, 0);
+        assert_eq!(
+            compositor.hit_test(&model, row0.x, row0.y, 80, 24),
+            Some(SidebarHitTarget::SshHostPickerRow { index: 0 })
+        );
+        let row1 = crate::ui::ssh_host_picker_row_rect(inner, 1);
+        assert_eq!(
+            compositor.hit_test(&model, row1.x, row1.y, 80, 24),
+            Some(SidebarHitTarget::SshHostPickerRow { index: 1 })
+        );
+        let (add, cancel) = crate::ui::ssh_host_picker_button_rects(inner);
+        assert_eq!(
+            compositor.hit_test(&model, add.x, add.y, 80, 24),
+            Some(SidebarHitTarget::SshHostPickerConfirm)
+        );
+        assert_eq!(
+            compositor.hit_test(&model, cancel.x, cancel.y, 80, 24),
+            Some(SidebarHitTarget::SshHostPickerCancel)
         );
     }
 
