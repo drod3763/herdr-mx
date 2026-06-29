@@ -476,10 +476,16 @@ mod tests {
         assert_eq!(prod.hostname.as_deref(), Some("10.0.0.5"));
         assert_eq!(prod.user.as_deref(), Some("deploy"));
         // The include's own trailing Host is captured with its HostName.
-        let extra = hosts.iter().find(|h| h.alias == "extra").expect("extra row");
+        let extra = hosts
+            .iter()
+            .find(|h| h.alias == "extra")
+            .expect("extra row");
         assert_eq!(extra.hostname.as_deref(), Some("e.host"));
         // After the include returns, the including file's next Host is its own block.
-        let plain = hosts.iter().find(|h| h.alias == "plain").expect("plain row");
+        let plain = hosts
+            .iter()
+            .find(|h| h.alias == "plain")
+            .expect("plain row");
         assert_eq!(plain.hostname.as_deref(), Some("p.host"));
     }
 
