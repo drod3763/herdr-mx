@@ -10,7 +10,7 @@ use std::process::{Command, Output, Stdio};
 use serde::Deserialize;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, OnceLock,
+    Arc,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -288,11 +288,11 @@ impl SshTarget {
         &self.destination
     }
 
-    /// Build the transport command for `remote_command`, resolving the process-wide transport
-    /// spec from config once. Defaults to the built-in `ssh` transport; a `[remote.transport]`
-    /// config entry swaps in a user-defined program + arg template instead.
+    /// Build the transport command for `remote_command`, resolving the transport spec from config
+    /// for this build. Defaults to the built-in `ssh` transport; a `[remote.transport]` config
+    /// entry swaps in a user-defined program + arg template instead.
     fn command(&self, remote_command: &str) -> Command {
-        self.build_command(remote_command, resolved_transport())
+        self.build_command(remote_command, &resolved_transport())
     }
 
     /// Build `ssh <options...> -T <destination> <remote_command>`. `-T` (disable pseudo-tty) is
@@ -392,13 +392,13 @@ impl TransportSpec {
     }
 }
 
-/// The transport spec for this process, resolved from config on first use. Transport selection is
-/// a launch-time concern that does not change mid-session, so caching avoids re-reading config on
-/// every remote command while still letting all `SshTarget` call sites (including reconnects)
-/// share one spec.
-fn resolved_transport() -> &'static TransportSpec {
-    static SPEC: OnceLock<TransportSpec> = OnceLock::new();
-    SPEC.get_or_init(|| TransportSpec::from_config(&crate::config::Config::load().config.remote))
+/// The transport spec, resolved fresh from config for each command build. Like the client's
+/// keybinding resolution (`client_navigation_keybinds`), this re-reads `Config::load()` rather than
+/// caching so a live config reload (`herdr server reload-config`) is naturally picked up by
+/// subsequent remote operations and reconnects. Command builds are rare relative to ssh spawn cost,
+/// so the per-build config read is negligible.
+fn resolved_transport() -> TransportSpec {
+    TransportSpec::from_config(&crate::config::Config::load().config.remote)
 }
 
 /// How `prepare_remote_herdr` / `ensure_remote_server_ready` resolve the install + restart
