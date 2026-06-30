@@ -3463,36 +3463,47 @@ fn spawn_remote_update_for(
     server_id: &supervisor::ServerId,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
-    let ssh_target = state.supervisor_model.as_ref().and_then(|model| {
-        model
-            .server_ssh_target(server_id)
-            .and_then(|(destination, options)| {
-                crate::remote::SshTarget::resolved(destination, options).ok()
-            })
-    });
-    match ssh_target {
-        Some(ssh_target) => {
-            if let Some(model) = &mut state.supervisor_model {
-                model.clear_update_outcome(server_id);
-                model.set_update_progress(server_id, Some("starting update…".to_string()));
-            }
-            state.update_outcome_expiry.remove(server_id);
-            spawn_client_update_remote(
-                server_id.clone(),
-                ssh_target,
-                event_tx,
-                &mut state.pending_update_remote,
+    // Three-way: a non-ssh (local) remote has nothing to reinstall over ssh; an ssh remote whose
+    // custom transport config is invalid is a genuine update failure (don't misreport it as
+    // "non-ssh"); otherwise resolve the transport and run the update.
+    let ssh_endpoint = state
+        .supervisor_model
+        .as_ref()
+        .and_then(|model| model.server_ssh_target(server_id));
+    let Some((destination, options)) = ssh_endpoint else {
+        if let Some(model) = &mut state.supervisor_model {
+            model.set_update_progress(
+                server_id,
+                Some("update is only available for ssh remotes".to_string()),
             );
         }
-        None => {
-            if let Some(model) = &mut state.supervisor_model {
-                model.set_update_progress(
-                    server_id,
-                    Some("update is only available for ssh remotes".to_string()),
-                );
-            }
+        return;
+    };
+    let ssh_target = match crate::remote::SshTarget::resolved(destination, options) {
+        Ok(ssh_target) => ssh_target,
+        Err(err) => {
+            // Surface an invalid custom transport as a terminal update failure (✗ outcome, failure
+            // TTL, and auto-update suppression via `apply_update_remote_finished`) instead of the
+            // wrong "non-ssh" message, which would also let the auto-update sweep retry every tick.
+            let _ = event_tx.try_send(ClientLoopEvent::UpdateRemoteFinished {
+                server_id: server_id.clone(),
+                result: Err(format!("transport config error: {err}")),
+                elapsed: Duration::ZERO,
+            });
+            return;
         }
+    };
+    if let Some(model) = &mut state.supervisor_model {
+        model.clear_update_outcome(server_id);
+        model.set_update_progress(server_id, Some("starting update…".to_string()));
     }
+    state.update_outcome_expiry.remove(server_id);
+    spawn_client_update_remote(
+        server_id.clone(),
+        ssh_target,
+        event_tx,
+        &mut state.pending_update_remote,
+    );
 }
 
 /// #61: with per-remote auto-update enabled, push THIS client's build onto every connected secondary
@@ -9055,6 +9066,55 @@ mod tests {
             state.pending_update_remote.is_empty(),
             "a failure-suppressed host is not auto-retried"
         );
+    }
+
+    #[test]
+    fn spawn_remote_update_surfaces_invalid_transport_as_failure() {
+        // An ssh remote whose custom transport config is invalid must produce a terminal update
+        // failure (UpdateRemoteFinished(Err)), not the "non-ssh remote" message — otherwise the
+        // auto-update sweep retries it every tick with the wrong diagnosis.
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-it".into(),
+            name: "it".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                target: "it-host".into(),
+                args: Vec::new(),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+            auto_update: true,
+        });
+        let mut state = test_client_state_with_model(model);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir =
+            std::env::temp_dir().join(format!("herdr-update-transport-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"ssh\"\nargs = [\"{host}\"]\n",
+        )
+        .expect("write invalid-template config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+
+        spawn_remote_update_for(&mut state, &remote, &event_tx);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match event_rx.try_recv() {
+            Ok(ClientLoopEvent::UpdateRemoteFinished {
+                server_id, result, ..
+            }) => {
+                assert_eq!(server_id, remote);
+                assert!(result.is_err(), "expected a failure result");
+            }
+            _ => panic!("expected UpdateRemoteFinished(Err) for invalid transport"),
+        }
     }
 
     #[test]
