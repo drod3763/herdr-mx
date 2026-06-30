@@ -1929,16 +1929,20 @@ impl ClientSupervisorModel {
     }
 
     /// Open the picker from a completed `remote.ssh_config_hosts` fetch, but ONLY when the Add Remote
-    /// overlay is still the active overlay — i.e. this is the fetch the user launched from its button.
-    /// A late or duplicate fetch result (the user already closed the overlay, or a picker is already
-    /// open from a double-click) is dropped so the picker never pops up unexpectedly or resets an
-    /// in-progress selection. Returns whether it opened.
+    /// overlay is still open with THIS fetch still in flight and no manual add in progress — i.e. the
+    /// fetch the user launched from the button, uninterrupted. Dropped otherwise: the overlay was
+    /// closed, a picker is already open (double-click), or the user submitted a manual add while the
+    /// fetch was pending (replacing that in-progress overlay would hide its progress/error). Returns
+    /// whether it opened.
     pub(crate) fn open_ssh_host_picker_if_adding(
         &mut self,
         hosts: Vec<crate::ssh_config::SshConfigHost>,
         existing: &[crate::remote_registry::RemoteDefinitionSnapshot],
     ) -> bool {
-        if !matches!(self.client_overlay, ClientOverlayState::AddRemote(_)) {
+        let ready = self
+            .add_remote_form()
+            .is_some_and(|form| form.ssh_fetch_in_flight && !form.in_progress);
+        if !ready {
             return false;
         }
         self.open_ssh_host_picker(hosts, existing);
@@ -6171,7 +6175,7 @@ mod tests {
     fn open_ssh_host_picker_if_adding_only_opens_over_the_add_remote_overlay() {
         // PRRT...WGY: a late/duplicate fetch result must not pop the picker when the user already
         // closed the Add Remote overlay (or a picker is already open). Only the fetch launched from
-        // the still-open Add Remote overlay opens the picker.
+        // the still-open Add Remote overlay (with that fetch in flight) opens the picker.
         let hosts = vec![ssh_host("alpha", None, Some("a.example.com"))];
 
         // No overlay open → the result is dropped.
@@ -6179,9 +6183,10 @@ mod tests {
         assert!(!idle.open_ssh_host_picker_if_adding(hosts.clone(), &[]));
         assert!(idle.ssh_host_picker().is_none());
 
-        // Add Remote overlay open → the picker opens.
+        // Add Remote overlay open with the fetch in flight → the picker opens.
         let mut adding = ClientSupervisorModel::new("local");
         adding.open_add_remote_form();
+        assert!(adding.begin_ssh_host_fetch());
         assert!(adding.open_ssh_host_picker_if_adding(hosts.clone(), &[]));
         assert!(adding.ssh_host_picker().is_some());
 
@@ -6189,6 +6194,24 @@ mod tests {
         // is dropped and does not reset the first picker.
         assert!(!adding.open_ssh_host_picker_if_adding(hosts, &[]));
         assert!(adding.ssh_host_picker().is_some());
+    }
+
+    #[test]
+    fn open_ssh_host_picker_if_adding_is_dropped_once_a_manual_add_starts() {
+        // codex (re-run): clicking `pick`, then submitting the manual add before the fetch returns,
+        // must NOT let the late fetch replace the in-progress Add Remote overlay (which would hide
+        // the add's progress/error). The fetch result is dropped while an add is in progress.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        assert!(model.begin_ssh_host_fetch());
+        model.set_add_remote_in_progress();
+
+        assert!(!model.open_ssh_host_picker_if_adding(vec![ssh_host("a", None, None)], &[]));
+        assert!(model.ssh_host_picker().is_none());
+        assert!(
+            model.add_remote_form().is_some_and(|f| f.in_progress),
+            "the in-progress add overlay stays put"
+        );
     }
 
     #[test]
