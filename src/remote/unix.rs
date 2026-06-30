@@ -488,14 +488,19 @@ fn resolve_transport() -> io::Result<TransportSpec> {
     // config still declares `[remote.transport]` (a transport was intended), and only fall back to
     // built-in ssh when no transport is declared so a typo elsewhere can't bypass a configured one.
     let keep_or_default = || -> io::Result<TransportSpec> {
-        match previous() {
-            Some(spec @ TransportSpec::Custom { .. }) => Ok(spec),
-            _ if config_declares_transport() => Err(io::Error::new(
+        if let Some(spec @ TransportSpec::Custom { .. }) = previous() {
+            return Ok(spec);
+        }
+        match config_declares_transport() {
+            // A transport is declared, or we can't even inspect the (present) config to rule one
+            // out: fail closed rather than bypass a possibly-configured custom transport over ssh.
+            TransportDeclared::Yes | TransportDeclared::Unknown => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "[remote.transport] is configured but config.toml could not be parsed; \
+                "config.toml is degraded and a custom [remote.transport] cannot be ruled out; \
                  refusing to fall back to built-in ssh",
             )),
-            _ => Ok(TransportSpec::Ssh),
+            // No transport configured: a typo elsewhere must not break `--remote`, so use ssh.
+            TransportDeclared::No => Ok(TransportSpec::Ssh),
         }
     };
 
@@ -536,31 +541,57 @@ fn resolve_transport() -> io::Result<TransportSpec> {
     }
 }
 
-/// Whether the config declares a custom transport (`remote.transport`). Used only when the config
-/// fails to parse / its `[remote]` section is invalid, to distinguish a config that intends a custom
-/// transport (fail closed) from one that does not (fall back to ssh).
+/// Whether the config declares a custom transport (`remote.transport`), as a tri-state. `Unknown`
+/// means a present config could not be inspected (read error), which must fail closed rather than be
+/// treated as "no transport declared".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportDeclared {
+    Yes,
+    No,
+    Unknown,
+}
+
+/// Inspect whether the config declares a custom transport (`remote.transport`). Used only when the
+/// config fails to parse / its `[remote]` section is invalid, to distinguish a config that intends a
+/// custom transport (fail closed) from one that does not (fall back to ssh).
 ///
 /// Prefers a structural check: parse the raw text to a `toml::Value` and look up `remote.transport`.
 /// This recognizes every valid TOML spelling — `[remote.transport]`, `[ remote.transport ]`, and the
 /// inline `[remote]` + `transport = { ... }` form — even when the typed `[remote]` section failed to
 /// deserialize (only the structured *typed* config is unavailable then; the raw value still parses).
 /// Falls back to a lenient text scan only when the TOML is too broken to parse to a value at all.
-fn config_declares_transport() -> bool {
+/// Returns `Unknown` when a present config file cannot be read, so the caller fails closed.
+fn config_declares_transport() -> TransportDeclared {
     let path = crate::config::config_path();
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return false;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        // Present but unreadable (permission denied, is-a-directory, transient IO): we cannot rule
+        // out a configured transport. Treat as Unknown so the caller fails closed. A genuinely
+        // absent file means no transport is configured.
+        Err(_) => {
+            return if path.exists() {
+                TransportDeclared::Unknown
+            } else {
+                TransportDeclared::No
+            };
+        }
     };
     if let Ok(value) = content.parse::<toml::Value>() {
-        return value
+        let declared = value
             .get("remote")
             .and_then(|remote| remote.as_table())
             .is_some_and(|remote| remote.contains_key("transport"));
+        return if declared {
+            TransportDeclared::Yes
+        } else {
+            TransportDeclared::No
+        };
     }
     // TOML won't parse to a value (syntax error): best-effort scan. Strip spaces so spaced table
     // headers match, skip comments, and accept either a `[remote.transport]` table or a `transport`
     // key declared under a `[remote]` table.
     let mut in_remote_table = false;
-    content.lines().any(|line| {
+    let scanned = content.lines().any(|line| {
         let trimmed = line.trim();
         if trimmed.starts_with('#') {
             return false;
@@ -574,7 +605,12 @@ fn config_declares_transport() -> bool {
             return false;
         }
         in_remote_table && compact.starts_with("transport=")
-    })
+    });
+    if scanned {
+        TransportDeclared::Yes
+    } else {
+        TransportDeclared::No
+    }
 }
 
 /// How `prepare_remote_herdr` / `ensure_remote_server_ready` resolve the install + restart
@@ -3298,6 +3334,19 @@ mod tests {
         )
         .expect("write inline-transport config");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_fails_closed_on_unreadable_config() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-unr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // Point the config path at a directory: read_to_string fails (present but unreadable), so
+        // a configured transport cannot be ruled out and the resolver must fail closed, not ssh.
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &dir);
         assert!(resolve_transport().is_err());
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
