@@ -592,10 +592,12 @@ fn config_declares_transport() -> TransportDeclared {
             TransportDeclared::No
         };
     }
-    // TOML won't parse to a value (syntax error): best-effort scan. Strip spaces so spaced table
-    // headers match, skip comments, and accept any spelling of a transport declaration: a
-    // `[remote.transport]` table, a top-level dotted key (`remote.transport...`), or a `transport`
-    // key inside a `[remote]` table. Over-detection here only errs toward failing closed.
+    // TOML won't parse to a value (syntax error): best-effort scan. Strip spaces so spelling/spacing
+    // doesn't matter, skip comments, and accept any way a remote transport can be declared: a
+    // `[remote.transport]` table, a top-level dotted key (`remote.transport...`), a `transport` key
+    // inside a `[remote]` table, or a single-line inline table (`remote = { transport = ... }`). The
+    // catch-all — any non-comment line mentioning both `remote` and `transport` — keeps this robust
+    // to TOML spellings the specific checks miss. Over-detection only errs toward failing closed.
     let mut in_remote_table = false;
     let scanned = content.lines().any(|line| {
         let trimmed = line.trim();
@@ -608,6 +610,11 @@ fn config_declares_transport() -> TransportDeclared {
         }
         // Top-level dotted key, e.g. `remote.transport.program = "..."` or `remote.transport = {...}`.
         if compact.starts_with("remote.transport.") || compact.starts_with("remote.transport=") {
+            return true;
+        }
+        // Conservative catch-all: any single line that mentions both `remote` and `transport`
+        // (covers inline `remote = { transport = ... }`, quoted/dotted keys, etc.).
+        if compact.contains("remote") && compact.contains("transport") {
             return true;
         }
         if compact.starts_with('[') {
@@ -3413,6 +3420,25 @@ mod tests {
             "remote.transport.program = \"autossh\"\nremote.transport.args = [\"{host}\", \"{remote_command}\"]\noops = = broken\n",
         )
         .expect("write dotted-transport unparseable config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_fails_closed_on_unparseable_config_with_inline_transport() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-inl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // Transport declared via a top-level inline table, plus a TOML syntax error elsewhere so the
+        // structured parse fails and the fallback scan must still detect the declaration.
+        std::fs::write(
+            &cfg,
+            "remote = { transport = { program = \"corp-wrapper\", args = [\"{host}\", \"{remote_command}\"] } }\noops = = broken\n",
+        )
+        .expect("write inline-transport unparseable config");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
         assert!(resolve_transport().is_err());
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
