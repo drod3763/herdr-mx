@@ -492,7 +492,12 @@ fn resolve_transport() -> io::Result<TransportSpec> {
     //         *custom* transport, else fail closed rather than bypass it over ssh.
     let keep_or_default = || -> io::Result<TransportSpec> {
         match config_declares_transport() {
-            TransportDeclared::No => Ok(TransportSpec::Ssh),
+            TransportDeclared::No => {
+                // Record ssh as the current valid spec so the now-removed custom transport can't be
+                // resurrected by a later invalid-custom config (whose fallback consults `previous`).
+                remember(&TransportSpec::Ssh);
+                Ok(TransportSpec::Ssh)
+            }
             TransportDeclared::Yes | TransportDeclared::Unknown => match previous() {
                 Some(spec @ TransportSpec::Custom { .. }) => Ok(spec),
                 _ => Err(io::Error::new(
@@ -3381,6 +3386,15 @@ mod tests {
             resolve_transport().expect("ssh fallback"),
             TransportSpec::Ssh
         );
+
+        // After the transport was removed (cache now ssh, not the old custom), adding an invalid
+        // custom transport must fail closed — the stale custom must not be resurrected.
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\"]\n",
+        )
+        .expect("write invalid-template config");
+        assert!(resolve_transport().is_err());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
