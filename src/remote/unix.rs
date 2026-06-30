@@ -16,6 +16,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
+/// Grace period after the local stream closes before a bridge transport that ignores stdin EOF is
+/// killed as a process group, so a disconnect can't leave the transport (e.g. autossh) running.
+const BRIDGE_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
 const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -2795,6 +2798,7 @@ fn bridge_connection(
     session_name: &str,
     kind: RemoteBridgeKind,
 ) -> io::Result<()> {
+    use std::os::unix::process::CommandExt as _;
     let mut command = target.command(&remote_bridge_command(remote_herdr, session_name, kind));
     command
         .stdin(Stdio::piped())
@@ -2803,7 +2807,10 @@ fn bridge_connection(
         // ssh chatter (host-key notices, multiplexing notes, transient warnings) would corrupt /
         // spam the screen. A genuine bridge failure surfaces as a dropped stream → reconnect, and
         // connection-setup errors are already reported by the detect/install phase.
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        // Own process group so a transport that ignores stdin EOF (e.g. autossh) can be killed as a
+        // tree when the local stream closes, instead of outliving the connection.
+        .process_group(0);
 
     let mut child = command.spawn().map_err(|err| {
         io::Error::new(
@@ -2811,6 +2818,7 @@ fn bridge_connection(
             format!("failed to start transport bridge: {err}"),
         )
     })?;
+    let pid = child.id() as i32;
     let mut child_stdin = child.stdin.take().ok_or_else(|| {
         io::Error::new(io::ErrorKind::BrokenPipe, "transport bridge stdin missing")
     })?;
@@ -2820,15 +2828,49 @@ fn bridge_connection(
     let mut stream_to_child = stream.try_clone()?;
     let mut child_to_stream = stream;
 
+    // The upload thread reads from the local stream; when it returns, the local side hit EOF/error
+    // (the client disconnected). Signal that so the watchdog can stop a transport that keeps its
+    // child alive past the disconnect.
+    let local_closed = Arc::new(AtomicBool::new(false));
+    let upload_closed = Arc::clone(&local_closed);
     let upload = thread::spawn(move || {
         let _ = copy_flush(&mut stream_to_child, &mut child_stdin);
+        // Drop child_stdin (closing it → remote EOF) and flag the disconnect.
+        drop(child_stdin);
+        upload_closed.store(true, Ordering::SeqCst);
     });
     let download = thread::spawn(move || {
         let _ = copy_flush(&mut child_stdout, &mut child_to_stream);
         let _ = child_to_stream.shutdown(std::net::Shutdown::Write);
     });
 
+    // Watchdog: once the local stream has closed, give the transport a grace window to exit on its
+    // own (a well-behaved transport sees stdin EOF and quits); if it ignores that and keeps the
+    // child alive, SIGKILL the whole transport group so a disconnect can't leak it across reconnects.
+    let watchdog_done = Arc::new(AtomicBool::new(false));
+    let watchdog_finished = Arc::clone(&watchdog_done);
+    let watchdog = thread::spawn(move || loop {
+        if watchdog_finished.load(Ordering::SeqCst) {
+            return;
+        }
+        if local_closed.load(Ordering::SeqCst) {
+            thread::sleep(BRIDGE_SHUTDOWN_GRACE);
+            if !watchdog_finished.load(Ordering::SeqCst) {
+                // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            return;
+        }
+        thread::sleep(Duration::from_millis(200));
+    });
+
     let status = child.wait()?;
+    // Child has exited (cleanly, because the remote closed, or because the watchdog killed it):
+    // release the watchdog and join the workers.
+    watchdog_done.store(true, Ordering::SeqCst);
+    let _ = watchdog.join();
     let _ = upload.join();
     let _ = download.join();
 
