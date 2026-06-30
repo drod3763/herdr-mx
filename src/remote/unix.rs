@@ -484,23 +484,23 @@ fn resolve_transport() -> io::Result<TransportSpec> {
         }
     };
     // The transport-section state is indeterminate (config won't parse, or its `[remote]` section
-    // is invalid): keep a previously valid *custom* transport; otherwise fail closed when the raw
-    // config still declares `[remote.transport]` (a transport was intended), and only fall back to
-    // built-in ssh when no transport is declared so a typo elsewhere can't bypass a configured one.
+    // is invalid). Decide from what the *current* config declares — checked before any cached value
+    // so a transport the user has since removed is not reused:
+    // - No  → no transport declared now: use built-in ssh (a typo elsewhere must not break it, and a
+    //         stale cached custom transport must not outlive its removal).
+    // - Yes/Unknown → a transport is declared (or can't be ruled out): keep a previously valid
+    //         *custom* transport, else fail closed rather than bypass it over ssh.
     let keep_or_default = || -> io::Result<TransportSpec> {
-        if let Some(spec @ TransportSpec::Custom { .. }) = previous() {
-            return Ok(spec);
-        }
         match config_declares_transport() {
-            // A transport is declared, or we can't even inspect the (present) config to rule one
-            // out: fail closed rather than bypass a possibly-configured custom transport over ssh.
-            TransportDeclared::Yes | TransportDeclared::Unknown => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "config.toml is degraded and a custom [remote.transport] cannot be ruled out; \
-                 refusing to fall back to built-in ssh",
-            )),
-            // No transport configured: a typo elsewhere must not break `--remote`, so use ssh.
             TransportDeclared::No => Ok(TransportSpec::Ssh),
+            TransportDeclared::Yes | TransportDeclared::Unknown => match previous() {
+                Some(spec @ TransportSpec::Custom { .. }) => Ok(spec),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "config.toml is degraded and a custom [remote.transport] cannot be ruled out; \
+                     refusing to fall back to built-in ssh",
+                )),
+            },
         }
     };
 
@@ -3162,9 +3162,14 @@ mod tests {
         // A valid custom transport resolves and is remembered as last-valid.
         assert_eq!(resolve_transport().expect("transport resolves"), valid);
 
-        // A later malformed edit must not silently downgrade the active transport to ssh:
-        // resolution keeps the last valid spec instead of falling back to config defaults.
-        std::fs::write(&cfg, "this is = not [[[ valid toml").expect("write broken config");
+        // A later malformed edit that still declares the transport must not silently downgrade the
+        // active transport to ssh: resolution keeps the last valid spec. (The config remains
+        // unparseable here — unterminated array — but the `[remote.transport]` stanza is present.)
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\n",
+        )
+        .expect("write broken config that still declares transport");
         assert_eq!(resolve_transport().expect("transport resolves"), valid);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -3224,11 +3229,15 @@ mod tests {
         };
         assert_eq!(resolve_transport().expect("transport resolves"), valid);
 
-        // Valid TOML whose `[remote]` section fails to deserialize (bool field given a string):
-        // load_live_config returns Ok with `remote` in invalid_sections and config.remote default.
-        // The transport must be kept, not overwritten with ssh derived from the default section.
-        std::fs::write(&cfg, "[remote]\nmanage_ssh_config = \"nope\"\n")
-            .expect("write invalid remote section");
+        // Valid TOML whose `[remote]` section fails to deserialize (bool field given a string) while
+        // still declaring the transport: load_live_config returns Ok with `remote` in
+        // invalid_sections and config.remote default. The transport must be kept, not overwritten
+        // with ssh derived from the default section.
+        std::fs::write(
+            &cfg,
+            "[remote]\nmanage_ssh_config = \"nope\"\n[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write invalid remote section that still declares transport");
         assert_eq!(resolve_transport().expect("transport resolves"), valid);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -3340,6 +3349,39 @@ mod tests {
         .expect("write inline-transport config");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
         assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_drops_cached_custom_when_config_removes_transport() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(
+            resolve_transport().expect("custom resolves"),
+            TransportSpec::Custom {
+                program: "autossh".into(),
+                args: vec!["{host}".into(), "{remote_command}".into()],
+            }
+        );
+
+        // The user removed `[remote.transport]` but left an unrelated TOML syntax error. The current
+        // config declares no transport, so resolution must fall back to ssh — not reuse the cached
+        // custom transport, which could route to a now-unintended host.
+        std::fs::write(&cfg, "oops = = broken\n").expect("write transport-less broken config");
+        assert_eq!(
+            resolve_transport().expect("ssh fallback"),
+            TransportSpec::Ssh
+        );
+
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
     }
