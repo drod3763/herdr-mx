@@ -2551,9 +2551,15 @@ trap - EXIT
 /// bridge is intentionally not bounded — a roaming transport's persistence there is desired.
 const SSH_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Run a one-shot command to completion, bounded by `deadline`. On timeout the child and its whole
-/// process group are SIGKILLed (a custom transport may have spawned ssh children) and a `TimedOut`
-/// error is returned. Probe output is small, so reading the pipes after exit cannot deadlock.
+/// Cap on retained probe output (per stream). Normal probe output (uname, version strings) is tiny;
+/// this only bounds a transport that floods stdout/stderr.
+const PROBE_OUTPUT_CAP: usize = 64 * 1024;
+
+/// Run a one-shot command to completion, bounded by `deadline`. stdout and stderr are drained
+/// concurrently (so a chatty transport that fills a pipe buffer can't block its own exit — the bug
+/// the install path also guards against), retaining only a bounded tail of each. On timeout the
+/// child and its whole process group are SIGKILLed (a custom transport may have spawned ssh
+/// children) and a `TimedOut` error is returned; killing the child unblocks the drain/wait.
 fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Output> {
     use std::os::unix::process::CommandExt as _;
     // Put the child in its own process group so the whole transport tree can be killed on timeout.
@@ -2564,30 +2570,64 @@ fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Ou
         .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let pid = child.id() as i32;
-    let start = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output();
-        }
-        if start.elapsed() >= deadline {
-            // SIGKILL the process group (negative pid), then reap the direct child.
-            // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
+
+    // Drain both pipes concurrently while the deadline runs; never read after exit only.
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "probe stdout missing"))?;
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "probe stderr missing"))?;
+    let stdout_reader =
+        thread::spawn(move || read_to_capped_tail(&mut child_stdout, PROBE_OUTPUT_CAP));
+    let stderr_reader =
+        thread::spawn(move || read_to_capped_tail(&mut child_stderr, PROBE_OUTPUT_CAP));
+
+    // Watchdog: SIGKILL the process group at the deadline. Killing the child makes the pipes hit EOF
+    // and `wait` return, so a hung/looping transport can't block forever.
+    let done = Arc::new(AtomicBool::new(false));
+    let watchdog_done = Arc::clone(&done);
+    let watchdog = thread::spawn(move || {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            if watchdog_done.load(Ordering::SeqCst) {
+                return false;
             }
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "remote transport command exceeded {}s and was killed (unreachable host, or a \
-                     custom [remote.transport] that does not time out)",
-                    deadline.as_secs()
-                ),
-            ));
+            thread::sleep(Duration::from_millis(50));
         }
-        thread::sleep(Duration::from_millis(50));
+        if watchdog_done.load(Ordering::SeqCst) {
+            return false;
+        }
+        // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        true
+    });
+
+    let status = child.wait()?;
+    done.store(true, Ordering::SeqCst);
+    let timed_out = watchdog.join().unwrap_or(false);
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+
+    if timed_out {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "remote transport command exceeded {}s and was killed (unreachable host, or a \
+                 custom [remote.transport] that does not time out)",
+                deadline.as_secs()
+            ),
+        ));
     }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn ssh_output(target: &SshTarget, command: &str) -> io::Result<Output> {
@@ -3611,6 +3651,23 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "must return promptly after the deadline, not wait for the command"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_drains_chatty_output_without_timing_out() {
+        // A healthy command that writes far more than the OS pipe buffer then exits must succeed:
+        // the pipes are drained concurrently, so the child is never blocked into the deadline+kill.
+        // (Before concurrent draining this deadlocked and was wrongly reported as a timeout.)
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("yes | head -c 200000; exit 0");
+        let output = run_bounded_output(command, Duration::from_secs(10))
+            .expect("a chatty but healthy command must succeed");
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout.len(),
+            PROBE_OUTPUT_CAP,
+            "stdout should be retained up to the cap"
         );
     }
 
