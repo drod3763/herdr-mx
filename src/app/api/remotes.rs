@@ -94,6 +94,26 @@ impl App {
         )
     }
 
+    /// #11: deferred variant of `remote.ssh_config_hosts`. `discover_hosts()` is bounded but does
+    /// blocking filesystem IO (up to 256 files / 65k dir-entry scans), and it touches no `App` state,
+    /// so the real socket path runs it on a worker thread and answers the request channel directly —
+    /// keeping the synchronous app loop free for input, rendering, and other API/remote-lifecycle
+    /// work. Mirrors the deferred worktree APIs, but needs no completion event since there is no
+    /// state mutation to fold back onto the loop. Returns `true` (always handled).
+    pub(crate) fn handle_deferred_remote_ssh_config_hosts(
+        &mut self,
+        request: crate::api::schema::Request,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) -> bool {
+        let id = request.id;
+        std::thread::spawn(move || {
+            let hosts = crate::ssh_config::discover_hosts();
+            let response = encode_success(id, ResponseResult::SshConfigHosts { hosts });
+            let _ = respond_to.send(response);
+        });
+        true
+    }
+
     /// #61: persist a remote's per-remote auto-update flag. Mirrors `handle_remote_set_enabled`;
     /// reuses the `RemoteEnabledChanged` success body (it just carries the updated definition — the
     /// client re-syncs the flag off the periodic `remote.list`, not this response).
@@ -454,6 +474,40 @@ mod tests {
         assert_eq!(hosts[0]["alias"], "prod");
         assert_eq!(hosts[0]["hostname"], "10.0.0.5");
         assert_eq!(hosts[0]["user"], "deploy");
+        assert!(!app.state.session_dirty, "discovery must not dirty session");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_ssh_config_hosts_answers_off_loop_via_channel() {
+        // #11 (codex iter 4): the real socket path defers discovery to a worker thread and answers
+        // the request channel directly, so it never blocks the synchronous app loop. The handler
+        // returns true (handled) and a full response lands on the channel.
+        let _env_lock = crate::ssh_config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("herdr-api-ssh-cfg-deferred");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config");
+        std::fs::write(&config_path, "Host prod\n  HostName 10.0.0.5\n").unwrap();
+        let _guard = SetEnvGuard::set(crate::ssh_config::SSH_CONFIG_PATH_ENV_VAR, &config_path);
+
+        let mut app = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request: Request = serde_json::from_str(
+            r#"{"id":"hosts","method":"remote.ssh_config_hosts","params":{}}"#,
+        )
+        .unwrap();
+        assert!(app.handle_deferred_remote_ssh_config_hosts(request, tx));
+
+        let raw = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deferred discovery should answer the channel");
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["type"], "ssh_config_hosts");
+        assert_eq!(response["result"]["hosts"][0]["alias"], "prod");
         assert!(!app.state.session_dirty, "discovery must not dirty session");
 
         let _ = std::fs::remove_dir_all(&dir);
