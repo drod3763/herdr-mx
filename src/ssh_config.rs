@@ -77,7 +77,11 @@ pub fn discover_hosts() -> Vec<SshConfigHost> {
     };
     let mut hosts = Vec::new();
     let mut seen_aliases = HashSet::new();
-    let mut visited_files = HashSet::new();
+    // Cycle guard = the files currently on the include recursion stack (not a global visited set, so
+    // a shared include reused under multiple `Host` blocks still applies to each); `files_read`
+    // bounds the total reads.
+    let mut include_stack = HashSet::new();
+    let mut files_read = 0usize;
     // The active `Host` block, shared across `Include` boundaries so a per-host include attributes
     // its directives to the including file's block (OpenSSH inline-insertion semantics).
     let mut current_aliases = Vec::new();
@@ -88,7 +92,8 @@ pub fn discover_hosts() -> Vec<SshConfigHost> {
         0,
         &mut hosts,
         &mut seen_aliases,
-        &mut visited_files,
+        &mut include_stack,
+        &mut files_read,
         &mut current_aliases,
         &mut glob_scans_remaining,
     );
@@ -129,7 +134,12 @@ fn parse_file(
     depth: usize,
     hosts: &mut Vec<SshConfigHost>,
     seen_aliases: &mut HashSet<String>,
-    visited_files: &mut HashSet<PathBuf>,
+    // Canonical paths of the files CURRENTLY being parsed (the include recursion stack), so a real
+    // cycle (A includes B includes A) is caught while a shared include reused under several `Host`
+    // blocks is still re-applied each time — matching OpenSSH's textual-insertion semantics.
+    include_stack: &mut HashSet<PathBuf>,
+    // Total files actually read this discovery pass; bounds re-reads of a shared include.
+    files_read: &mut usize,
     // The aliases of the current `Host` block, awaiting `HostName`/`User` lines beneath them.
     // Threaded through `Include` so the active block is shared across the include boundary (OpenSSH
     // inserts included contents inline): a per-host include attributes to the including block, and a
@@ -138,16 +148,16 @@ fn parse_file(
     // Request-wide remaining glob-scan budget (see `MAX_TOTAL_GLOB_SCANS`).
     glob_scans_remaining: &mut usize,
 ) {
-    // Canonicalize so the same file reached via different relative paths is only visited once
-    // (cycle guard). Fall back to the raw path if canonicalization fails (e.g. file is missing).
+    // Canonicalize so a cycle is detected regardless of how the same file is reached.
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !visited_files.insert(canonical) {
+    if include_stack.contains(&canonical) {
+        // Recursion cycle — this file is already an ancestor on the include stack.
         return;
     }
     // Bound discovery: it runs synchronously on the server loop. Cap the total files read across a
     // glob-fanned `Include` tree, require a regular file (a FIFO/device would block `read_to_string`
     // forever; a directory/socket is not a config), and skip files larger than the per-file cap.
-    if visited_files.len() > MAX_CONFIG_FILES {
+    if *files_read >= MAX_CONFIG_FILES {
         return;
     }
     let Ok(meta) = std::fs::metadata(path) else {
@@ -163,6 +173,8 @@ fn parse_file(
     let Ok(contents) = std::fs::read_to_string(path) else {
         return;
     };
+    *files_read += 1;
+    include_stack.insert(canonical.clone());
 
     for raw_line in contents.lines() {
         let Some((keyword, rest)) = split_keyword(raw_line) else {
@@ -225,7 +237,7 @@ fn parse_file(
                 // skip Include expansion — expanding more would be wasted work that could pin the
                 // synchronous app-loop discovery. Use `continue`, not `break`: the rest of THIS file
                 // (e.g. later `Host` blocks) must still be parsed.
-                if visited_files.len() >= MAX_CONFIG_FILES || *glob_scans_remaining == 0 {
+                if *files_read >= MAX_CONFIG_FILES || *glob_scans_remaining == 0 {
                     continue;
                 }
                 for included in resolve_includes(rest, glob_scans_remaining) {
@@ -234,7 +246,8 @@ fn parse_file(
                         depth + 1,
                         hosts,
                         seen_aliases,
-                        visited_files,
+                        include_stack,
+                        files_read,
                         current_aliases,
                         glob_scans_remaining,
                     );
@@ -243,6 +256,9 @@ fn parse_file(
             _ => {}
         }
     }
+    // Pop this file off the include stack so it can be re-included under a later, non-recursive
+    // context (OpenSSH re-inserts a shared include each time it appears).
+    include_stack.remove(&canonical);
 }
 
 /// Split a config line into `(lowercased keyword, remainder)`, dropping comments and blank lines.
@@ -389,6 +405,7 @@ fn glob_expand(pattern: &Path, glob_scans_remaining: &mut usize) -> Vec<PathBuf>
 /// and non-recursive, so a pathological pattern from a local `Include` (e.g. `*a*a*a*b`) applied to
 /// a long filename cannot blow up CPU/stack the way naive recursive backtracking would, while
 /// discovery runs synchronously on the app loop.
+#[cfg(test)]
 fn glob_match(pattern: &str, candidate: &str) -> bool {
     glob_match_chars(&pattern.chars().collect::<Vec<_>>(), candidate)
 }
@@ -636,6 +653,27 @@ mod tests {
         let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
         assert!(aliases.contains(&"alpha".to_string()));
         assert!(aliases.contains(&"bravo".to_string()));
+    }
+
+    #[test]
+    fn shared_include_reused_under_multiple_hosts_applies_to_each() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex (re-run): OpenSSH re-inserts a shared Include each time it appears. A file pulled in
+        // under two Host blocks must attribute its HostName/User to BOTH, not only the first (the old
+        // global visited-set guard dropped it for the second block).
+        let fixture = ConfigFixture::new(
+            "shared-include",
+            "Host a\n  Include config.d/common\n\nHost b\n  Include config.d/common\n",
+        );
+        fixture.write_extra("config.d/common", "HostName shared.host\n  User shared\n");
+        let hosts = discover_hosts();
+
+        let a = hosts.iter().find(|h| h.alias == "a").expect("host a");
+        let b = hosts.iter().find(|h| h.alias == "b").expect("host b");
+        assert_eq!(a.hostname.as_deref(), Some("shared.host"));
+        assert_eq!(a.user.as_deref(), Some("shared"));
+        assert_eq!(b.hostname.as_deref(), Some("shared.host"));
+        assert_eq!(b.user.as_deref(), Some("shared"));
     }
 
     #[test]
