@@ -3823,6 +3823,9 @@ fn classify_provision_failure(err: &ClientError) -> ProvisionFailureDisposition 
         "does not support the remote-bridge subcommands",
         "did not respond to --version",
         "installation cancelled",
+        // An invalid/undeterminable custom [remote.transport]: deterministic, retrying can't fix it
+        // until the config changes. All such resolver errors share this phrase.
+        "refusing to fall back to built-in ssh",
     ];
     if TERMINAL_MARKERS.iter().any(|marker| text.contains(marker)) {
         ProvisionFailureDisposition::Stop
@@ -7295,6 +7298,9 @@ mod tests {
             "installed remote herdr at \"$HOME/.local/bin/herdr\", but it reports `herdr 0.6.9`, not version 0.6.10-mx.1",
             "this mx-channel build (0.6.10-mx.1) cannot seed remotes from the herdr.dev release manifest",
             "remote herdr is incompatible and can't be upgraded in place — update it and retry",
+            // Invalid custom transport config is deterministic: stop instead of reconnect-churning.
+            "[remote.transport] is configured but invalid (args must include a {remote_command} placeholder); refusing to fall back to built-in ssh",
+            "config.toml is degraded and a custom [remote.transport] cannot be ruled out; refusing to fall back to built-in ssh",
         ] {
             let err = ClientError::ConnectionFailed(io::Error::other(terminal));
             assert_eq!(
