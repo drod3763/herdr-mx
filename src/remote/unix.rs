@@ -2460,6 +2460,11 @@ trap - EXIT
         install_suffix = remote_herdr.install_suffix
     );
 
+    // Open the source binary BEFORE starting the remote transport: a failure here must not leave a
+    // spawned child/watchdog behind (the watchdog would later SIGKILL a possibly-reused process
+    // group), and must not let the remote `cat` see an immediate EOF and install an empty file.
+    let mut source = File::open(source_path)?;
+
     // Capture (never inherit) the install child's output: this also runs inside the in-client
     // add-remote worker, where the raw-mode TUI owns the terminal, so any inherited byte (ssh's
     // "Permanently added … to known hosts" warning, remote shell chatter) scrolls/garbles the
@@ -2522,16 +2527,17 @@ trap - EXIT
         }
     });
 
-    let mut source = File::open(source_path)?;
     let copy_result = io::copy(&mut source, &mut child_stdin).map(|_| ());
     // Close stdin so the remote `cat` sees EOF and the child can exit.
     drop(child_stdin);
 
-    let status = child.wait()?;
-    // Cancel the watchdog now that the child has exited, then join it and the stderr drain.
+    // Reap the child, but cancel and join the watchdog BEFORE propagating any error, so the watchdog
+    // can never outlive this function and later SIGKILL a reused process group.
+    let wait_result = child.wait();
     install_done.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
     let stderr = stderr_reader.join().unwrap_or_default();
+    let status = wait_result?;
     copy_result?;
 
     if status.success() {
