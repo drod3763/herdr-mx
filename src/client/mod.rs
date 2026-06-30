@@ -6184,11 +6184,11 @@ async fn run_client_loop(
                 match result {
                     Ok(hosts) => {
                         if let Some(model) = &mut state.supervisor_model {
-                            model.clear_ssh_host_fetch();
                             let existing = model.synced_remotes().to_vec();
-                            // Only open if the Add Remote overlay the fetch was launched from is still
-                            // active — a late/duplicate result must not pop the picker unexpectedly.
-                            model.open_ssh_host_picker_if_adding(hosts, &existing);
+                            // Atomic open-then-clear: only opens if the Add Remote overlay the fetch
+                            // was launched from is still active and uninterrupted; otherwise drops the
+                            // late/duplicate result and clears the in-flight flag.
+                            model.complete_ssh_host_fetch(hosts, &existing);
                         }
                     }
                     Err(err) => {

@@ -1728,6 +1728,23 @@ impl ClientSupervisorModel {
         }
     }
 
+    /// Consume a successful ssh-config fetch atomically: open the picker if this is still the
+    /// in-flight fetch on an uninterrupted Add Remote overlay, otherwise clear the in-flight flag.
+    /// Opening MUST happen while `ssh_fetch_in_flight` is still set (the open gate requires it), so
+    /// this keeps the open-before-clear order in one place — a caller can't reintroduce the
+    /// clear-before-open bug that silently dropped every successful fetch. Returns whether it opened.
+    pub(crate) fn complete_ssh_host_fetch(
+        &mut self,
+        hosts: Vec<crate::ssh_config::SshConfigHost>,
+        existing: &[crate::remote_registry::RemoteDefinitionSnapshot],
+    ) -> bool {
+        let opened = self.open_ssh_host_picker_if_adding(hosts, existing);
+        if !opened {
+            self.clear_ssh_host_fetch();
+        }
+        opened
+    }
+
     pub(crate) fn add_remote_form(&self) -> Option<&AddRemoteForm> {
         match &self.client_overlay {
             ClientOverlayState::AddRemote(form) => Some(form),
@@ -6194,6 +6211,32 @@ mod tests {
         // is dropped and does not reset the first picker.
         assert!(!adding.open_ssh_host_picker_if_adding(hosts, &[]));
         assert!(adding.ssh_host_picker().is_some());
+    }
+
+    #[test]
+    fn complete_ssh_host_fetch_opens_the_picker_on_success() {
+        // codex (re-run): the SshHostsFetched Ok handler used to clear the in-flight flag BEFORE
+        // opening, but the open gate requires the flag set — so every successful fetch was dropped.
+        // complete_ssh_host_fetch opens first (flag still set), then clears, so success opens the
+        // picker; an intervening manual add still drops the result and clears the flag.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        assert!(model.begin_ssh_host_fetch());
+        assert!(model.complete_ssh_host_fetch(vec![ssh_host("a", None, None)], &[]));
+        assert!(
+            model.ssh_host_picker().is_some(),
+            "a successful fetch must open the picker"
+        );
+
+        let mut racing = ClientSupervisorModel::new("local");
+        racing.open_add_remote_form();
+        assert!(racing.begin_ssh_host_fetch());
+        racing.set_add_remote_in_progress();
+        assert!(!racing.complete_ssh_host_fetch(vec![ssh_host("a", None, None)], &[]));
+        assert!(racing.ssh_host_picker().is_none());
+        assert!(racing
+            .add_remote_form()
+            .is_some_and(|f| !f.ssh_fetch_in_flight));
     }
 
     #[test]
