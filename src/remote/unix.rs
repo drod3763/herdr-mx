@@ -2531,12 +2531,14 @@ trap - EXIT
     // Close stdin so the remote `cat` sees EOF and the child can exit.
     drop(child_stdin);
 
-    // Reap the child, but cancel and join the watchdog BEFORE propagating any error, so the watchdog
-    // can never outlive this function and later SIGKILL a reused process group.
+    // Reap the child, then drain stderr while the watchdog is STILL armed: a descendant that
+    // inherited stderr could outlive the direct child and block this join forever, so the deadline
+    // must be able to kill the group first. Only then cancel + join the watchdog (before propagating
+    // any error, so it can't outlive this function and later SIGKILL a reused process group).
     let wait_result = child.wait();
+    let stderr = stderr_reader.join().unwrap_or_default();
     install_done.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
-    let stderr = stderr_reader.join().unwrap_or_default();
     let status = wait_result?;
     copy_result?;
 
@@ -2616,11 +2618,18 @@ fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Ou
         true
     });
 
-    let status = child.wait()?;
-    done.store(true, Ordering::SeqCst);
-    let timed_out = watchdog.join().unwrap_or(false);
+    let wait_result = child.wait();
+    // Keep the watchdog armed THROUGH the pipe drains: if a descendant that inherited stdout/stderr
+    // outlives the direct child (e.g. a wrapper that backgrounds a process), these joins would
+    // otherwise block forever waiting for EOF. With the watchdog still live, the deadline kills the
+    // process group, the descendant dies, the pipes hit EOF, and the joins return. (When the child
+    // exits cleanly with no such descendant, the pipes EOF immediately and `done` is set below
+    // before the deadline, so the watchdog never kills.)
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
+    done.store(true, Ordering::SeqCst);
+    let timed_out = watchdog.join().unwrap_or(false);
+    let status = wait_result?;
 
     if timed_out {
         return Err(io::Error::new(
@@ -2872,13 +2881,20 @@ fn bridge_connection(
         thread::sleep(Duration::from_millis(200));
     });
 
-    let status = child.wait()?;
-    // Child has exited (cleanly, because the remote closed, or because the watchdog killed it):
-    // release the watchdog and join the workers.
+    let wait_result = child.wait();
+    // The bridge child has exited (cleanly because the remote closed, or because the watchdog killed
+    // it). Clear any descendant that inherited the pipes so the copy-thread joins below can't block
+    // forever, then release the watchdog and reap the workers. The leader has exited, so this kill
+    // only reaps lingering group members; an empty group is a harmless ESRCH no-op.
+    // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
     watchdog_done.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
     let _ = upload.join();
     let _ = download.join();
+    let status = wait_result?;
 
     if status.success() {
         Ok(())
@@ -3716,6 +3732,23 @@ mod tests {
             output.stdout.len(),
             PROBE_OUTPUT_CAP,
             "stdout should be retained up to the cap"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_times_out_when_a_descendant_holds_the_pipe() {
+        // The direct child exits immediately but backgrounds a descendant that inherited the pipes.
+        // The deadline must still fire (killing the whole group) instead of the reader joins
+        // blocking forever waiting for EOF from the lingering descendant.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 600 &");
+        let start = Instant::now();
+        let result = run_bounded_output(command, Duration::from_millis(300));
+        let err = result.expect_err("a descendant holding the pipe must hit the deadline");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must return shortly after the deadline, not hang on the reader join"
         );
     }
 
