@@ -3483,13 +3483,15 @@ fn spawn_remote_update_for(
         Ok(ssh_target) => ssh_target,
         Err(err) => {
             // Surface an invalid custom transport as a terminal update failure (✗ outcome, failure
-            // TTL, and auto-update suppression via `apply_update_remote_finished`) instead of the
-            // wrong "non-ssh" message, which would also let the auto-update sweep retry every tick.
-            let _ = event_tx.try_send(ClientLoopEvent::UpdateRemoteFinished {
-                server_id: server_id.clone(),
-                result: Err(format!("transport config error: {err}")),
-                elapsed: Duration::ZERO,
-            });
+            // TTL, and auto-update suppression) instead of the wrong "non-ssh" message, which would
+            // also let the auto-update sweep retry every tick. Mutate state directly rather than via
+            // a best-effort `try_send` so a full event channel can never drop this terminal state.
+            mark_remote_update_failed(
+                state,
+                server_id,
+                &format!("transport config error: {err}"),
+                Instant::now(),
+            );
             return;
         }
     };
@@ -4374,28 +4376,41 @@ fn apply_update_remote_finished(
             schedule_secondary_retry(state, server_id.clone(), 0, now);
         }
         Err(message) => {
-            if let Some(model) = &mut state.supervisor_model {
-                // #61: clear the spinner and surface a clear, lingering failure instead of leaving a
-                // stale "installing…"-looking progress line frozen on the banner (the old behaviour).
-                model.set_update_progress(server_id, None);
-                model.set_update_outcome(
-                    server_id,
-                    crate::app::state::HostUpdateOutcome {
-                        message: format!("✗ update failed: {message}"),
-                        success: false,
-                    },
-                );
-            }
-            state
-                .update_outcome_expiry
-                .insert(server_id.clone(), now + HOST_UPDATE_FAILURE_TTL);
-            // #61: suppress AUTO-update retries for this host — a failed update (e.g. the local build
-            // can't seed its platform) would otherwise re-fire every cadence once the outcome line
-            // expires. The manual menu `update` still works; a deliberate auto-update re-toggle (or a
-            // later success) clears this.
-            state.auto_update_suppressed.insert(server_id.clone());
+            mark_remote_update_failed(state, server_id, &message, now);
         }
     }
+}
+
+/// Apply the terminal "remote update failed" state transition: clear the spinner, leave a lingering
+/// ✗ outcome, set the failure TTL, and suppress auto-update retries for this host. Shared by the
+/// `UpdateRemoteFinished(Err)` handler and the synchronous transport-resolution failure path so the
+/// failure is recorded directly on state and never depends on a best-effort event send.
+fn mark_remote_update_failed(
+    state: &mut ClientState,
+    server_id: &supervisor::ServerId,
+    message: &str,
+    now: Instant,
+) {
+    if let Some(model) = &mut state.supervisor_model {
+        // #61: clear the spinner and surface a clear, lingering failure instead of leaving a stale
+        // "installing…"-looking progress line frozen on the banner.
+        model.set_update_progress(server_id, None);
+        model.set_update_outcome(
+            server_id,
+            crate::app::state::HostUpdateOutcome {
+                message: format!("✗ update failed: {message}"),
+                success: false,
+            },
+        );
+    }
+    state
+        .update_outcome_expiry
+        .insert(server_id.clone(), now + HOST_UPDATE_FAILURE_TTL);
+    // #61: suppress AUTO-update retries for this host — a failed update (e.g. the local build can't
+    // seed its platform) would otherwise re-fire every cadence once the outcome line expires. The
+    // manual menu `update` still works; a deliberate auto-update re-toggle (or a later success)
+    // clears this.
+    state.auto_update_suppressed.insert(server_id.clone());
 }
 
 /// #61: clear any host update-outcome banner line whose display window has elapsed at `now`. The
@@ -9087,7 +9102,7 @@ mod tests {
             auto_update: true,
         });
         let mut state = test_client_state_with_model(model);
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
 
         // nextest isolates each test in its own process (own env var + own last-valid static).
         let dir =
@@ -9106,15 +9121,21 @@ mod tests {
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
 
-        match event_rx.try_recv() {
-            Ok(ClientLoopEvent::UpdateRemoteFinished {
-                server_id, result, ..
-            }) => {
-                assert_eq!(server_id, remote);
-                assert!(result.is_err(), "expected a failure result");
-            }
-            _ => panic!("expected UpdateRemoteFinished(Err) for invalid transport"),
-        }
+        // The failure must be recorded directly on state (terminal outcome + auto-update
+        // suppression), not via a best-effort event that a full channel could drop, and must NOT
+        // start a worker.
+        assert!(
+            state.auto_update_suppressed.contains(&remote),
+            "invalid transport must suppress auto-update retries"
+        );
+        assert!(
+            state.update_outcome_expiry.contains_key(&remote),
+            "invalid transport must record a terminal update outcome"
+        );
+        assert!(
+            !state.pending_update_remote.contains(&remote),
+            "no update worker should be spawned for an invalid transport"
+        );
     }
 
     #[test]
