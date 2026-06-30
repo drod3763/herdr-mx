@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, IsTerminal, Write as _};
+use std::io::{self, IsTerminal, Read as _, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -1149,7 +1149,7 @@ fn prepare_remote_herdr(
     });
     let source = resolve_install_source(&remote_herdr.platform, override_binary)?;
     progress(RemoteProvisionStage::Installing);
-    let install_result = install_remote_herdr(target, &remote_herdr, &source.path);
+    let install_result = install_remote_herdr(target, &remote_herdr, &source.path, progress);
     source.cleanup();
     install_result?;
 
@@ -2411,6 +2411,11 @@ fn confirm_remote_install(
 /// link uploading the ~11 MB binary is not killed mid-transfer.
 const INSTALL_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How often the install upload re-emits its `Installing` progress stage so the client's idle
+/// watchdog (which resets on each stage) doesn't abandon a slow-but-progressing transfer. Must be
+/// comfortably under that idle window (90s).
+const INSTALL_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(15);
+
 /// Cap on retained install stderr. The tail is kept to enrich a failure message; a verbose/looping
 /// custom transport could otherwise grow this without bound.
 const INSTALL_STDERR_TAIL_CAP: usize = 8 * 1024;
@@ -2467,6 +2472,7 @@ fn install_remote_herdr(
     target: &SshTarget,
     remote_herdr: &RemoteHerdr,
     source_path: &Path,
+    progress: &ProgressSink,
 ) -> io::Result<()> {
     // mktemp the staging file rather than a predictable "$dest.tmp.$$": `cat >` follows symlinks, so
     // a guessable name in $HOME could be pre-planted (symlink redirect / pre-created file). mktemp
@@ -2563,7 +2569,32 @@ trap - EXIT
         }
     });
 
-    let copy_result = io::copy(&mut source, &mut child_stdin).map(|_| ());
+    // Stream the binary, beating `progress(Installing)` periodically so the client's idle watchdog
+    // (which resets on each progress stage) does not abandon a slow-but-progressing upload. A genuine
+    // stall stops producing beats, so the idle timeout still fires; the install watchdog above bounds
+    // the absolute time regardless.
+    let mut copy_result = Ok(());
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut last_beat = Instant::now();
+    loop {
+        let read = match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                copy_result = Err(err);
+                break;
+            }
+        };
+        if let Err(err) = child_stdin.write_all(&buffer[..read]) {
+            copy_result = Err(err);
+            break;
+        }
+        if last_beat.elapsed() >= INSTALL_PROGRESS_HEARTBEAT {
+            progress(RemoteProvisionStage::Installing);
+            last_beat = Instant::now();
+        }
+    }
     // Close stdin so the remote `cat` sees EOF and the child can exit.
     drop(child_stdin);
 
