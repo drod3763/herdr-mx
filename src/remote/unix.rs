@@ -477,22 +477,37 @@ fn resolve_transport() -> io::Result<TransportSpec> {
             *guard = Some(spec.clone());
         }
     };
+    // The transport-section state is indeterminate (config won't parse, or its `[remote]` section
+    // is invalid): keep a previously valid *custom* transport; otherwise fail closed when the raw
+    // config still declares `[remote.transport]` (a transport was intended), and only fall back to
+    // built-in ssh when no transport is declared so a typo elsewhere can't bypass a configured one.
+    let keep_or_default = || -> io::Result<TransportSpec> {
+        match previous() {
+            Some(spec @ TransportSpec::Custom { .. }) => Ok(spec),
+            _ if raw_config_declares_transport() => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "[remote.transport] is configured but config.toml could not be parsed; \
+                 refusing to fall back to built-in ssh",
+            )),
+            _ => Ok(TransportSpec::Ssh),
+        }
+    };
 
-    // Config currently fails to parse/read: keep the last spec we resolved successfully. With no
-    // prior valid spec we cannot tell a custom transport was configured, so use built-in ssh.
+    // Config currently fails to parse/read (`load_live_config` returns `Ok(default)` when the file
+    // is absent, `Err` only when a present file fails to read/parse).
     let Ok(loaded) = crate::config::load_live_config() else {
-        return Ok(previous().unwrap_or(TransportSpec::Ssh));
+        return keep_or_default();
     };
     // `load_live_config` returns Ok even when the `[remote]` section fails to deserialize: it
     // records the section in `invalid_sections` and leaves `config.remote` at its default. Deriving
     // a transport from that default would silently drop a configured custom transport, so treat an
-    // invalid `[remote]` section like a parse error and keep the last valid transport.
+    // invalid `[remote]` section the same way.
     if loaded
         .invalid_sections
         .iter()
         .any(|section| section == "remote")
     {
-        return Ok(previous().unwrap_or(TransportSpec::Ssh));
+        return keep_or_default();
     }
     match TransportSpec::from_config(&loaded.config.remote) {
         TransportResolution::Spec(spec) => {
@@ -513,6 +528,23 @@ fn resolve_transport() -> io::Result<TransportSpec> {
             )),
         },
     }
+}
+
+/// Best-effort check of whether the raw config declares a custom transport. Used only when the
+/// config fails to parse / its `[remote]` section is invalid, to distinguish a config that intends
+/// a `[remote.transport]` (fail closed) from one that does not (fall back to ssh). Scans the raw
+/// text for a `[remote.transport]` table header, skipping comment lines, since the structured
+/// config is unavailable in those cases. The inline `transport = { ... }` form is not detected; the
+/// documented form is the `[remote.transport]` table.
+fn raw_config_declares_transport() -> bool {
+    let path = crate::config::config_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    content.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with('#') && trimmed.starts_with("[remote.transport]")
+    })
 }
 
 /// How `prepare_remote_herdr` / `ensure_remote_server_ready` resolve the install + restart
@@ -3174,6 +3206,44 @@ mod tests {
         .expect("write invalid-template config");
         assert!(resolve_transport().is_err());
 
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_errors_on_unparseable_config_declaring_transport() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-unp1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // Config declares [remote.transport] but has a TOML syntax error (unterminated array), so
+        // load_live_config returns Err and the structured transport is unavailable. With no prior
+        // valid transport, fail closed rather than routing the configured transport over ssh.
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\n",
+        )
+        .expect("write unparseable config with transport");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_defaults_ssh_on_unparseable_config_without_transport() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-unp2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // A config that fails to parse but declares no transport must not break `--remote` for the
+        // common no-transport user: fall back to built-in ssh.
+        std::fs::write(&cfg, "oops = = broken\n").expect("write unparseable config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(
+            resolve_transport().expect("ssh default"),
+            TransportSpec::Ssh
+        );
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
     }
