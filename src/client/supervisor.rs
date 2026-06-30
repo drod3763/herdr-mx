@@ -387,6 +387,11 @@ pub(crate) struct SshHostPickerOverlay {
     pub(crate) checked: std::collections::HashSet<usize>,
     pub(crate) scroll: usize,
     pub(crate) error: Option<String>,
+    /// Generation of the in-flight batch `remote.add` this picker submitted, if any. A late
+    /// `SshHostsAdded` result only closes/mutates the overlay when its generation matches this — so a
+    /// stale result from a previous picker session can't dismiss or write errors into a newer one,
+    /// and `Some(_)` also blocks a repeat submit while the batch is running.
+    pub(crate) submit_generation: Option<u64>,
 }
 
 /// The typed outcome of a key press in the ssh-host picker. `Submit` carries the checked,
@@ -737,6 +742,9 @@ pub(crate) struct ClientSupervisorModel {
     /// can dedup its rows against the already-registered remotes (`already_added`) without a fresh
     /// `remote.list` round-trip. This is the SAME source `remote_manage_rows` derives from.
     synced_remotes: Vec<crate::remote_registry::RemoteDefinitionSnapshot>,
+    /// Monotonic generation handed to each ssh-host batch `remote.add`, so a late `SshHostsAdded`
+    /// result can be matched back to the picker session that submitted it (re-entrancy guard).
+    next_ssh_add_generation: u64,
 }
 
 const SUPERVISOR_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -821,6 +829,7 @@ impl ClientSupervisorModel {
             update_progress: std::collections::HashMap::new(),
             update_outcomes: std::collections::HashMap::new(),
             synced_remotes: Vec::new(),
+            next_ssh_add_generation: 0,
         }
     }
 
@@ -1952,7 +1961,28 @@ impl ClientSupervisorModel {
             checked: std::collections::HashSet::new(),
             scroll: 0,
             error: None,
+            submit_generation: None,
         });
+    }
+
+    /// Allocate a generation for a batch `remote.add` the active picker is submitting, stamping it on
+    /// the overlay so a late `SshHostsAdded` can be matched back to THIS picker. Returns the
+    /// generation. No active picker (overlay already gone) still returns a fresh, unmatched id.
+    pub(crate) fn begin_ssh_host_add(&mut self) -> u64 {
+        let generation = self.next_ssh_add_generation;
+        self.next_ssh_add_generation = self.next_ssh_add_generation.wrapping_add(1);
+        if let Some(overlay) = self.ssh_host_picker_mut() {
+            overlay.submit_generation = Some(generation);
+        }
+        generation
+    }
+
+    /// Whether the currently-active ssh-host picker is the one that submitted batch `generation` —
+    /// i.e. a late `SshHostsAdded` should still apply to it (close / show errors). False if no picker
+    /// is open or a different picker session is now active.
+    pub(crate) fn ssh_host_add_is_current(&self, generation: u64) -> bool {
+        self.ssh_host_picker()
+            .is_some_and(|overlay| overlay.submit_generation == Some(generation))
     }
 
     /// Open the picker from a completed `remote.ssh_config_hosts` fetch, but ONLY when the Add Remote
@@ -2089,6 +2119,10 @@ impl ClientSupervisorModel {
                 let Some(overlay) = self.ssh_host_picker() else {
                     return SshHostPickerOutcome::Redraw;
                 };
+                // Ignore a repeat submit while a batch add from this picker is already in flight.
+                if overlay.submit_generation.is_some() {
+                    return SshHostPickerOutcome::Redraw;
+                }
                 // Preserve row order so the batch-add reads top-to-bottom; skip already-added rows
                 // (the server dedup also protects against a stale check).
                 let aliases: Vec<String> = overlay
@@ -6179,6 +6213,34 @@ mod tests {
         model.clear_ssh_host_fetch();
         assert!(!model.add_remote_form().unwrap().ssh_fetch_in_flight);
         assert!(model.begin_ssh_host_fetch(), "begins again after clear");
+    }
+
+    #[test]
+    fn ssh_host_add_generation_ties_results_to_the_submitting_picker() {
+        use crossterm::event::KeyCode;
+        // codex (re-run): a late SshHostsAdded result must only apply to the picker that submitted it.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_ssh_host_picker(vec![ssh_host("a", None, None)], &[]);
+        let gen_a = model.begin_ssh_host_add();
+        assert!(model.ssh_host_add_is_current(gen_a));
+        // A repeat submit while the batch is in flight is ignored.
+        assert_eq!(
+            model.handle_ssh_host_picker_key(picker_key(KeyCode::Enter)),
+            SshHostPickerOutcome::Redraw
+        );
+
+        // User opens a fresh picker B before A's result returns.
+        model.open_ssh_host_picker(vec![ssh_host("b", None, None)], &[]);
+        assert!(
+            !model.ssh_host_add_is_current(gen_a),
+            "A's late result is no longer current for picker B"
+        );
+        assert!(model.ssh_host_picker().is_some(), "picker B stays open");
+
+        // B's own submission gets a distinct generation that is current.
+        let gen_b = model.begin_ssh_host_add();
+        assert_ne!(gen_a, gen_b);
+        assert!(model.ssh_host_add_is_current(gen_b));
     }
 
     #[test]

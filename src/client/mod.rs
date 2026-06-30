@@ -2500,6 +2500,9 @@ enum ClientLoopEvent {
             String,
             Result<crate::remote_registry::RemoteDefinitionSnapshot, String>,
         )>,
+        /// Generation of the picker submission this batch belongs to, so a late result only
+        /// closes/mutates the picker that submitted it (re-entrancy guard).
+        generation: u64,
     },
     /// #44: a provisioning stage of an in-flight one-click "update" (reinstall the local herdr onto
     /// a remote via the add-remote flow). Server_id-keyed so the banner sub-line targets the right
@@ -3681,6 +3684,7 @@ fn fetch_ssh_config_hosts() -> Result<Vec<crate::ssh_config::SshConfigHost>, Str
 /// up (so the picker never blocks on a slow install). Modeled on `spawn_client_add_remote_submission`.
 fn spawn_client_ssh_hosts_add(
     aliases: Vec<String>,
+    generation: u64,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
     let event_tx = event_tx.clone();
@@ -3702,7 +3706,10 @@ fn spawn_client_ssh_hosts_add(
                 (alias, result)
             })
             .collect();
-        let _ = event_tx.blocking_send(ClientLoopEvent::SshHostsAdded { results });
+        let _ = event_tx.blocking_send(ClientLoopEvent::SshHostsAdded {
+            results,
+            generation,
+        });
     });
 }
 
@@ -5300,9 +5307,15 @@ async fn run_client_loop(
                                 continue;
                             }
                             // Batch-register the checked picker aliases off the UI loop; results land
-                            // as `SshHostsAdded`.
+                            // as `SshHostsAdded`. A generation stamped on the picker ties the result
+                            // back to this submission so a late result can't dismiss a newer picker.
                             ClientInputDispatch::AddSshHosts(aliases) => {
-                                spawn_client_ssh_hosts_add(aliases, &event_tx);
+                                let generation = state
+                                    .supervisor_model
+                                    .as_mut()
+                                    .map(|model| model.begin_ssh_host_add())
+                                    .unwrap_or(0);
+                                spawn_client_ssh_hosts_add(aliases, generation, &event_tx);
                                 state.request_full_redraw();
                                 render_cached_composited_frame(&mut state);
                                 continue;
@@ -6212,9 +6225,16 @@ async fn run_client_loop(
             // registered host (`Connecting`) and schedule its reconnect, mark it added in the still-
             // open picker, and surface any per-host failures on the picker's error line. Close on a
             // clean full success.
-            ClientLoopEvent::SshHostsAdded { results } => {
+            ClientLoopEvent::SshHostsAdded {
+                results,
+                generation,
+            } => {
                 let mut added_server_ids = Vec::new();
                 if let Some(model) = &mut state.supervisor_model {
+                    // Registry adds + reconnects always apply (the hosts are registered regardless),
+                    // but overlay mutations apply ONLY to the picker that submitted this batch — a
+                    // late result must not close or write errors into a newer picker session.
+                    let current = model.ssh_host_add_is_current(generation);
                     let mut errors = Vec::new();
                     for (alias, result) in results {
                         match result {
@@ -6227,18 +6247,20 @@ async fn run_client_loop(
                                     &server_id,
                                     Some("waiting to connect…".to_string()),
                                 );
-                                model.mark_ssh_host_added(&alias);
+                                if current {
+                                    model.mark_ssh_host_added(&alias);
+                                }
                                 added_server_ids.push(server_id);
                             }
                             Err(err) => errors.push(format!("{alias}: {err}")),
                         }
                     }
-                    if errors.is_empty() {
-                        // Close only if the picker is still the active overlay — a late success must
-                        // not dismiss whatever overlay the user has since opened.
-                        model.close_ssh_host_picker();
-                    } else {
-                        model.set_ssh_host_picker_error(errors.join("; "));
+                    if current {
+                        if errors.is_empty() {
+                            model.close_ssh_host_picker();
+                        } else {
+                            model.set_ssh_host_picker_error(errors.join("; "));
+                        }
                     }
                 }
                 for server_id in added_server_ids {
