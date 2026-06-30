@@ -490,7 +490,7 @@ fn resolve_transport() -> io::Result<TransportSpec> {
     let keep_or_default = || -> io::Result<TransportSpec> {
         match previous() {
             Some(spec @ TransportSpec::Custom { .. }) => Ok(spec),
-            _ if raw_config_declares_transport() => Err(io::Error::new(
+            _ if config_declares_transport() => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "[remote.transport] is configured but config.toml could not be parsed; \
                  refusing to fall back to built-in ssh",
@@ -536,20 +536,44 @@ fn resolve_transport() -> io::Result<TransportSpec> {
     }
 }
 
-/// Best-effort check of whether the raw config declares a custom transport. Used only when the
-/// config fails to parse / its `[remote]` section is invalid, to distinguish a config that intends
-/// a `[remote.transport]` (fail closed) from one that does not (fall back to ssh). Scans the raw
-/// text for a `[remote.transport]` table header, skipping comment lines, since the structured
-/// config is unavailable in those cases. The inline `transport = { ... }` form is not detected; the
-/// documented form is the `[remote.transport]` table.
-fn raw_config_declares_transport() -> bool {
+/// Whether the config declares a custom transport (`remote.transport`). Used only when the config
+/// fails to parse / its `[remote]` section is invalid, to distinguish a config that intends a custom
+/// transport (fail closed) from one that does not (fall back to ssh).
+///
+/// Prefers a structural check: parse the raw text to a `toml::Value` and look up `remote.transport`.
+/// This recognizes every valid TOML spelling — `[remote.transport]`, `[ remote.transport ]`, and the
+/// inline `[remote]` + `transport = { ... }` form — even when the typed `[remote]` section failed to
+/// deserialize (only the structured *typed* config is unavailable then; the raw value still parses).
+/// Falls back to a lenient text scan only when the TOML is too broken to parse to a value at all.
+fn config_declares_transport() -> bool {
     let path = crate::config::config_path();
     let Ok(content) = std::fs::read_to_string(&path) else {
         return false;
     };
+    if let Ok(value) = content.parse::<toml::Value>() {
+        return value
+            .get("remote")
+            .and_then(|remote| remote.as_table())
+            .is_some_and(|remote| remote.contains_key("transport"));
+    }
+    // TOML won't parse to a value (syntax error): best-effort scan. Strip spaces so spaced table
+    // headers match, skip comments, and accept either a `[remote.transport]` table or a `transport`
+    // key declared under a `[remote]` table.
+    let mut in_remote_table = false;
     content.lines().any(|line| {
         let trimmed = line.trim();
-        !trimmed.starts_with('#') && trimmed.starts_with("[remote.transport]")
+        if trimmed.starts_with('#') {
+            return false;
+        }
+        let compact: String = trimmed.chars().filter(|ch| !ch.is_whitespace()).collect();
+        if compact.starts_with("[remote.transport]") || compact.starts_with("[remote.transport.") {
+            return true;
+        }
+        if compact.starts_with('[') {
+            in_remote_table = compact.starts_with("[remote]");
+            return false;
+        }
+        in_remote_table && compact.starts_with("transport=")
     })
 }
 
@@ -3234,6 +3258,45 @@ mod tests {
             "[remote.transport]\nprogram = \"autossh\"\nargs = [\n",
         )
         .expect("write unparseable config with transport");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_fails_closed_on_spaced_transport_header_with_invalid_remote() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-sp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // `[remote]` fails to deserialize (bool given a string) but the raw TOML still parses, and
+        // declares the transport with a spaced table header. The structural check must detect it
+        // and fail closed rather than routing over ssh.
+        std::fs::write(
+            &cfg,
+            "[remote]\nmanage_ssh_config = \"bad\"\n[ remote.transport ]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write spaced-header config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_fails_closed_on_inline_transport_with_invalid_remote() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-il-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // `[remote]` fails to deserialize but declares an inline `transport = { ... }`. The
+        // structural check must detect the nested transport field and fail closed.
+        std::fs::write(
+            &cfg,
+            "[remote]\nmanage_ssh_config = \"bad\"\ntransport = { program = \"autossh\", args = [\"{host}\", \"{remote_command}\"] }\n",
+        )
+        .expect("write inline-transport config");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
         assert!(resolve_transport().is_err());
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
