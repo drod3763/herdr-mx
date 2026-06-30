@@ -3714,7 +3714,13 @@ fn trimmed_optional(value: &str) -> Option<String> {
 /// filtered out during discovery, so the bare prefix needs no quoting. The submit path and the
 /// `already_added` dedup both call this so they agree on one canonical key.
 pub(crate) fn ssh_config_alias_target(alias: &str) -> String {
-    format!("ssh {alias}")
+    // Quote the alias so the string round-trips losslessly back through `RemoteTargetSnapshot::parse`
+    // (which `shlex`-splits this): an alias containing shell metacharacters (e.g. backslash, quotes,
+    // `$`) admitted by discovery must register as exactly that ssh destination, not a
+    // shell-reinterpreted one. `try_quote` only errors on an interior NUL byte (impossible in an
+    // ssh_config alias); fall back to the raw alias in that case.
+    let quoted = shlex::try_quote(alias).unwrap_or(std::borrow::Cow::Borrowed(alias));
+    format!("ssh {quoted}")
 }
 
 /// #44: format the host context-menu version-readout label and whether the remote's wire protocol
@@ -6286,6 +6292,36 @@ mod tests {
             model.add_remote_form().is_some_and(|f| f.in_progress),
             "the in-progress add overlay stays put"
         );
+    }
+
+    #[test]
+    fn ssh_config_alias_target_round_trips_aliases_with_shell_metacharacters() {
+        // codex (re-run): the picker surfaces aliases, then ssh_config_alias_target round-trips them
+        // through RemoteTargetSnapshot::parse (shlex). An alias with shell metacharacters must
+        // register as exactly that ssh destination, not a shell-reinterpreted one.
+        for alias in [
+            "plain",
+            "localhost",
+            "local:prod",
+            r"with\back",
+            "with'quote",
+            "a$b",
+            r#"weird"q"#,
+            "semi;colon",
+        ] {
+            let target = crate::remote_registry::RemoteTargetSnapshot::parse(
+                &ssh_config_alias_target(alias),
+            )
+            .unwrap_or_else(|_| panic!("alias {alias:?} should parse"));
+            assert_eq!(
+                target,
+                crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                    target: alias.to_string(),
+                    args: Vec::new(),
+                },
+                "alias {alias:?} must round-trip to its exact ssh target"
+            );
+        }
     }
 
     #[test]
