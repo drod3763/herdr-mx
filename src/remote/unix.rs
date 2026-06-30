@@ -2417,12 +2417,33 @@ const INSTALL_STDERR_TAIL_CAP: usize = 8 * 1024;
 
 /// Read `reader` to EOF, retaining only the last `cap` bytes. Always drains the pipe fully so a
 /// chatty child cannot deadlock on a full stderr buffer, but never grows memory past `cap`.
-fn read_to_capped_tail<R: io::Read>(reader: &mut R, cap: usize) -> Vec<u8> {
+/// Put a file descriptor into non-blocking mode so reads return `WouldBlock` instead of parking.
+fn set_nonblocking(fd: std::os::unix::io::RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Drain a **non-blocking** reader to EOF or until `deadline`, retaining only the last `cap` bytes.
+/// Returns `(tail, hit_deadline)`. Unlike a blocking drain, this returns even when a descendant that
+/// escaped the process group (e.g. via `setsid`) keeps the pipe's write end open and EOF never
+/// arrives — so a bounded operation can report a timeout instead of parking on the reader forever.
+/// The caller must have set the reader's fd non-blocking (see [`set_nonblocking`]).
+fn read_to_capped_tail_until<R: io::Read>(
+    reader: &mut R,
+    cap: usize,
+    deadline: Instant,
+) -> (Vec<u8>, bool) {
     let mut tail: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => return (tail, false),
             Ok(read) => {
                 tail.extend_from_slice(&chunk[..read]);
                 if tail.len() > cap {
@@ -2431,10 +2452,15 @@ fn read_to_capped_tail<R: io::Read>(reader: &mut R, cap: usize) -> Vec<u8> {
                 }
             }
             Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return (tail, true);
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return (tail, false),
         }
     }
-    tail
 }
 
 fn install_remote_herdr(
@@ -2470,6 +2496,7 @@ trap - EXIT
     // "Permanently added … to known hosts" warning, remote shell chatter) scrolls/garbles the
     // screen mid-provision (issue #32 follow-up). stdout is discarded; stderr is kept only to
     // enrich a failure message.
+    use std::os::unix::io::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
     let mut command = target.command(&format!("sh -eu -c {}", shell_quote(&script)));
     // Lead a new process group so the whole install transport tree (a custom wrapper may spawn ssh
@@ -2501,8 +2528,17 @@ trap - EXIT
             "install transport stderr missing",
         )
     })?;
-    let stderr_reader =
-        thread::spawn(move || read_to_capped_tail(&mut child_stderr, INSTALL_STDERR_TAIL_CAP));
+    // Deadline-aware drain so an stderr holder that escaped the process group can't park this join.
+    set_nonblocking(child_stderr.as_raw_fd())?;
+    let install_deadline_at = Instant::now() + INSTALL_TRANSPORT_TIMEOUT;
+    let stderr_reader = thread::spawn(move || {
+        read_to_capped_tail_until(
+            &mut child_stderr,
+            INSTALL_STDERR_TAIL_CAP,
+            install_deadline_at,
+        )
+        .0
+    });
 
     // Watchdog: SIGKILL the install transport group if it has not finished within the deadline. A
     // custom transport (autossh) that keeps retrying could otherwise leave the stdin copy / wait
@@ -2572,6 +2608,7 @@ const PROBE_OUTPUT_CAP: usize = 64 * 1024;
 /// child and its whole process group are SIGKILLed (a custom transport may have spawned ssh
 /// children) and a `TimedOut` error is returned; killing the child unblocks the drain/wait.
 fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Output> {
+    use std::os::unix::io::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
     // Put the child in its own process group so the whole transport tree can be killed on timeout.
     command.process_group(0);
@@ -2582,7 +2619,10 @@ fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Ou
     let mut child = command.spawn()?;
     let pid = child.id() as i32;
 
-    // Drain both pipes concurrently while the deadline runs; never read after exit only.
+    // Drain both pipes concurrently and deadline-aware: non-blocking reads stop at the deadline even
+    // if a descendant that escaped the process group (setsid/new session) keeps the pipe open, so a
+    // reader can never park forever. Killing the group (watchdog below) handles in-group children.
+    let deadline_at = Instant::now() + deadline;
     let mut child_stdout = child
         .stdout
         .take()
@@ -2591,10 +2631,14 @@ fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Ou
         .stderr
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "probe stderr missing"))?;
-    let stdout_reader =
-        thread::spawn(move || read_to_capped_tail(&mut child_stdout, PROBE_OUTPUT_CAP));
-    let stderr_reader =
-        thread::spawn(move || read_to_capped_tail(&mut child_stderr, PROBE_OUTPUT_CAP));
+    set_nonblocking(child_stdout.as_raw_fd())?;
+    set_nonblocking(child_stderr.as_raw_fd())?;
+    let stdout_reader = thread::spawn(move || {
+        read_to_capped_tail_until(&mut child_stdout, PROBE_OUTPUT_CAP, deadline_at)
+    });
+    let stderr_reader = thread::spawn(move || {
+        read_to_capped_tail_until(&mut child_stderr, PROBE_OUTPUT_CAP, deadline_at)
+    });
 
     // Watchdog: SIGKILL the process group at the deadline. Killing the child makes the pipes hit EOF
     // and `wait` return, so a hung/looping transport can't block forever.
@@ -2619,17 +2663,14 @@ fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Ou
     });
 
     let wait_result = child.wait();
-    // Keep the watchdog armed THROUGH the pipe drains: if a descendant that inherited stdout/stderr
-    // outlives the direct child (e.g. a wrapper that backgrounds a process), these joins would
-    // otherwise block forever waiting for EOF. With the watchdog still live, the deadline kills the
-    // process group, the descendant dies, the pipes hit EOF, and the joins return. (When the child
-    // exits cleanly with no such descendant, the pipes EOF immediately and `done` is set below
-    // before the deadline, so the watchdog never kills.)
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+    // The deadline-aware readers always return (even on an escaped pipe holder), so these joins are
+    // bounded. `hit_deadline` from either reader, or a watchdog kill, means the operation timed out.
+    let (stdout, stdout_timed_out) = stdout_reader.join().unwrap_or_default();
+    let (stderr, stderr_timed_out) = stderr_reader.join().unwrap_or_default();
     done.store(true, Ordering::SeqCst);
-    let timed_out = watchdog.join().unwrap_or(false);
+    let watchdog_killed = watchdog.join().unwrap_or(false);
     let status = wait_result?;
+    let timed_out = watchdog_killed || stdout_timed_out || stderr_timed_out;
 
     if timed_out {
         return Err(io::Error::new(
@@ -3687,19 +3728,73 @@ mod tests {
     }
 
     #[test]
-    fn read_to_capped_tail_retains_only_the_last_bytes() {
-        // A transport that emits more stderr than the cap must not grow memory: only the tail is
-        // kept, and it is the LAST bytes (for the failure message), not the head.
+    fn read_to_capped_tail_until_retains_only_the_last_bytes() {
+        // A transport that emits more output than the cap must not grow memory: only the tail is
+        // kept, and it is the LAST bytes (for the failure message), not the head. A Cursor reads to
+        // EOF without blocking, exercising the cap path of the deadline-aware drain.
         let data: Vec<u8> = (0..20_000u32).map(|byte| byte as u8).collect();
-        let tail = read_to_capped_tail(&mut std::io::Cursor::new(data.clone()), 4096);
+        let (tail, hit_deadline) = read_to_capped_tail_until(
+            &mut std::io::Cursor::new(data.clone()),
+            4096,
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(!hit_deadline);
         assert_eq!(tail.len(), 4096);
         assert_eq!(tail, &data[data.len() - 4096..]);
     }
 
     #[test]
-    fn read_to_capped_tail_keeps_small_output_intact() {
-        let tail = read_to_capped_tail(&mut std::io::Cursor::new(b"boom".to_vec()), 4096);
+    fn read_to_capped_tail_until_keeps_small_output_intact() {
+        let (tail, hit_deadline) = read_to_capped_tail_until(
+            &mut std::io::Cursor::new(b"boom".to_vec()),
+            4096,
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(!hit_deadline);
         assert_eq!(tail, b"boom");
+    }
+
+    #[test]
+    fn read_to_capped_tail_until_returns_at_deadline_when_pipe_stays_open() {
+        // Model an escaped descendant holding the pipe: the write end is kept open so the read end
+        // never sees EOF. The non-blocking deadline-aware drain must return `hit_deadline = true`
+        // shortly after the deadline instead of parking forever.
+        use std::os::unix::io::AsRawFd as _;
+        let (mut reader, _writer) =
+            std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        set_nonblocking(reader.as_raw_fd()).expect("set non-blocking");
+        let start = Instant::now();
+        let (data, hit_deadline) =
+            read_to_capped_tail_until(&mut reader, 4096, start + Duration::from_millis(200));
+        assert!(
+            hit_deadline,
+            "an open pipe past the deadline must report a timeout"
+        );
+        assert!(data.is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return shortly after the deadline, not park on the open pipe"
+        );
+        // Some data already buffered before the deadline is still retained.
+        // (_writer dropped here closes the write end.)
+    }
+
+    #[test]
+    fn read_to_capped_tail_until_returns_eof_data_before_deadline() {
+        let (mut reader, mut writer) =
+            std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        use std::io::Write as _;
+        use std::os::unix::io::AsRawFd as _;
+        writer.write_all(b"hello").expect("write");
+        drop(writer); // close write end → reader sees EOF after "hello"
+        set_nonblocking(reader.as_raw_fd()).expect("set non-blocking");
+        let (data, hit_deadline) =
+            read_to_capped_tail_until(&mut reader, 4096, Instant::now() + Duration::from_secs(5));
+        assert!(
+            !hit_deadline,
+            "EOF before the deadline must not report a timeout"
+        );
+        assert_eq!(data, b"hello");
     }
 
     #[test]
