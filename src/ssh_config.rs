@@ -35,6 +35,10 @@ const MAX_CONFIG_FILES: usize = 256;
 /// iterating/sorting unboundedly. Set well above any realistic `~/.ssh/config.d`.
 const MAX_GLOB_SCAN_ENTRIES: usize = 8192;
 
+/// Max length of a single glob `Include` final component. A real pattern is short (`*`, `*.conf`);
+/// a pathological huge one is rejected so per-entry match work stays bounded.
+const MAX_GLOB_PATTERN_LEN: usize = 256;
+
 /// Request-wide budget on total directory entries examined across ALL glob `Include`s in one
 /// discovery pass. The per-glob cap alone does not stop a root file with tens of thousands of
 /// `Include config.d/*` lines from re-scanning a directory for every line; this bounds the
@@ -343,6 +347,15 @@ fn glob_expand(pattern: &Path, glob_scans_remaining: &mut usize) -> Vec<PathBuf>
     let Some(file_pattern) = pattern.file_name().and_then(|n| n.to_str()) else {
         return Vec::new();
     };
+    // A real `Include` glob component is short (`*`, `config-*`, `*.conf`). Reject a pathological
+    // huge pattern outright so per-entry matching work stays bounded.
+    if file_pattern.len() > MAX_GLOB_PATTERN_LEN {
+        return Vec::new();
+    }
+    // Precompile the pattern's chars ONCE for the whole directory rather than rebuilding the Vec for
+    // every scanned entry (a long pattern over a big directory would otherwise be pattern_len × scan
+    // allocations/work).
+    let pat: Vec<char> = file_pattern.chars().collect();
     let Ok(entries) = std::fs::read_dir(parent) else {
         return Vec::new();
     };
@@ -360,7 +373,7 @@ fn glob_expand(pattern: &Path, glob_scans_remaining: &mut usize) -> Vec<PathBuf>
         }
         *glob_scans_remaining -= 1;
         if let Some(name) = entry.file_name().to_str() {
-            if glob_match(file_pattern, name) {
+            if glob_match_chars(&pat, name) {
                 matched.push(entry.path());
             }
         }
@@ -377,7 +390,12 @@ fn glob_expand(pattern: &Path, glob_scans_remaining: &mut usize) -> Vec<PathBuf>
 /// a long filename cannot blow up CPU/stack the way naive recursive backtracking would, while
 /// discovery runs synchronously on the app loop.
 fn glob_match(pattern: &str, candidate: &str) -> bool {
-    let pat: Vec<char> = pattern.chars().collect();
+    glob_match_chars(&pattern.chars().collect::<Vec<_>>(), candidate)
+}
+
+/// Matcher over a PRECOMPILED pattern slice, so `glob_expand` collects the pattern's chars once per
+/// directory rather than rebuilding it for every scanned entry.
+fn glob_match_chars(pat: &[char], candidate: &str) -> bool {
     let text: Vec<char> = candidate.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     // Last `*` position and the text index it was matched against, for backtracking.
@@ -591,6 +609,22 @@ mod tests {
             .find(|h| h.alias == "plain")
             .expect("plain row");
         assert_eq!(plain.hostname.as_deref(), Some("p.host"));
+    }
+
+    #[test]
+    fn oversized_glob_pattern_is_rejected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex (re-run): a pathological huge glob pattern is rejected outright so per-entry match
+        // work stays bounded. A normal short pattern still expands.
+        let huge = "*".repeat(MAX_GLOB_PATTERN_LEN + 1);
+        let fixture = ConfigFixture::new(
+            "huge-glob",
+            &format!("Include config.d/{huge}\nInclude config.d/*\n"),
+        );
+        fixture.write_extra("config.d/real", "Host real\n");
+        let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
+        // The oversized pattern matched nothing; the normal `*` include still found `real`.
+        assert_eq!(aliases, vec!["real".to_string()]);
     }
 
     #[test]
