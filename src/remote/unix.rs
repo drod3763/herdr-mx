@@ -2484,8 +2484,54 @@ trap - EXIT
     }
 }
 
+/// Cap on a single one-shot remote probe (`ssh_output`). The built-in ssh transport already bounds
+/// its connect with `-o ConnectTimeout=10`; this is the backstop for a custom `[remote.transport]`
+/// program (e.g. autossh) that retries forever, so an unreachable host fails a provisioning probe
+/// fast instead of hanging it and leaking the spawned transport across retry ticks. The long-lived
+/// bridge is intentionally not bounded — a roaming transport's persistence there is desired.
+const SSH_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run a one-shot command to completion, bounded by `deadline`. On timeout the child and its whole
+/// process group are SIGKILLed (a custom transport may have spawned ssh children) and a `TimedOut`
+/// error is returned. Probe output is small, so reading the pipes after exit cannot deadlock.
+fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Output> {
+    use std::os::unix::process::CommandExt as _;
+    // Put the child in its own process group so the whole transport tree can be killed on timeout.
+    command.process_group(0);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let pid = child.id() as i32;
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if start.elapsed() >= deadline {
+            // SIGKILL the process group (negative pid), then reap the direct child.
+            // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "remote transport command exceeded {}s and was killed (unreachable host, or a \
+                     custom [remote.transport] that does not time out)",
+                    deadline.as_secs()
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn ssh_output(target: &SshTarget, command: &str) -> io::Result<Output> {
-    target.command(command).output()
+    run_bounded_output(target.command(command), SSH_PROBE_TIMEOUT)
 }
 
 fn remote_bridge_command(
@@ -3474,6 +3520,32 @@ mod tests {
         );
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_bounded_output_kills_a_hung_command() {
+        // A custom transport that never exits (here: a subshell that sleeps) must be killed at the
+        // deadline rather than hanging the probe and leaking the process.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 600");
+        let start = Instant::now();
+        let result = run_bounded_output(command, Duration::from_millis(200));
+        let err = result.expect_err("a hung command must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must return promptly after the deadline, not wait for the command"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_returns_quick_command_output() {
+        // A command that finishes within the deadline returns its captured output normally.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("printf hi");
+        let output = run_bounded_output(command, Duration::from_secs(5)).expect("completes");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hi");
     }
 
     fn probe_lines(version: &str, protocol: u32, bridge_ok: bool) -> String {
