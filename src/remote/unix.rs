@@ -424,10 +424,16 @@ impl TransportSpec {
             // No `[remote.transport]` override configured: use built-in ssh.
             return TransportResolution::Spec(TransportSpec::Ssh);
         };
-        // An empty program is treated as "no transport" so a stray `[remote.transport]` header
-        // can't break every connection by spawning a nameless command.
+        // A present `[remote.transport]` with a blank/omitted `program` is a malformed custom
+        // transport, not "no transport": report it invalid so the resolver keeps a prior valid
+        // custom transport or fails closed, instead of spawning a nameless command or silently
+        // downgrading to ssh and bypassing the configured transport. `Spec(Ssh)` is reserved for an
+        // entirely absent transport table (handled above).
         if transport.program.trim().is_empty() {
-            return TransportResolution::Spec(TransportSpec::Ssh);
+            tracing::warn!(
+                "[remote.transport] is present but `program` is blank; keeping the last valid transport"
+            );
+            return TransportResolution::Invalid;
         }
         // The bridge/install path runs an arbitrary remote command (the herdr payload) over the
         // transport. A template that omits `{remote_command}` would spawn the transport and stream
@@ -2996,18 +3002,22 @@ mod tests {
     }
 
     #[test]
-    fn transport_spec_from_config_ignores_blank_program() {
-        let remote = crate::config::model::RemoteConfig {
-            transport: Some(crate::config::model::RemoteTransportConfig {
-                program: "   ".into(),
-                args: vec!["{host}".into()],
-            }),
-            ..Default::default()
-        };
-        assert_eq!(
-            TransportSpec::from_config(&remote),
-            TransportResolution::Spec(TransportSpec::Ssh)
-        );
+    fn transport_spec_from_config_rejects_blank_program() {
+        // A present [remote.transport] with a blank or omitted program is a malformed custom
+        // transport (Invalid), not "no transport" (Spec(Ssh)): it must not silently downgrade to ssh.
+        for program in ["   ", ""] {
+            let remote = crate::config::model::RemoteConfig {
+                transport: Some(crate::config::model::RemoteTransportConfig {
+                    program: program.into(),
+                    args: vec!["{host}".into(), "{remote_command}".into()],
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                TransportSpec::from_config(&remote),
+                TransportResolution::Invalid
+            );
+        }
     }
 
     #[test]
