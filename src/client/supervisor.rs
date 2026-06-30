@@ -1895,6 +1895,16 @@ impl ClientSupervisorModel {
         }
     }
 
+    /// Dismiss the ssh-host picker ONLY when it is still the active overlay. A late `SshHostsAdded`
+    /// success must not close whatever overlay the user has since opened (the user can submit, then
+    /// cancel and start a manual add before the batch worker returns), which would hide that
+    /// overlay's progress/errors and lose their interaction.
+    pub(crate) fn close_ssh_host_picker(&mut self) {
+        if matches!(self.client_overlay, ClientOverlayState::SshHostPicker(_)) {
+            self.close_client_overlay();
+        }
+    }
+
     // ----- ssh-host picker overlay ("pick from ~/.ssh/config") --------------------------------
 
     /// The last registry snapshot applied via `sync_remote_registry`. Used by the client loop to
@@ -6163,6 +6173,27 @@ mod tests {
         model.clear_ssh_host_fetch();
         assert!(!model.add_remote_form().unwrap().ssh_fetch_in_flight);
         assert!(model.begin_ssh_host_fetch(), "begins again after clear");
+    }
+
+    #[test]
+    fn close_ssh_host_picker_only_closes_the_picker_overlay() {
+        // codex (re-run): a late SshHostsAdded success must not dismiss whatever overlay the user
+        // opened after submitting + closing the picker. close_ssh_host_picker is scoped to the picker.
+        let mut moved_on = ClientSupervisorModel::new("local");
+        moved_on.open_ssh_host_picker(vec![ssh_host("a", None, None)], &[]);
+        // User cancelled the picker and started a manual add before the batch worker returned.
+        moved_on.open_add_remote_form();
+        moved_on.close_ssh_host_picker();
+        assert!(
+            moved_on.add_remote_form().is_some(),
+            "a late add-success must not close the unrelated Add Remote overlay"
+        );
+
+        // When the picker is still open, it is dismissed on a clean success.
+        let mut still_open = ClientSupervisorModel::new("local");
+        still_open.open_ssh_host_picker(vec![ssh_host("a", None, None)], &[]);
+        still_open.close_ssh_host_picker();
+        assert!(still_open.ssh_host_picker().is_none());
     }
 
     #[test]

@@ -6234,7 +6234,9 @@ async fn run_client_loop(
                         }
                     }
                     if errors.is_empty() {
-                        model.close_client_overlay();
+                        // Close only if the picker is still the active overlay — a late success must
+                        // not dismiss whatever overlay the user has since opened.
+                        model.close_ssh_host_picker();
                     } else {
                         model.set_ssh_host_picker_error(errors.join("; "));
                     }
