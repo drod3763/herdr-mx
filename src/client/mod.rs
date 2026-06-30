@@ -6188,8 +6188,10 @@ async fn run_client_loop(
                         // Surface the failure on the Add Remote overlay if it's still open (the user
                         // launched this fetch from it); a late result after it closed stays log-only.
                         if let Some(model) = &mut state.supervisor_model {
+                            // Generic: the fetch can fail for reasons other than a local file read
+                            // (unsupported API method on an older server, socket failure, etc.).
                             model.set_add_remote_error_if_open(format!(
-                                "couldn't read ~/.ssh/config: {err}"
+                                "couldn't load ssh hosts: {err}"
                             ));
                         }
                     }
