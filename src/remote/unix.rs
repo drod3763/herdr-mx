@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, IsTerminal, Read as _, Write as _};
+use std::io::{self, IsTerminal, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -2402,6 +2402,38 @@ fn confirm_remote_install(
     Ok(())
 }
 
+/// Backstop deadline for a remote install over a custom transport. The binary upload is bounded by
+/// the copy completing; this kills a transport (e.g. autossh) that stalls the stdin copy or never
+/// exits, so an install can't hang the worker / leak the process indefinitely. Generous so a slow
+/// link uploading the ~11 MB binary is not killed mid-transfer.
+const INSTALL_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Cap on retained install stderr. The tail is kept to enrich a failure message; a verbose/looping
+/// custom transport could otherwise grow this without bound.
+const INSTALL_STDERR_TAIL_CAP: usize = 8 * 1024;
+
+/// Read `reader` to EOF, retaining only the last `cap` bytes. Always drains the pipe fully so a
+/// chatty child cannot deadlock on a full stderr buffer, but never grows memory past `cap`.
+fn read_to_capped_tail<R: io::Read>(reader: &mut R, cap: usize) -> Vec<u8> {
+    let mut tail: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                tail.extend_from_slice(&chunk[..read]);
+                if tail.len() > cap {
+                    let overflow = tail.len() - cap;
+                    tail.drain(..overflow);
+                }
+            }
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    tail
+}
+
 fn install_remote_herdr(
     target: &SshTarget,
     remote_herdr: &RemoteHerdr,
@@ -2430,8 +2462,12 @@ trap - EXIT
     // "Permanently added … to known hosts" warning, remote shell chatter) scrolls/garbles the
     // screen mid-provision (issue #32 follow-up). stdout is discarded; stderr is kept only to
     // enrich a failure message.
-    let mut child = target
-        .command(&format!("sh -eu -c {}", shell_quote(&script)))
+    use std::os::unix::process::CommandExt as _;
+    let mut command = target.command(&format!("sh -eu -c {}", shell_quote(&script)));
+    // Lead a new process group so the whole install transport tree (a custom wrapper may spawn ssh
+    // children) can be killed on the watchdog deadline below.
+    command.process_group(0);
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -2449,17 +2485,38 @@ trap - EXIT
     // Drain stderr on its own thread while we stream the ~11 MB binary to stdin. A custom
     // `[remote.transport]` may be a verbose wrapper/autossh, and the old "stderr stays tiny"
     // assumption no longer holds: if the child filled its stderr pipe buffer it would stop reading
-    // stdin, and our blocking write of the binary would deadlock against it.
+    // stdin, and our blocking write of the binary would deadlock against it. Retain only a bounded
+    // tail so a transport that emits stderr forever can't exhaust memory.
     let mut child_stderr = child.stderr.take().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::BrokenPipe,
             "install transport stderr missing",
         )
     })?;
-    let stderr_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = child_stderr.read_to_end(&mut buf);
-        buf
+    let stderr_reader =
+        thread::spawn(move || read_to_capped_tail(&mut child_stderr, INSTALL_STDERR_TAIL_CAP));
+
+    // Watchdog: SIGKILL the install transport group if it has not finished within the deadline. A
+    // custom transport (autossh) that keeps retrying could otherwise leave the stdin copy / wait
+    // blocked forever and accumulate stuck processes across retry ticks. Killing the child makes the
+    // blocking `io::copy` (a stalled child stops reading stdin) and `wait` below return.
+    let install_pid = child.id() as i32;
+    let install_done = Arc::new(AtomicBool::new(false));
+    let watchdog_done = Arc::clone(&install_done);
+    let watchdog = thread::spawn(move || {
+        let start = Instant::now();
+        while start.elapsed() < INSTALL_TRANSPORT_TIMEOUT {
+            if watchdog_done.load(Ordering::SeqCst) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if !watchdog_done.load(Ordering::SeqCst) {
+            // Safety: `install_pid` leads its own group (set above); `kill` has no other effect here.
+            unsafe {
+                libc::kill(-install_pid, libc::SIGKILL);
+            }
+        }
     });
 
     let mut source = File::open(source_path)?;
@@ -2468,6 +2525,9 @@ trap - EXIT
     drop(child_stdin);
 
     let status = child.wait()?;
+    // Cancel the watchdog now that the child has exited, then join it and the stderr drain.
+    install_done.store(true, Ordering::SeqCst);
+    let _ = watchdog.join();
     let stderr = stderr_reader.join().unwrap_or_default();
     copy_result?;
 
@@ -3520,6 +3580,22 @@ mod tests {
         );
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_to_capped_tail_retains_only_the_last_bytes() {
+        // A transport that emits more stderr than the cap must not grow memory: only the tail is
+        // kept, and it is the LAST bytes (for the failure message), not the head.
+        let data: Vec<u8> = (0..20_000u32).map(|byte| byte as u8).collect();
+        let tail = read_to_capped_tail(&mut std::io::Cursor::new(data.clone()), 4096);
+        assert_eq!(tail.len(), 4096);
+        assert_eq!(tail, &data[data.len() - 4096..]);
+    }
+
+    #[test]
+    fn read_to_capped_tail_keeps_small_output_intact() {
+        let tail = read_to_capped_tail(&mut std::io::Cursor::new(b"boom".to_vec()), 4096);
+        assert_eq!(tail, b"boom");
     }
 
     #[test]
