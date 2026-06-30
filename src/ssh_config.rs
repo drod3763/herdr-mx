@@ -21,8 +21,9 @@ pub const SSH_CONFIG_PATH_ENV_VAR: &str = "HERDR_SSH_CONFIG_PATH";
 /// caught by the visited-path set, but a deep legitimate chain is also not worth following).
 const MAX_INCLUDE_DEPTH: usize = 16;
 
-/// Per-file byte cap. The API handler runs `discover_hosts()` synchronously on the server loop, so a
-/// huge config/include must not be slurped into memory there. Files larger than this are skipped.
+/// Per-file byte cap. `discover_hosts()` is deferred off the app loop on a worker thread, but it is
+/// still bounded work, so a huge config/include must not be slurped into memory. Files larger than
+/// this are skipped.
 const MAX_CONFIG_FILE_BYTES: u64 = 1 << 20;
 
 /// Total files (default config + all includes) read in one discovery pass. Bounds a config whose

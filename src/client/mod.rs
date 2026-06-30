@@ -6171,8 +6171,8 @@ async fn run_client_loop(
                 render_cached_composited_frame(&mut state);
             }
             // The add-remote "pick" affordance's ssh-config fetch finished: on Ok open the
-            // multi-select picker, deduped against the current registry snapshot; on Err drop a
-            // warning (no overlay to surface it on yet).
+            // multi-select picker, deduped against the current registry snapshot; on Err log a
+            // warning and surface the failure on the Add Remote overlay if it is still open.
             ClientLoopEvent::SshHostsFetched { result } => {
                 match result {
                     Ok(hosts) => {
