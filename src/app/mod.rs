@@ -132,6 +132,11 @@ pub struct App {
         HashSet<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     pub render_notify: Arc<Notify>,
     pub render_dirty: Arc<AtomicBool>,
+    /// #11: single-flight guard for `remote.ssh_config_hosts`. Each request spawns a worker thread
+    /// for the bounded-but-blocking filesystem discovery; this caps concurrency to one so a flood of
+    /// local API calls cannot pile up threads/IO. A request that arrives while one is running gets a
+    /// `discovery_busy` error instead of spawning another thread.
+    pub(crate) ssh_discovery_in_flight: Arc<AtomicBool>,
     pub(crate) full_redraw_pending: bool,
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
     pub(crate) local_terminal_notifications: bool,
@@ -743,6 +748,7 @@ impl App {
             last_terminal_size: terminal::size().ok(),
             render_notify,
             render_dirty,
+            ssh_discovery_in_flight: Arc::new(AtomicBool::new(false)),
             full_redraw_pending: false,
             overlay_panes: HashMap::new(),
             local_terminal_notifications: true,

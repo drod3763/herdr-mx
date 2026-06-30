@@ -95,19 +95,33 @@ impl App {
     }
 
     /// #11: deferred variant of `remote.ssh_config_hosts`. `discover_hosts()` is bounded but does
-    /// blocking filesystem IO (up to 256 files / 65k dir-entry scans), and it touches no `App` state,
-    /// so the real socket path runs it on a worker thread and answers the request channel directly —
-    /// keeping the synchronous app loop free for input, rendering, and other API/remote-lifecycle
-    /// work. Mirrors the deferred worktree APIs, but needs no completion event since there is no
-    /// state mutation to fold back onto the loop. Returns `true` (always handled).
+    /// blocking filesystem IO (up to 256 files / 65k dir-entry scans), so the real socket path runs
+    /// it on a worker thread and answers the request channel directly — keeping the synchronous app
+    /// loop free for input, rendering, and other API/remote-lifecycle work. Mirrors the deferred
+    /// worktree APIs, but needs no completion event since the discovery produces no app-loop state to
+    /// fold back (only the thread-safe single-flight flag below). Returns `true` (always handled).
     pub(crate) fn handle_deferred_remote_ssh_config_hosts(
         &mut self,
         request: crate::api::schema::Request,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
+        use std::sync::atomic::Ordering;
         let id = request.id;
+        // Single-flight: cap discovery to one worker thread at a time so a flood of local API calls
+        // can't pile up concurrent filesystem scans. A request that arrives while one is running is
+        // answered immediately with a `discovery_busy` error rather than spawning another thread.
+        if self.ssh_discovery_in_flight.swap(true, Ordering::SeqCst) {
+            let _ = respond_to.send(encode_error(
+                id,
+                "discovery_busy",
+                "ssh config discovery already in progress",
+            ));
+            return true;
+        }
+        let in_flight = self.ssh_discovery_in_flight.clone();
         std::thread::spawn(move || {
             let hosts = crate::ssh_config::discover_hosts();
+            in_flight.store(false, Ordering::SeqCst);
             let response = encode_success(id, ResponseResult::SshConfigHosts { hosts });
             let _ = respond_to.send(response);
         });
@@ -477,6 +491,28 @@ mod tests {
         assert!(!app.state.session_dirty, "discovery must not dirty session");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_config_hosts_single_flight_returns_busy_when_already_running() {
+        // codex (re-run): a flood of remote.ssh_config_hosts must not spawn unbounded discovery
+        // threads. While one discovery is in flight, further requests get a `discovery_busy` error.
+        use std::sync::atomic::Ordering;
+        let mut app = test_app();
+        app.ssh_discovery_in_flight.store(true, Ordering::SeqCst);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request: Request = serde_json::from_str(
+            r#"{"id":"hosts","method":"remote.ssh_config_hosts","params":{}}"#,
+        )
+        .unwrap();
+        assert!(app.handle_deferred_remote_ssh_config_hosts(request, tx));
+
+        let raw = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("busy response should answer immediately");
+        let error: ErrorResponse = serde_json::from_str(&raw).unwrap();
+        assert_eq!(error.error.code, "discovery_busy");
     }
 
     #[test]
