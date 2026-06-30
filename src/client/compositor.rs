@@ -2857,9 +2857,11 @@ fn hit_test_add_remote(
     x: u16,
     y: u16,
 ) -> Option<SidebarHitTarget> {
-    snapshot.add_remote_form.as_ref()?;
+    let form = snapshot.add_remote_form.as_ref()?;
     let inner = popup_inner(popup);
-    if rect_contains(crate::ui::add_remote_pick_button_rect(inner), x, y) {
+    // The "pick from ~/.ssh/config" button is inert while an add is in flight: starting a fetch then
+    // would let a late AddRemoteFinished close the picker that replaced this overlay (PRRT...qyR).
+    if !form.in_progress && rect_contains(crate::ui::add_remote_pick_button_rect(inner), x, y) {
         return Some(SidebarHitTarget::OpenSshHostPicker);
     }
     let (submit_rect, cancel_rect) = crate::ui::add_remote_button_rects(inner);

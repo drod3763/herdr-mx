@@ -1843,7 +1843,12 @@ impl ClientSupervisorModel {
     }
 
     pub(crate) fn finish_add_remote(&mut self) {
-        self.close_client_overlay();
+        // Only dismiss the Add Remote overlay. A late AddRemoteFinished must not close a different
+        // overlay the user has since opened (e.g. the ssh-host picker), which would drop their
+        // selection or hide its error line (PRRT...qyR).
+        if matches!(self.client_overlay, ClientOverlayState::AddRemote(_)) {
+            self.close_client_overlay();
+        }
     }
 
     // ----- ssh-host picker overlay ("pick from ~/.ssh/config") --------------------------------
@@ -6092,6 +6097,29 @@ mod tests {
             adding.add_remote_form().and_then(|f| f.error.as_deref()),
             Some("couldn't read ~/.ssh/config")
         );
+    }
+
+    #[test]
+    fn finish_add_remote_does_not_close_a_replaced_ssh_picker() {
+        // PRRT...qyR: if the picker opened over the Add Remote overlay (a fast fetch during an
+        // in-flight add), a late AddRemoteFinished -> finish_add_remote must NOT close it and lose
+        // the user's selection. finish_add_remote only dismisses the Add Remote overlay itself.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        model.open_ssh_host_picker(vec![ssh_host("alpha", None, None)], &[]);
+        assert!(model.ssh_host_picker().is_some());
+
+        model.finish_add_remote();
+        assert!(
+            model.ssh_host_picker().is_some(),
+            "finish_add_remote must not close a picker that replaced the Add Remote overlay"
+        );
+
+        // It still closes the Add Remote overlay when that is what's open.
+        let mut adding = ClientSupervisorModel::new("local");
+        adding.open_add_remote_form();
+        adding.finish_add_remote();
+        assert!(adding.add_remote_form().is_none());
     }
 
     #[test]
