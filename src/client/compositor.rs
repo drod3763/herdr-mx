@@ -2524,6 +2524,7 @@ fn render_client_shell(
                     in_progress: form.in_progress,
                     progress: form.progress.as_deref(),
                     spinner: crate::ui::spinner_frame(snapshot.app.spinner_tick),
+                    pick_disabled: form.in_progress || form.ssh_fetch_in_flight,
                 };
                 if let Some(popup) = overlay_popup {
                     crate::ui::render_add_remote_overlay(
@@ -2859,9 +2860,13 @@ fn hit_test_add_remote(
 ) -> Option<SidebarHitTarget> {
     let form = snapshot.add_remote_form.as_ref()?;
     let inner = popup_inner(popup);
-    // The "pick from ~/.ssh/config" button is inert while an add is in flight: starting a fetch then
-    // would let a late AddRemoteFinished close the picker that replaced this overlay (PRRT...qyR).
-    if !form.in_progress && rect_contains(crate::ui::add_remote_pick_button_rect(inner), x, y) {
+    // The "pick from ~/.ssh/config" button is inert while an add is in flight (a late
+    // AddRemoteFinished would close the picker that replaced this overlay, PRRT...qyR) or while a
+    // discovery fetch is already running (avoids duplicate fetch threads, PRRT...Hqu).
+    if !form.in_progress
+        && !form.ssh_fetch_in_flight
+        && rect_contains(crate::ui::add_remote_pick_button_rect(inner), x, y)
+    {
         return Some(SidebarHitTarget::OpenSshHostPicker);
     }
     let (submit_rect, cancel_rect) = crate::ui::add_remote_button_rects(inner);

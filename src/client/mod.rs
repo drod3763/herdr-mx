@@ -1689,8 +1689,15 @@ fn dispatch_sidebar_hit_target(
             ClientInputDispatch::Redraw
         }
         // The add-remote "pick from ~/.ssh/config" affordance fetches the ssh hosts off the UI loop;
-        // the result opens the multi-select picker (`SshHostsFetched`).
-        compositor::SidebarHitTarget::OpenSshHostPicker => ClientInputDispatch::FetchSshHosts,
+        // the result opens the multi-select picker (`SshHostsFetched`). `begin_ssh_host_fetch` marks
+        // the fetch in flight and rejects a duplicate while one is already running.
+        compositor::SidebarHitTarget::OpenSshHostPicker => {
+            if model.begin_ssh_host_fetch() {
+                ClientInputDispatch::FetchSshHosts
+            } else {
+                ClientInputDispatch::Redraw
+            }
+        }
         // A click on a picker row toggles its checkmark (already-added rows are ignored); the confirm
         // button replays Enter through the key handler to collect the checked aliases; cancel closes.
         compositor::SidebarHitTarget::SshHostPickerRow { index } => {
@@ -6177,6 +6184,7 @@ async fn run_client_loop(
                 match result {
                     Ok(hosts) => {
                         if let Some(model) = &mut state.supervisor_model {
+                            model.clear_ssh_host_fetch();
                             let existing = model.synced_remotes().to_vec();
                             // Only open if the Add Remote overlay the fetch was launched from is still
                             // active — a late/duplicate result must not pop the picker unexpectedly.
@@ -6188,6 +6196,7 @@ async fn run_client_loop(
                         // Surface the failure on the Add Remote overlay if it's still open (the user
                         // launched this fetch from it); a late result after it closed stays log-only.
                         if let Some(model) = &mut state.supervisor_model {
+                            model.clear_ssh_host_fetch();
                             // Generic: the fetch can fail for reasons other than a local file read
                             // (unsupported API method on an older server, socket failure, etc.).
                             model.set_add_remote_error_if_open(format!(

@@ -35,6 +35,10 @@ pub(crate) struct AddRemoteOverlayView<'a> {
     pub progress: Option<&'a str>,
     /// Current spinner glyph for the in-progress line (advances with the shared animation tick).
     pub spinner: &'a str,
+    /// When true, the "pick from ~/.ssh/config" affordance is inert (an add is in progress or a
+    /// discovery fetch is already in flight) and is rendered disabled so the visuals match the
+    /// hit-test, which makes it unclickable in the same states.
+    pub pick_disabled: bool,
 }
 
 /// View for one new-workspace destination row.
@@ -1012,12 +1016,17 @@ pub(crate) fn render_add_remote_overlay(
 
     // A click-to-open affordance for the multi-select ssh-config picker. Lives on the gap row so the
     // existing field/error/action geometry is unchanged; the hit rect comes from the SAME helper.
+    // Rendered disabled (dim, no bold) while inert so the visuals match the hit-test (which makes it
+    // unclickable during an add or an in-flight fetch).
+    let pick_style = if view.pick_disabled {
+        Style::default().fg(palette.subtext0)
+    } else {
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    };
     frame.render_widget(
-        Paragraph::new(" + pick from ~/.ssh/config").style(
-            Style::default()
-                .fg(palette.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Paragraph::new(" + pick from ~/.ssh/config").style(pick_style),
         add_remote_pick_button_rect(inner),
     );
 

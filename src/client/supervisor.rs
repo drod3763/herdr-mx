@@ -345,6 +345,10 @@ pub(crate) struct AddRemoteForm {
     /// on the in-progress status row in place of the static "connecting to remote…" so seeding a
     /// fresh machine reads as live progress (issue #32). `None` until the first stage arrives.
     pub(crate) progress: Option<String>,
+    /// True while an ssh-config discovery fetch (the "pick from ~/.ssh/config" affordance) is in
+    /// flight. Gates the affordance so a fast double-click cannot spawn duplicate fetch threads, and
+    /// renders it disabled so the visuals match the inert hit-test (PRRT...HqO / PRRT...Hqu).
+    pub(crate) ssh_fetch_in_flight: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1698,7 +1702,30 @@ impl ClientSupervisorModel {
             error: None,
             in_progress: false,
             progress: None,
+            ssh_fetch_in_flight: false,
         });
+    }
+
+    /// Begin an ssh-config discovery fetch from the Add Remote overlay. Returns `true` (and marks the
+    /// fetch in flight) only when the overlay is open, no add is in progress, and no fetch is already
+    /// running — so a fast double-click can't spawn duplicate fetch threads. Returns `false` (no-op)
+    /// otherwise.
+    pub(crate) fn begin_ssh_host_fetch(&mut self) -> bool {
+        if let Some(form) = self.add_remote_form_mut() {
+            if !form.in_progress && !form.ssh_fetch_in_flight {
+                form.ssh_fetch_in_flight = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Clear the in-flight ssh-config fetch flag (the fetch resolved). No-op if the Add Remote
+    /// overlay is no longer open (e.g. the picker already replaced it).
+    pub(crate) fn clear_ssh_host_fetch(&mut self) {
+        if let Some(form) = self.add_remote_form_mut() {
+            form.ssh_fetch_in_flight = false;
+        }
     }
 
     pub(crate) fn add_remote_form(&self) -> Option<&AddRemoteForm> {
@@ -5969,6 +5996,7 @@ mod tests {
                 error: None,
                 in_progress: false,
                 progress: None,
+                ssh_fetch_in_flight: false,
             })
         );
     }
@@ -6097,6 +6125,23 @@ mod tests {
             adding.add_remote_form().and_then(|f| f.error.as_deref()),
             Some("couldn't read ~/.ssh/config")
         );
+    }
+
+    #[test]
+    fn begin_ssh_host_fetch_rejects_duplicates_until_cleared() {
+        // PRRT...Hqu: a fast double-click must not spawn duplicate fetch threads. begin_ssh_host_fetch
+        // marks the fetch in flight and rejects a second start until it is cleared.
+        let mut model = ClientSupervisorModel::new("local");
+        assert!(!model.begin_ssh_host_fetch(), "no overlay → cannot begin");
+
+        model.open_add_remote_form();
+        assert!(model.begin_ssh_host_fetch());
+        assert!(model.add_remote_form().unwrap().ssh_fetch_in_flight);
+        assert!(!model.begin_ssh_host_fetch(), "duplicate fetch rejected");
+
+        model.clear_ssh_host_fetch();
+        assert!(!model.add_remote_form().unwrap().ssh_fetch_in_flight);
+        assert!(model.begin_ssh_host_fetch(), "begins again after clear");
     }
 
     #[test]
