@@ -218,10 +218,11 @@ fn parse_file(
                     continue;
                 }
                 // Once no further file can be read or the request-wide glob-scan budget is spent,
-                // stop processing Include lines entirely — expanding more would be wasted work that
-                // could pin the synchronous app-loop discovery.
+                // skip Include expansion — expanding more would be wasted work that could pin the
+                // synchronous app-loop discovery. Use `continue`, not `break`: the rest of THIS file
+                // (e.g. later `Host` blocks) must still be parsed.
                 if visited_files.len() >= MAX_CONFIG_FILES || *glob_scans_remaining == 0 {
-                    break;
+                    continue;
                 }
                 for included in resolve_includes(rest, glob_scans_remaining) {
                     parse_file(
@@ -659,6 +660,25 @@ mod tests {
             aliases,
             vec!["real".to_string()],
             "the oversized include's hosts must be skipped"
+        );
+    }
+
+    #[test]
+    fn include_budget_exhaustion_still_parses_later_host_lines() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // PRRT...Hph: exhausting the file/glob budget must stop only further Include expansion, not
+        // the rest of the current file — `Host` blocks after the spent Include still get parsed.
+        let fixture = ConfigFixture::new(
+            "budget-continue",
+            "Include config.d/*\nInclude config.d/*\nHost trailing\n  HostName t.host\n",
+        );
+        for i in 0..MAX_CONFIG_FILES {
+            fixture.write_extra(&format!("config.d/g{i}"), &format!("Host g{i}\n"));
+        }
+        let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
+        assert!(
+            aliases.contains(&"trailing".to_string()),
+            "a Host after a budget-exhausted Include must still be parsed"
         );
     }
 
