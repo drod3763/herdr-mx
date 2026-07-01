@@ -4219,6 +4219,50 @@ mod tests {
     }
 
     #[test]
+    fn resolve_transport_keeps_custom_when_config_path_is_unreadable() {
+        // A present-but-unreadable config path (here routed through a regular file → ENOTDIR, so
+        // `Path::exists()` is false) must not let `load_live_config`'s default-on-absence path resolve
+        // ssh and bypass the fail-closed custom transport boundary (codex-1-1). With a prior valid
+        // custom transport cached, resolution keeps it instead of silently downgrading to ssh.
+        let dir =
+            std::env::temp_dir().join(format!("herdr-transport-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        let custom = TransportSpec::Custom {
+            program: "corp-proxy".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"corp-proxy\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(resolve_transport().expect("custom resolves"), custom);
+
+        // Point the config path through a regular file so any read/stat fails with ENOTDIR and
+        // `Path::exists()` returns false — the exact case load_live_config's old exists() short-circuit
+        // mistook for "absent".
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let unreadable = blocker.join("config.toml");
+        assert!(
+            !unreadable.exists(),
+            "Path::exists() is false for this path"
+        );
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &unreadable);
+        assert_eq!(
+            resolve_transport().expect("keeps custom, never ssh"),
+            custom,
+            "an unreadable config path must fail closed, not fall open to ssh"
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn resolve_transport_keeps_custom_on_unparseable_config_without_visible_transport() {
         // Direct regression for codex-13-1: a valid custom transport, then a fully unparseable config
         // whose (best-effort) scan shows no transport at all, must keep the custom transport rather

@@ -174,16 +174,26 @@ pub fn config_diagnostic_summary(diagnostics: &[String]) -> Option<String> {
 
 pub fn load_live_config() -> Result<LoadedConfig, Vec<String>> {
     let path = config_path();
-    if !path.exists() {
-        return Ok(LoadedConfig {
-            config: Config::default(),
-            diagnostics: Vec::new(),
-            invalid_sections: Vec::new(),
-        });
-    }
-
-    let content = std::fs::read_to_string(&path)
-        .map_err(|err| vec![format!("config read error: {err}; keeping current config")])?;
+    // Key "no config file" off the read error, not `path.exists()`: `exists()` returns false for a
+    // present-but-unreadable path (e.g. `EACCES`/`ENOTDIR` while stat-ing an inaccessible parent),
+    // which would silently reset to defaults. Only a genuine `NotFound` is absent; any other read
+    // error keeps the current config (Err), so callers that fail closed on a degraded config — like
+    // custom transport resolution — are not handed a default that bypasses their guarantee.
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LoadedConfig {
+                config: Config::default(),
+                diagnostics: Vec::new(),
+                invalid_sections: Vec::new(),
+            });
+        }
+        Err(err) => {
+            return Err(vec![format!(
+                "config read error: {err}; keeping current config"
+            )]);
+        }
+    };
     load_live_config_from_str(&content)
 }
 
