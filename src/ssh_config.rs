@@ -196,6 +196,14 @@ fn parse_file(
     *files_read += 1;
     include_stack.insert(canonical.clone());
 
+    // Whether the parser has entered a conditional scope in THIS file. Everything before the first
+    // `Host`/`Match` line is top-level (unconditional); once any `Host` or `Match` block opens, the
+    // rest of the file is conditional and there is no way back to top-level within a file. An
+    // `Include` decides whether its hosts are globally discoverable from this flag — not from whether
+    // a concrete alias happens to be active, because a `Match` block or a pattern-only `Host *.corp`
+    // block is conditional yet leaves no retained alias. #11.
+    let mut in_conditional_scope = false;
+
     for raw_line in contents.lines() {
         let Some((keyword, rest)) = split_keyword(raw_line) else {
             continue;
@@ -203,6 +211,9 @@ fn parse_file(
         match keyword.as_str() {
             "host" => {
                 current_aliases.clear();
+                // A `Host` line opens a conditional scope: any `Include` beneath it is conditional
+                // even when the pattern is a non-connectable wildcard that retains no alias.
+                in_conditional_scope = true;
                 // A `Host` inside a conditional include is not a standalone discoverable alias; still
                 // clear attribution so its own `HostName`/`User` don't fall onto the enclosing block.
                 if !emit_hosts {
@@ -234,8 +245,10 @@ fn parse_file(
             }
             "match" => {
                 // We only enumerate `Host` blocks; a `Match` block's directives must not attach to
-                // the previous host. Don't crash on `Match` selectors — just stop attributing.
+                // the previous host. Don't crash on `Match` selectors — just stop attributing. A
+                // `Match` also opens a conditional scope, so any `Include` beneath it is conditional.
                 current_aliases.clear();
+                in_conditional_scope = true;
             }
             "hostname" => {
                 // Ignore an over-length value (not a real DNS name). Each set adds to the payload
@@ -277,10 +290,11 @@ fn parse_file(
                 if *files_read >= MAX_CONFIG_FILES || *glob_scans_remaining == 0 {
                     continue;
                 }
-                // An include nested in a `Host` block is conditional: its `Host` blocks are not
-                // discoverable aliases (only the enclosing block's own directives apply). It stays
-                // unconditional only when there is no active `Host` block AND this file already is.
-                let child_emit_hosts = emit_hosts && current_aliases.is_empty();
+                // An include nested in a conditional (`Host`/`Match`) scope is itself conditional: its
+                // `Host` blocks are not globally discoverable aliases, because `ssh <alias>` only
+                // processes the include when the outer condition matches. It stays unconditional only
+                // at top-level scope AND when this file is already being parsed unconditionally.
+                let child_emit_hosts = emit_hosts && !in_conditional_scope;
                 for included in resolve_includes(rest, glob_scans_remaining) {
                     parse_file(
                         &included,
@@ -721,6 +735,47 @@ mod tests {
         assert!(
             !aliases.contains(&"hidden".to_string()),
             "a Host inside a conditional (per-host) include is not discoverable"
+        );
+    }
+
+    #[test]
+    fn include_inside_a_match_block_is_conditional() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex (re-run): a `Match` block opens a conditional scope but retains no alias, so the old
+        // `current_aliases.is_empty()` proxy wrongly treated an Include beneath it as top-level. ssh
+        // only processes that include when the Match condition holds, so its hosts are not globally
+        // discoverable.
+        let fixture = ConfigFixture::new(
+            "match-include",
+            "Host real\n  HostName r.host\n\nMatch host bastion\n  Include config.d/match-only\n",
+        );
+        fixture.write_extra("config.d/match-only", "Host matchhost\n  HostName m.host\n");
+        let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
+
+        assert!(aliases.contains(&"real".to_string()));
+        assert!(
+            !aliases.contains(&"matchhost".to_string()),
+            "a Host inside an Include under a Match block is not discoverable"
+        );
+    }
+
+    #[test]
+    fn include_inside_a_pattern_only_host_block_is_conditional() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex (re-run): `Host *.corp` is a conditional block whose wildcard pattern is filtered out,
+        // so it retains no alias. An Include beneath it must still be treated as conditional — its
+        // hosts are only applied by ssh when a concrete destination matches `*.corp`.
+        let fixture = ConfigFixture::new(
+            "pattern-host-include",
+            "Host real\n  HostName r.host\n\nHost *.corp\n  Include config.d/corp\n",
+        );
+        fixture.write_extra("config.d/corp", "Host corphidden\n  HostName c.host\n");
+        let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
+
+        assert!(aliases.contains(&"real".to_string()));
+        assert!(
+            !aliases.contains(&"corphidden".to_string()),
+            "a Host inside an Include under a pattern-only Host block is not discoverable"
         );
     }
 
