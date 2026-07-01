@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## [0.7.1-mx.2] - 2026-07-01
+
+herdr-mx multi-remote release. The thin client can now manage secondary local and SSH-backed Herdr servers from a single sidebar, discover remotes from `~/.ssh/config`, reach hosts through a configurable transport, and hide nested `herdr --remote` mirror panes.
+
 ### Added
 - Added a configurable remote transport via `[remote.transport]`, so `herdr --remote` can reach hosts through a program other than `ssh` (for example `autossh` or a wrapper script). The template expands `{host}`, `{remote_command}`, and `{options}` placeholders; the default `ssh -T` behavior is unchanged when unset. The replacement must provide a raw binary stdio channel, so terminal transports such as mosh and Eternal Terminal cannot serve as the bridge. (#10)
 - Added mixed remote headless server support: the thin client can manage secondary local or SSH-backed Herdr servers from the sidebar, persist the remote registry on the main server, show combined workspace and agent summaries, route workspace creation/focus to the selected server, and keep secondary disconnects isolated from the main session.
