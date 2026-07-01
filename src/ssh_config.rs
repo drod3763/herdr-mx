@@ -108,7 +108,7 @@ pub fn discover_hosts() -> Vec<SshConfigHost> {
         &mut payload_bytes,
         &mut current_aliases,
         &mut glob_scans_remaining,
-        true,
+        &[],
     );
     hosts
 }
@@ -162,11 +162,12 @@ fn parse_file(
     current_aliases: &mut Vec<usize>,
     // Request-wide remaining glob-scan budget (see `MAX_TOTAL_GLOB_SCANS`).
     glob_scans_remaining: &mut usize,
-    // Whether `Host` lines in THIS file yield discoverable aliases. False inside a conditional
-    // include — one nested in a `Host` block — since OpenSSH only processes such an include when the
-    // enclosing host matches, so a `Host` defined only there is not a standalone connectable alias.
-    // Directives before any `Host` line still attribute to the enclosing block (inline semantics).
-    emit_hosts: bool,
+    // Stack of enclosing conditional gates from the ancestor `Host`/`Match` blocks that led to this
+    // file via nested `Include`s. Empty at top level (an unconditionally reached file). A `Host` alias
+    // in this file is discoverable only if it satisfies every gate — mirroring that ssh processes a
+    // conditional include, and the aliases it defines, only when the connection matches the enclosing
+    // conditions. Directives before any `Host` line still attribute to the enclosing block. #11.
+    gates: &[IncludeGate],
 ) {
     // Canonicalize so a cycle is detected regardless of how the same file is reached.
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -196,13 +197,11 @@ fn parse_file(
     *files_read += 1;
     include_stack.insert(canonical.clone());
 
-    // Whether the parser has entered a conditional scope in THIS file. Everything before the first
-    // `Host`/`Match` line is top-level (unconditional); once any `Host` or `Match` block opens, the
-    // rest of the file is conditional and there is no way back to top-level within a file. An
-    // `Include` decides whether its hosts are globally discoverable from this flag — not from whether
-    // a concrete alias happens to be active, because a `Match` block or a pattern-only `Host *.corp`
-    // block is conditional yet leaves no retained alias. #11.
-    let mut in_conditional_scope = false;
+    // The active condition opened by the most recent `Host`/`Match` line in THIS file. `None` before
+    // any such line (top-level of this file). It gates only CHILD includes: a nested `Include` is
+    // conditional on it. A `Host`/`Match` block or a pattern-only `Host *.corp` block all set this,
+    // so conditional-vs-top-level is tracked precisely rather than inferred from a retained alias. #11.
+    let mut active_gate: Option<IncludeGate> = None;
 
     for raw_line in contents.lines() {
         let Some((keyword, rest)) = split_keyword(raw_line) else {
@@ -211,19 +210,21 @@ fn parse_file(
         match keyword.as_str() {
             "host" => {
                 current_aliases.clear();
-                // A `Host` line opens a conditional scope: any `Include` beneath it is conditional
-                // even when the pattern is a non-connectable wildcard that retains no alias.
-                in_conditional_scope = true;
-                // A `Host` inside a conditional include is not a standalone discoverable alias; still
-                // clear attribution so its own `HostName`/`User` don't fall onto the enclosing block.
-                if !emit_hosts {
-                    continue;
-                }
+                // A `Host` line opens a conditional scope for any `Include` beneath it — even when the
+                // pattern is a non-connectable wildcard. Record its patterns so a child include is
+                // gated on them.
+                active_gate = Some(IncludeGate::host(rest));
                 for token in tokenize(rest) {
                     if hosts.len() >= MAX_HOSTS || *payload_bytes >= MAX_TOTAL_PAYLOAD_BYTES {
                         break;
                     }
                     if !is_connectable_alias(&token) {
+                        continue;
+                    }
+                    // A `Host` reached through conditional includes is discoverable only if it
+                    // satisfies every enclosing gate — i.e. `ssh <alias>` would actually process the
+                    // includes that led here. Top-level files have no gates, so all aliases pass.
+                    if !gates.iter().all(|gate| gate.admits(&token)) {
                         continue;
                     }
                     if !seen_aliases.insert(token.clone()) {
@@ -246,9 +247,10 @@ fn parse_file(
             "match" => {
                 // We only enumerate `Host` blocks; a `Match` block's directives must not attach to
                 // the previous host. Don't crash on `Match` selectors — just stop attributing. A
-                // `Match` also opens a conditional scope, so any `Include` beneath it is conditional.
+                // `Match` opens an opaque conditional scope, so any `Include` beneath it is
+                // conditional on a selector we can't evaluate statically.
                 current_aliases.clear();
-                in_conditional_scope = true;
+                active_gate = Some(IncludeGate::MatchOpaque);
             }
             "hostname" => {
                 // Ignore an over-length value (not a real DNS name). Each set adds to the payload
@@ -290,11 +292,18 @@ fn parse_file(
                 if *files_read >= MAX_CONFIG_FILES || *glob_scans_remaining == 0 {
                     continue;
                 }
-                // An include nested in a conditional (`Host`/`Match`) scope is itself conditional: its
-                // `Host` blocks are not globally discoverable aliases, because `ssh <alias>` only
-                // processes the include when the outer condition matches. It stays unconditional only
-                // at top-level scope AND when this file is already being parsed unconditionally.
-                let child_emit_hosts = emit_hosts && !in_conditional_scope;
+                // An include nested in a conditional (`Host`/`Match`) scope is itself conditional: push
+                // this file's active gate onto the stack so the included file's aliases are surfaced
+                // only when they satisfy every enclosing condition. An include at top level of this
+                // file (no active gate) inherits the stack unchanged, staying unconditional.
+                let child_gates = match &active_gate {
+                    Some(gate) => {
+                        let mut extended = gates.to_vec();
+                        extended.push(gate.clone());
+                        extended
+                    }
+                    None => gates.to_vec(),
+                };
                 for included in resolve_includes(rest, glob_scans_remaining) {
                     parse_file(
                         &included,
@@ -306,7 +315,7 @@ fn parse_file(
                         payload_bytes,
                         current_aliases,
                         glob_scans_remaining,
-                        child_emit_hosts,
+                        &child_gates,
                     );
                 }
             }
@@ -376,6 +385,61 @@ fn is_connectable_alias(token: &str) -> bool {
         && !token.contains('[')
         && !token.contains(']')
         && !token.chars().any(char::is_whitespace)
+}
+
+/// A conditional scope an `Include` sits under. When a file is pulled in via an `Include` nested in a
+/// `Host` or `Match` block, ssh only processes it — and therefore the aliases it defines — when the
+/// connection satisfies that enclosing condition. Discovery mirrors this: an alias from a
+/// conditionally included file is surfaced only if it satisfies every gate on the stack of ancestor
+/// conditions that led to the include. #11.
+#[derive(Clone)]
+enum IncludeGate {
+    /// A `Host` line's pattern list. An alias is admitted when it matches at least one positive
+    /// pattern and no negated (`!`) pattern — ssh's Host-pattern matching. `Host *` admits every
+    /// alias; `Host *.corp` admits only `*.corp` names; a concrete `Host prod` admits only `prod`.
+    HostPatterns {
+        positive: Vec<String>,
+        negated: Vec<String>,
+    },
+    /// A `Match` block. Its selectors (`exec`, `host`, `user`, …) can't be evaluated statically for
+    /// an arbitrary future target, so nothing beneath it is treated as unconditionally discoverable.
+    MatchOpaque,
+}
+
+impl IncludeGate {
+    /// Build a `Host`-pattern gate from the tokens of a `Host` line, splitting negated patterns.
+    fn host(rest: &str) -> Self {
+        let mut positive = Vec::new();
+        let mut negated = Vec::new();
+        for token in tokenize(rest) {
+            if let Some(stripped) = token.strip_prefix('!') {
+                if !stripped.is_empty() {
+                    negated.push(stripped.to_string());
+                }
+            } else if !token.is_empty() {
+                positive.push(token);
+            }
+        }
+        IncludeGate::HostPatterns { positive, negated }
+    }
+
+    /// Whether `alias` satisfies this gate — i.e. `ssh <alias>` would process the gated include.
+    fn admits(&self, alias: &str) -> bool {
+        match self {
+            IncludeGate::MatchOpaque => false,
+            IncludeGate::HostPatterns { positive, negated } => {
+                if negated
+                    .iter()
+                    .any(|p| glob_match_chars(&p.chars().collect::<Vec<_>>(), alias))
+                {
+                    return false;
+                }
+                positive
+                    .iter()
+                    .any(|p| glob_match_chars(&p.chars().collect::<Vec<_>>(), alias))
+            }
+        }
+    }
 }
 
 /// Resolve the path tokens of an `Include` line to concrete files. Relative paths are resolved
@@ -760,13 +824,13 @@ mod tests {
     }
 
     #[test]
-    fn include_inside_a_pattern_only_host_block_is_conditional() {
+    fn include_under_host_pattern_hides_aliases_that_cannot_match_it() {
         let _lock = ENV_LOCK.lock().unwrap();
-        // codex (re-run): `Host *.corp` is a conditional block whose wildcard pattern is filtered out,
-        // so it retains no alias. An Include beneath it must still be treated as conditional — its
-        // hosts are only applied by ssh when a concrete destination matches `*.corp`.
+        // codex (re-run): an Include under `Host *.corp` is conditional. A host inside it that CANNOT
+        // match the enclosing pattern (`corphidden` has no `.corp` suffix) is never processed by
+        // `ssh corphidden`, so it must not be surfaced.
         let fixture = ConfigFixture::new(
-            "pattern-host-include",
+            "pattern-host-include-miss",
             "Host real\n  HostName r.host\n\nHost *.corp\n  Include config.d/corp\n",
         );
         fixture.write_extra("config.d/corp", "Host corphidden\n  HostName c.host\n");
@@ -775,7 +839,54 @@ mod tests {
         assert!(aliases.contains(&"real".to_string()));
         assert!(
             !aliases.contains(&"corphidden".to_string()),
-            "a Host inside an Include under a pattern-only Host block is not discoverable"
+            "a Host that cannot match the enclosing Host pattern is not discoverable"
+        );
+    }
+
+    #[test]
+    fn include_under_host_pattern_surfaces_aliases_that_match_it() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex (re-run): the flip side — a host inside an Include under `Host *.corp` that DOES match
+        // the pattern (`db.corp`) is processed by `ssh db.corp`, so it is a real connectable alias and
+        // must be surfaced. Also covers the catch-all `Host *` case.
+        let fixture = ConfigFixture::new(
+            "pattern-host-include-hit",
+            "Host *.corp\n  Include config.d/corp\n\nHost *\n  Include config.d/all\n",
+        );
+        fixture.write_extra("config.d/corp", "Host db.corp\n  HostName d.host\n");
+        fixture.write_extra("config.d/all", "Host anything\n  HostName a.host\n");
+        let hosts = discover_hosts();
+        let aliases: Vec<_> = hosts.iter().map(|h| h.alias.clone()).collect();
+
+        assert!(
+            aliases.contains(&"db.corp".to_string()),
+            "a Host matching the enclosing `*.corp` pattern is discoverable"
+        );
+        assert!(
+            aliases.contains(&"anything".to_string()),
+            "a Host under a catch-all `Host *` include is discoverable"
+        );
+        // Resolved display fields still attach through the conditional include.
+        let db = hosts.iter().find(|h| h.alias == "db.corp").unwrap();
+        assert_eq!(db.hostname.as_deref(), Some("d.host"));
+    }
+
+    #[test]
+    fn include_under_concrete_host_hides_non_matching_alias() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // A concrete `Host prod` gates its include to `prod` only; a differently-named host defined in
+        // that include is never reached by `ssh <that-name>`, so it stays hidden.
+        let fixture = ConfigFixture::new(
+            "concrete-host-include",
+            "Host prod\n  Include config.d/prod\n",
+        );
+        fixture.write_extra("config.d/prod", "Host staging\n  HostName s.host\n");
+        let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
+
+        assert!(aliases.contains(&"prod".to_string()));
+        assert!(
+            !aliases.contains(&"staging".to_string()),
+            "a Host that cannot match the enclosing concrete Host is not discoverable"
         );
     }
 
