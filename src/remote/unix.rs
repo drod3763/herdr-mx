@@ -2849,6 +2849,15 @@ fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Ou
     // bounded. `hit_deadline` from either reader, or a watchdog kill, means the operation timed out.
     let (stdout, stdout_timed_out) = stdout_reader.join().unwrap_or_default();
     let (stderr, stderr_timed_out) = stderr_reader.join().unwrap_or_default();
+    // Reap the group unconditionally before releasing the watchdog. If the direct child exits fast
+    // but leaves an in-group descendant holding a pipe, the readers return at the deadline and we set
+    // `done` — which can make the watchdog skip its own kill (it lost the deadline race). Killing here
+    // guarantees such a descendant is gone instead of leaking across retrying probes; the leader has
+    // exited, so on the clean path this is a harmless ESRCH no-op.
+    // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
     done.store(true, Ordering::SeqCst);
     let watchdog_killed = watchdog.join().unwrap_or(false);
     let status = wait_result?;
@@ -4542,6 +4551,59 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "must return shortly after the deadline, not hang on the reader join"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_kills_pipe_holding_descendant_on_timeout() {
+        // Liveness, not just the timeout error: the direct child exits immediately but backgrounds an
+        // in-group descendant that holds stdout open. The readers reach the deadline and `done` is
+        // set, which can make the watchdog skip its own kill (deadline race) — so the cleanup must
+        // SIGKILL the group unconditionally, or the descendant leaks across retrying probes
+        // (codex-10-1). Prove the backgrounded `sleep` is gone after the call returns.
+        let pidfile =
+            std::env::temp_dir().join(format!("herdr-bounded-descendant-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        // `$!` is the backgrounded sleep's pid; it inherits the piped stdout and outlives the shell.
+        let script = format!("sleep 600 & echo $! > '{}'; exit 0", pidfile.display());
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&script);
+        let start = Instant::now();
+        let result = run_bounded_output(command, Duration::from_millis(300));
+        assert_eq!(
+            result.expect_err("held-open stdout must time out").kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "returns near the deadline"
+        );
+
+        let descendant: i32 = std::fs::read_to_string(&pidfile)
+            .expect("pidfile written")
+            .trim()
+            .parse()
+            .expect("descendant pid parses");
+        // `kill(pid, 0)` succeeds while the process exists (even as a zombie) and fails with ESRCH
+        // once it is gone/reaped. Poll briefly since SIGKILL + reparent-reap is asynchronous.
+        let mut alive = true;
+        for _ in 0..100 {
+            if unsafe { libc::kill(descendant, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if alive {
+            // Cleanup guard so a regression doesn't leak a 600s sleep.
+            unsafe {
+                libc::kill(descendant, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(
+            !alive,
+            "the pipe-holding descendant must be killed with the group after a timeout"
         );
     }
 
