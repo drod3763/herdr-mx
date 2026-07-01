@@ -495,62 +495,51 @@ fn resolve_transport() -> io::Result<TransportSpec> {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(spec.clone());
     };
-    // The transport-section state is indeterminate (config won't parse, or its `[remote]` section is
-    // invalid). Decide from what the *current* config declares. `structural_trustworthy` says whether
-    // that declaration comes from a real parse (`config_declares_transport` parsed the TOML to a value
-    // and inspected `remote.transport`) or only from the best-effort text scan used when the file is
-    // unparseable — a scan a truncated / partially written file can fool into reporting "no transport".
-    //
-    // - Yes/Unknown → a transport is declared or can't be ruled out: keep a previously valid *custom*
-    //   transport, else fail closed rather than bypass it over ssh.
-    // - No + trustworthy (a legible removal in an otherwise-parseable file) → fall back to ssh.
-    // - No + NOT trustworthy (unparseable file, scan saw nothing) → do NOT let that low-trust "No"
-    //   downgrade a previously valid custom transport to ssh: keep the custom (fail closed, matching
-    //   the loader's keep-current behavior for a bad config). With no prior custom there is no
-    //   boundary to preserve, so ssh is the safe default a typo elsewhere must not break.
-    let keep_or_default = |structural_trustworthy: bool| -> io::Result<TransportSpec> {
+    // Reached only on a DEGRADED config — the file won't parse/read, or its `[remote]` section is
+    // typed-invalid. A clean, legible removal (a fully valid config with no `[remote.transport]`) is
+    // *not* handled here; it flows through the success path below and authoritatively resolves ssh.
+    // So a "No transport" reading in this degraded state is never authoritative: a previously valid
+    // *custom* transport is preserved (fail closed), because a bad edit / partial write / broken
+    // `[remote]` section must not silently redirect remote operations over built-in ssh and bypass a
+    // wrapper/proxy the user relies on for routing or trust separation. Only when no custom transport
+    // was ever resolved do we decide from the current declaration: `No` → ssh (a typo elsewhere must
+    // not break the default path), `Yes`/`Unknown` → fail closed rather than guess.
+    let keep_or_default = || -> io::Result<TransportSpec> {
+        if let Some(spec @ TransportSpec::Custom { .. }) = previous() {
+            return Ok(spec);
+        }
         match config_declares_transport() {
-            TransportDeclared::No if structural_trustworthy => {
-                // Record ssh as the current valid spec so the now-removed custom transport can't be
-                // resurrected by a later invalid-custom config (whose fallback consults `previous`).
+            TransportDeclared::No => {
+                // No prior custom transport and none declared now: use built-in ssh. Record it so a
+                // later invalid-custom config (whose fallback consults `previous`) still fails closed
+                // instead of resurrecting a spec that was never validly resolved.
                 remember(&TransportSpec::Ssh);
                 Ok(TransportSpec::Ssh)
             }
-            TransportDeclared::No => match previous() {
-                Some(spec @ TransportSpec::Custom { .. }) => Ok(spec),
-                _ => {
-                    remember(&TransportSpec::Ssh);
-                    Ok(TransportSpec::Ssh)
-                }
-            },
-            TransportDeclared::Yes | TransportDeclared::Unknown => match previous() {
-                Some(spec @ TransportSpec::Custom { .. }) => Ok(spec),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "config.toml is degraded and a custom [remote.transport] cannot be ruled out; \
-                     refusing to fall back to built-in ssh",
-                )),
-            },
+            TransportDeclared::Yes | TransportDeclared::Unknown => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "config.toml is degraded and a custom [remote.transport] cannot be ruled out; \
+                 refusing to fall back to built-in ssh",
+            )),
         }
     };
 
     // Config currently fails to parse/read (`load_live_config` returns `Ok(default)` when the file
-    // is absent, `Err` only when a present file fails to read/parse). Unparseable → any transport
-    // declaration can only come from the text scan, so it is NOT structurally trustworthy.
+    // is absent, `Err` only when a present file fails to read/parse).
     let Ok(loaded) = crate::config::load_live_config() else {
-        return keep_or_default(false);
+        return keep_or_default();
     };
-    // `load_live_config` returns Ok even when the `[remote]` section fails to deserialize: it
-    // records the section in `invalid_sections` and leaves `config.remote` at its default. Deriving
-    // a transport from that default would silently drop a configured custom transport, so treat an
-    // invalid `[remote]` section the same way. Here the file DID parse to a TOML value, so
-    // `config_declares_transport`'s structural lookup is reliable → trustworthy.
+    // `load_live_config` returns Ok even when the `[remote]` section fails to deserialize: it records
+    // the section in `invalid_sections` and leaves `config.remote` at its default. Deriving a
+    // transport from that default would silently drop a configured custom transport, so treat an
+    // invalid `[remote]` section as degraded too — a typed-invalid `[remote]` is not a legible
+    // transport removal, so it must not authoritatively fall open to ssh.
     if loaded
         .invalid_sections
         .iter()
         .any(|section| section == "remote")
     {
-        return keep_or_default(true);
+        return keep_or_default();
     }
     match TransportSpec::from_config(&loaded.config.remote) {
         TransportResolution::Spec(spec) => {
@@ -4301,6 +4290,43 @@ mod tests {
             resolve_transport().expect("keeps custom, never ssh"),
             custom,
             "an unreadable config path must fail closed, not fall open to ssh"
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_keeps_custom_on_invalid_remote_section_without_transport() {
+        // A typed-invalid `[remote]` section (parses as TOML, but the section fails to deserialize)
+        // that no longer shows a transport key is NOT a legible removal — it's a degraded/broken
+        // config. It must not authoritatively fall open to ssh over a previously valid custom
+        // transport; keep the custom (fail closed) until the config is valid again (codex-1-1).
+        let dir =
+            std::env::temp_dir().join(format!("herdr-transport-badremote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        let custom = TransportSpec::Custom {
+            program: "corp-proxy".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"corp-proxy\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(resolve_transport().expect("custom resolves"), custom);
+
+        // `manage_ssh_config` is a bool; a string value makes the whole `[remote]` section fail to
+        // deserialize (recorded in `invalid_sections`) while the TOML still parses. No transport key.
+        std::fs::write(&cfg, "[remote]\nmanage_ssh_config = \"bad\"\n")
+            .expect("write invalid [remote] section");
+        assert_eq!(
+            resolve_transport().expect("keeps custom, never ssh"),
+            custom,
+            "an invalid [remote] section without a transport key must fail closed, not fall to ssh"
         );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
