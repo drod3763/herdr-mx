@@ -2052,6 +2052,16 @@ impl ClientSupervisorModel {
         }
     }
 
+    /// A batch add finished with failures: clear the in-flight `submit_generation` so Enter is
+    /// re-enabled (the user can retry the still-checked failed rows) and surface the error. Without
+    /// clearing the generation the picker would be a dead end after any partial failure.
+    pub(crate) fn fail_ssh_host_submit(&mut self, error: impl Into<String>) {
+        if let Some(overlay) = self.ssh_host_picker_mut() {
+            overlay.submit_generation = None;
+            overlay.error = Some(error.into());
+        }
+    }
+
     /// Toggle the checkmark for row `index` (mouse click), ignoring already-added rows. Out-of-range
     /// indices are ignored. Mirrors `set_remote_manage_selected` + a toggle.
     pub(crate) fn toggle_ssh_host_picker_row(&mut self, index: usize) {
@@ -6232,6 +6242,34 @@ mod tests {
         model.clear_ssh_host_fetch();
         assert!(!model.add_remote_form().unwrap().ssh_fetch_in_flight);
         assert!(model.begin_ssh_host_fetch(), "begins again after clear");
+    }
+
+    #[test]
+    fn fail_ssh_host_submit_reenables_resubmit_after_partial_failure() {
+        use crossterm::event::KeyCode;
+        // codex (re-run): a partial batch-add failure must not leave the picker a dead end. Clearing
+        // submit_generation re-enables Enter so the user can retry the still-checked rows.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_ssh_host_picker(vec![ssh_host("a", None, None)], &[]);
+        model.toggle_ssh_host_picker_row(0);
+        let _gen = model.begin_ssh_host_add();
+        // While the batch is in flight, Enter is gated.
+        assert_eq!(
+            model.handle_ssh_host_picker_key(picker_key(KeyCode::Enter)),
+            SshHostPickerOutcome::Redraw
+        );
+
+        // A partial failure clears the generation and surfaces the error.
+        model.fail_ssh_host_submit("a: boom");
+        assert_eq!(
+            model.ssh_host_picker().and_then(|o| o.error.as_deref()),
+            Some("a: boom")
+        );
+        // Enter now resubmits the still-checked row.
+        assert_eq!(
+            model.handle_ssh_host_picker_key(picker_key(KeyCode::Enter)),
+            SshHostPickerOutcome::Submit(vec!["a".into()])
+        );
     }
 
     #[test]

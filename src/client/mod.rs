@@ -6264,7 +6264,9 @@ async fn run_client_loop(
                         if errors.is_empty() {
                             model.close_ssh_host_picker();
                         } else {
-                            model.set_ssh_host_picker_error(errors.join("; "));
+                            // Clear the in-flight generation so Enter re-enables and the user can
+                            // retry the still-checked failed rows (not a dead-end picker).
+                            model.fail_ssh_host_submit(errors.join("; "));
                         }
                     }
                 }
