@@ -2950,9 +2950,15 @@ fn bridge_connection(
         io::Error::new(io::ErrorKind::BrokenPipe, "transport bridge stdout missing")
     })?;
     let mut stream_to_child = stream.try_clone()?;
+    // A dedicated clone the watchdog polls for local-peer hangup. It must observe the disconnect
+    // independently of the upload thread: a wedged transport that stops reading its stdin can park
+    // the upload thread in `write_all` so it never reaches its read-side EOF and never sets
+    // `local_closed`, which would otherwise leave the watchdog idle and the bridge unkilled.
+    let watchdog_stream = stream.try_clone()?;
     let mut child_to_stream = stream;
     let upload_fd = stream_to_child.as_raw_fd();
     let download_fd = child_stdout.as_raw_fd();
+    let watchdog_fd = watchdog_stream.as_raw_fd();
 
     // Teardown flag shared with both copy threads. After the child exits and its group is cleared
     // (below), we set this so the copy loops stop even if a descendant that escaped the process
@@ -2991,23 +2997,51 @@ fn bridge_connection(
     // Watchdog: once the local stream has closed, give the transport a grace window to exit on its
     // own (a well-behaved transport sees stdin EOF and quits); if it ignores that and keeps the
     // child alive, SIGKILL the whole transport group so a disconnect can't leak it across reconnects.
+    //
+    // It detects the disconnect two ways so a wedged transport can't defeat it: `local_closed` (set
+    // when the upload thread reaches read-side EOF) covers the common case, and polling `watchdog_fd`
+    // for `POLLHUP` covers the case where the upload thread is parked in `write_all` to a transport
+    // that stopped reading its stdin — then it never reaches EOF, so the poll is the only signal.
     let watchdog_done = Arc::new(AtomicBool::new(false));
     let watchdog_finished = Arc::clone(&watchdog_done);
-    let watchdog = thread::spawn(move || loop {
-        if watchdog_finished.load(Ordering::SeqCst) {
-            return;
-        }
-        if local_closed.load(Ordering::SeqCst) {
-            thread::sleep(BRIDGE_SHUTDOWN_GRACE);
-            if !watchdog_finished.load(Ordering::SeqCst) {
-                // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
+    let watchdog = thread::spawn(move || {
+        // Hold the clone open for the thread's lifetime so `watchdog_fd` stays valid to poll.
+        let _watchdog_stream = watchdog_stream;
+        loop {
+            if watchdog_finished.load(Ordering::SeqCst) {
+                return;
             }
-            return;
+            // Poll for a local-peer hangup. `events` must include `POLLIN` for `POLLHUP` to be
+            // reported on a socket (macOS reports nothing for `events = 0`); the 200ms timeout also
+            // paces the `local_closed` / finished re-checks.
+            let mut poll_fd = libc::pollfd {
+                fd: watchdog_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, 200) };
+            let hung_up = ready > 0
+                && (poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0;
+
+            if watchdog_finished.load(Ordering::SeqCst) {
+                return;
+            }
+            if hung_up || local_closed.load(Ordering::SeqCst) {
+                thread::sleep(BRIDGE_SHUTDOWN_GRACE);
+                if !watchdog_finished.load(Ordering::SeqCst) {
+                    // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
+                return;
+            }
+            // A readable wake without a hangup means buffered upload data the parked upload thread
+            // hasn't drained. Back off so this loop doesn't spin while the transport is wedged.
+            if ready > 0 {
+                thread::sleep(Duration::from_millis(100));
+            }
         }
-        thread::sleep(Duration::from_millis(200));
     });
 
     let wait_result = child.wait();
@@ -4033,6 +4067,43 @@ mod tests {
             copy_flush_until_stop(&mut reader, reader_fd, &mut sink, &stop).expect("copy succeeds");
         assert_eq!(copied, 7);
         assert_eq!(sink, b"payload");
+    }
+
+    #[test]
+    fn watchdog_poll_detects_local_hangup_independent_of_upload() {
+        // The bridge watchdog can't rely on the upload thread setting `local_closed`: a transport
+        // that stops reading stdin parks upload in `write_all`, so it never reaches read-side EOF
+        // (codex-6-1). The watchdog instead polls the local socket for a hangup. Guard that signal:
+        // an open, idle peer must NOT report a hangup, and a closed peer MUST — within one poll
+        // window — so teardown fires even while upload is wedged. `events` includes `POLLIN` because
+        // macOS reports nothing for `events = 0`.
+        use std::os::unix::io::AsRawFd as _;
+        let (watched, peer) = std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        let watched_fd = watched.as_raw_fd();
+        let poll_hangup = |timeout_ms: libc::c_int| -> bool {
+            let mut poll_fd = libc::pollfd {
+                fd: watched_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+            ready > 0 && (poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+        };
+
+        assert!(
+            !poll_hangup(100),
+            "an open idle peer must not look like a hangup"
+        );
+        drop(peer); // client disconnects
+        let start = Instant::now();
+        assert!(
+            poll_hangup(500),
+            "a closed peer must report a hangup so the watchdog can fire while upload is parked"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "hangup must be detected promptly, not after a long park"
+        );
     }
 
     #[test]
