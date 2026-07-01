@@ -2518,21 +2518,29 @@ fn wait_exit_success_without_reaping(pid: i32) -> io::Result<bool> {
 /// [`wait_exit_success_without_reaping`] for callers that must keep doing work (e.g. emit progress)
 /// while waiting, and that will send a process-group signal before the final reap.
 fn child_exited_without_reaping(pid: i32) -> io::Result<bool> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            // Retry on EINTR like the other wait/poll helpers, so a signal delivered during the
+            // install wait loop can't spuriously fail provisioning.
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        // `info` was zeroed, and `WNOHANG` leaves `si_signo` at 0 when no child state is available; a
+        // terminated child sets it to `SIGCHLD`.
+        return Ok(info.si_signo != 0);
     }
-    // `info` was zeroed, and `WNOHANG` leaves `si_signo` at 0 when no child state is available; a
-    // terminated child sets it to `SIGCHLD`.
-    Ok(info.si_signo != 0)
 }
 
 /// Drain a **non-blocking** reader to EOF or until `deadline`, retaining only the last `cap` bytes.
@@ -2787,7 +2795,15 @@ fn install_remote_herdr(
                         events: libc::POLLOUT,
                         revents: 0,
                     };
-                    unsafe { libc::poll(&mut poll_fd, 1, 250) };
+                    let ready = unsafe { libc::poll(&mut poll_fd, 1, 250) };
+                    if ready < 0 {
+                        let poll_err = io::Error::last_os_error();
+                        // EINTR just retries the write next pass; any other poll error is real.
+                        if poll_err.kind() != io::ErrorKind::Interrupted {
+                            copy_result = Err(poll_err);
+                            break 'copy;
+                        }
+                    }
                 }
                 Err(err) => {
                     copy_result = Err(err);
@@ -2867,7 +2883,11 @@ fn install_remote_herdr(
             thread::sleep(Duration::from_millis(50));
         }
         stderr_stop.store(true, Ordering::SeqCst);
-        let stderr = stderr_reader.join().unwrap_or_default();
+        // A panic in the stderr reader shouldn't be silently swallowed as empty output on an install
+        // that is already failing — surface it in the diagnostic instead.
+        let stderr = stderr_reader
+            .join()
+            .unwrap_or_else(|_| b"<stderr reader thread panicked>".to_vec());
         let stderr = String::from_utf8_lossy(&stderr);
         let stderr = stderr.trim();
         Err(io::Error::other(if stderr.is_empty() {
@@ -2955,6 +2975,10 @@ fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Ou
     // so its pid — and therefore the group id — is guaranteed ours. Reaping first would free the pid
     // for up to the whole deadline (the readers can block that long on an escaped pipe holder), and a
     // recycled pid could redirect the group kill at an unrelated local process group.
+    // Default to empty output if a reader thread's join fails. Propagating early here would skip the
+    // watchdog-stop / group-kill / reap sequence below and leak the child — and the readers run only
+    // the panic-free `read_to_capped_tail_until`, so a join failure cannot actually occur. The
+    // `timed_out` signal below still bounds a genuinely bad run.
     let (stdout, stdout_timed_out) = stdout_reader.join().unwrap_or_default();
     let (stderr, stderr_timed_out) = stderr_reader.join().unwrap_or_default();
     // Stop the watchdog first (any kill it already sent was while the leader was unreaped), then reap
