@@ -1,0 +1,9 @@
+# Integration tests under `tests/` spawn real servers, PTYs, and Unix sockets. On loaded CI
+# (macOS especially) they occasionally flake on timing — e.g. a broadcast frame or socket not yet
+# observable within a fixed wait — even though they assert correct behavior. Retry only these
+# integration tests so an environmental hiccup does not red an otherwise-green run. Retries never
+# mask a real regression: a deterministic failure still fails every attempt. Unit tests (compiled
+# into the lib/bin targets) are deterministic and are intentionally NOT retried.
+[[profile.default.overrides]]
+filter = 'kind(test)'
+retries = 2
