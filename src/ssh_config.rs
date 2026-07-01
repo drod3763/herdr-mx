@@ -398,10 +398,14 @@ enum IncludeGate {
     /// A `Host` line's pattern list. An alias is admitted when it matches at least one positive
     /// pattern and no negated (`!`) pattern — ssh's Host-pattern matching for the `*`/`?` wildcards.
     /// `Host *` admits every alias; `Host *.corp` admits only `*.corp` names; a concrete `Host prod`
-    /// admits only `prod`. Bracket character classes (`Host db-[0-9]`) are matched literally, not
-    /// expanded. This can only ever under-report, never mis-admit: the candidate alias is always
-    /// bracket-free (`is_connectable_alias` rejects `[`/`]` before the gate runs), so a gate pattern
-    /// with literal brackets can never match it — it just drops the reachable `db-[0-9]`-style alias.
+    /// admits only `prod`. Bracket character classes (`db-[0-9]`) are matched literally, not expanded:
+    /// - In a *positive* pattern that only under-reports — the candidate is always bracket-free
+    ///   (`is_connectable_alias` rejects `[`/`]`), so a literal-bracket pattern just fails to match and
+    ///   drops the reachable `db-[0-9]`-style alias.
+    /// - In a *negated* pattern a literal-treated class would FAIL to match and wrongly *keep* an alias
+    ///   ssh excludes (a false offer). So `admits` treats any gate with a bracketed negation as
+    ///   admitting nothing. Net: the gate can under-report but never mis-admit.
+    ///
     /// A rare pattern in a rare (gating) position; the fallback is typing the alias by hand.
     HostPatterns {
         positive: Vec<String>,
@@ -455,6 +459,14 @@ impl IncludeGate {
         match self {
             IncludeGate::MatchOpaque => false,
             IncludeGate::HostPatterns { positive, negated } => {
+                // A negated pattern with a bracket character class (`!db-[0-9]`) is one this matcher
+                // can't evaluate — `glob_match_chars` treats `[`/`]` literally and would FAIL to
+                // match, wrongly *keeping* an alias ssh actually excludes. That is the unsafe
+                // direction (offering an unreachable alias), so when exclusion is unprovable, refuse
+                // to admit. (Positive bracket patterns fail-to-match too, but that only under-reports.)
+                if negated.iter().any(|p| p.contains('[') || p.contains(']')) {
+                    return false;
+                }
                 if negated
                     .iter()
                     .any(|p| glob_match_chars(&p.chars().collect::<Vec<_>>(), alias))
@@ -874,6 +886,26 @@ mod tests {
         );
         let other = hosts.iter().find(|h| h.alias == "other").unwrap();
         assert_eq!(other.hostname.as_deref(), Some("o.host"));
+    }
+
+    #[test]
+    fn include_under_negated_bracket_host_gate_is_not_surfaced() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex: `Host * !db-[0-9]` excludes `db-1` in ssh, so the include never applies to db-1 and
+        // `ssh db-1` would not resolve through it. The matcher can't evaluate the bracket class in a
+        // negation, so it must NOT offer db-1 (mis-admit is the unsafe direction). Conservative: a gate
+        // with a bracketed negation admits nothing.
+        let fixture = ConfigFixture::new(
+            "negated-bracket-gate",
+            "Host * !db-[0-9]\n  Include config.d/dbs\n",
+        );
+        fixture.write_extra("config.d/dbs", "Host db-1\n  HostName d1.host\n");
+        let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
+
+        assert!(
+            !aliases.contains(&"db-1".to_string()),
+            "an alias under a negated bracket-class Host gate must not be surfaced (unprovable exclusion)"
+        );
     }
 
     #[test]
