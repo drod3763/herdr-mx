@@ -108,6 +108,7 @@ pub fn discover_hosts() -> Vec<SshConfigHost> {
         &mut payload_bytes,
         &mut current_aliases,
         &mut glob_scans_remaining,
+        true,
     );
     hosts
 }
@@ -161,6 +162,11 @@ fn parse_file(
     current_aliases: &mut Vec<usize>,
     // Request-wide remaining glob-scan budget (see `MAX_TOTAL_GLOB_SCANS`).
     glob_scans_remaining: &mut usize,
+    // Whether `Host` lines in THIS file yield discoverable aliases. False inside a conditional
+    // include — one nested in a `Host` block — since OpenSSH only processes such an include when the
+    // enclosing host matches, so a `Host` defined only there is not a standalone connectable alias.
+    // Directives before any `Host` line still attribute to the enclosing block (inline semantics).
+    emit_hosts: bool,
 ) {
     // Canonicalize so a cycle is detected regardless of how the same file is reached.
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -197,6 +203,11 @@ fn parse_file(
         match keyword.as_str() {
             "host" => {
                 current_aliases.clear();
+                // A `Host` inside a conditional include is not a standalone discoverable alias; still
+                // clear attribution so its own `HostName`/`User` don't fall onto the enclosing block.
+                if !emit_hosts {
+                    continue;
+                }
                 for token in tokenize(rest) {
                     if hosts.len() >= MAX_HOSTS || *payload_bytes >= MAX_TOTAL_PAYLOAD_BYTES {
                         break;
@@ -266,6 +277,10 @@ fn parse_file(
                 if *files_read >= MAX_CONFIG_FILES || *glob_scans_remaining == 0 {
                     continue;
                 }
+                // An include nested in a `Host` block is conditional: its `Host` blocks are not
+                // discoverable aliases (only the enclosing block's own directives apply). It stays
+                // unconditional only when there is no active `Host` block AND this file already is.
+                let child_emit_hosts = emit_hosts && current_aliases.is_empty();
                 for included in resolve_includes(rest, glob_scans_remaining) {
                     parse_file(
                         &included,
@@ -277,6 +292,7 @@ fn parse_file(
                         payload_bytes,
                         current_aliases,
                         glob_scans_remaining,
+                        child_emit_hosts,
                     );
                 }
             }
@@ -628,9 +644,9 @@ mod tests {
     #[test]
     fn include_attributes_directives_to_the_active_host_block_inline() {
         let _lock = ENV_LOCK.lock().unwrap();
-        // PRRT...oT2: OpenSSH processes an Include as if its contents were inserted inline, so a
-        // per-host include must attribute its HostName/User to the including file's active Host block,
-        // and a Host opened inside the include continues as the active block afterward.
+        // PRRT...oT2 + codex (re-run): a per-host `Include` attributes its leading HostName/User to
+        // the enclosing `Host` block (inline directives), but it is CONDITIONAL — a `Host` opened
+        // inside it is not a standalone discoverable alias (OpenSSH only sees it when `prod` matches).
         let fixture = ConfigFixture::new(
             "include-inline",
             "Host prod\n  Include config.d/prod\n\nHost plain\n  HostName p.host\n",
@@ -644,12 +660,11 @@ mod tests {
         let prod = hosts.iter().find(|h| h.alias == "prod").expect("prod row");
         assert_eq!(prod.hostname.as_deref(), Some("10.0.0.5"));
         assert_eq!(prod.user.as_deref(), Some("deploy"));
-        // The include's own trailing Host is captured with its HostName.
-        let extra = hosts
-            .iter()
-            .find(|h| h.alias == "extra")
-            .expect("extra row");
-        assert_eq!(extra.hostname.as_deref(), Some("e.host"));
+        // `extra` (a Host opened inside the conditional per-host include) is NOT surfaced.
+        assert!(
+            !hosts.iter().any(|h| h.alias == "extra"),
+            "a Host inside a conditional include is not a discoverable alias"
+        );
         // After the include returns, the including file's next Host is its own block.
         let plain = hosts
             .iter()
@@ -683,6 +698,30 @@ mod tests {
         let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
         assert!(aliases.contains(&"alpha".to_string()));
         assert!(aliases.contains(&"bravo".to_string()));
+    }
+
+    #[test]
+    fn conditional_include_hosts_are_not_discoverable_but_top_level_ones_are() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex (re-run): a Host inside a per-host (conditional) include is not a standalone alias,
+        // but a Host inside a TOP-LEVEL (unconditional) include is.
+        let fixture = ConfigFixture::new(
+            "conditional-include",
+            "Include config.d/top\n\nHost gate\n  Include config.d/hidden\n",
+        );
+        fixture.write_extra("config.d/top", "Host toplevel\n  HostName t.host\n");
+        fixture.write_extra("config.d/hidden", "Host hidden\n  HostName h.host\n");
+        let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
+
+        assert!(
+            aliases.contains(&"toplevel".to_string()),
+            "top-level include host is discoverable"
+        );
+        assert!(aliases.contains(&"gate".to_string()));
+        assert!(
+            !aliases.contains(&"hidden".to_string()),
+            "a Host inside a conditional (per-host) include is not discoverable"
+        );
     }
 
     #[test]
