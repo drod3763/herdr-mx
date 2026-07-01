@@ -583,6 +583,24 @@ enum TransportDeclared {
     Unknown,
 }
 
+/// Return `line` with any trailing TOML inline comment (`# …`) removed. Quote-aware: a `#` inside a
+/// basic (`"`) or literal (`'`) string is not a comment, so a genuine transport line with a `#` in a
+/// value (e.g. a `ProxyCommand`) keeps its keywords. Best-effort — used only by the unparseable-config
+/// text scan in [`config_declares_transport`].
+fn strip_toml_inline_comment(line: &str) -> &str {
+    let mut in_basic = false;
+    let mut in_literal = false;
+    for (index, ch) in line.char_indices() {
+        match ch {
+            '"' if !in_literal => in_basic = !in_basic,
+            '\'' if !in_basic => in_literal = !in_literal,
+            '#' if !in_basic && !in_literal => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
 /// Inspect whether the config declares a custom transport (`remote.transport`). Used only when the
 /// config fails to parse / its `[remote]` section is invalid, to distinguish a config that intends a
 /// custom transport (fail closed) from one that does not (fall back to ssh).
@@ -630,8 +648,12 @@ fn config_declares_transport() -> TransportDeclared {
     // to TOML spellings the specific checks miss. Over-detection only errs toward failing closed.
     let mut in_remote_table = false;
     let scanned = content.lines().any(|line| {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') {
+        // Drop a trailing inline comment before scanning, so an unrelated comment that happens to
+        // mention `remote`/`transport` (e.g. `onboarding = false # remote transport`) can't trip the
+        // catch-all below into a false positive. Quote-aware so a `#` *inside* a string on a genuine
+        // transport line isn't mistaken for a comment (that would drop the keyword and fail open).
+        let trimmed = strip_toml_inline_comment(line).trim();
+        if trimmed.is_empty() {
             return false;
         }
         let compact: String = trimmed.chars().filter(|ch| !ch.is_whitespace()).collect();
@@ -4352,6 +4374,57 @@ mod tests {
         let cfg = dir.join("does-not-exist.toml");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
         assert_eq!(config_declares_transport(), TransportDeclared::No);
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_toml_inline_comment_is_quote_aware() {
+        assert_eq!(strip_toml_inline_comment("a = 1 # c"), "a = 1 ");
+        assert_eq!(strip_toml_inline_comment("# whole line"), "");
+        assert_eq!(
+            strip_toml_inline_comment("no comment here"),
+            "no comment here"
+        );
+        // A `#` inside a basic or literal string is not a comment.
+        assert_eq!(strip_toml_inline_comment("x = \"a#b\""), "x = \"a#b\"");
+        assert_eq!(strip_toml_inline_comment("y = 'a#b' # c"), "y = 'a#b' ");
+    }
+
+    #[test]
+    fn config_declares_transport_ignores_inline_comment_in_text_scan() {
+        // An unparseable config whose only mention of remote/transport is in an inline comment must
+        // not be scanned as declaring a transport — otherwise the catch-all fails closed spuriously
+        // (copilot-C). The trailing `[broken` keeps the file unparseable so the text-scan path runs.
+        let dir = std::env::temp_dir().join(format!("herdr-cfg-comment-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, "onboarding = false # remote transport\n[broken\n")
+            .expect("write config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(config_declares_transport(), TransportDeclared::No);
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_declares_transport_still_detects_a_declaration_with_a_trailing_comment() {
+        // Stripping inline comments must not cause a false negative: a real `[remote.transport]` with
+        // a trailing comment, in an unparseable file, is still detected (fail closed).
+        let dir =
+            std::env::temp_dir().join(format!("herdr-cfg-decl-comment-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // Unterminated array → unparseable → text-scan path; header has a trailing comment.
+        std::fs::write(
+            &cfg,
+            "[remote.transport] # my proxy\nprogram = \"x\"\nargs = [\n",
+        )
+        .expect("write config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(config_declares_transport(), TransportDeclared::Yes);
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
     }
