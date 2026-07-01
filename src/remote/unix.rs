@@ -2455,6 +2455,12 @@ fn read_to_capped_tail_until<R: io::Read>(
                     let overflow = tail.len() - cap;
                     tail.drain(..overflow);
                 }
+                // Enforce the deadline even while data keeps flowing: a descendant that escaped the
+                // process group could emit continuously and never yield a `WouldBlock`, so a check
+                // only in that branch would let this loop run forever.
+                if Instant::now() >= deadline {
+                    return (tail, true);
+                }
             }
             Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -3772,6 +3778,32 @@ mod tests {
         assert!(!hit_deadline);
         assert_eq!(tail.len(), 4096);
         assert_eq!(tail, &data[data.len() - 4096..]);
+    }
+
+    #[test]
+    fn read_to_capped_tail_until_returns_at_deadline_under_continuous_output() {
+        // A descendant that escaped the process group could emit continuously (read() always returns
+        // data, never WouldBlock/EOF). The drain must still return at the deadline instead of looping
+        // forever.
+        struct EndlessReader;
+        impl io::Read for EndlessReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                buf.iter_mut().for_each(|byte| *byte = b'x');
+                Ok(buf.len())
+            }
+        }
+        let start = Instant::now();
+        let (data, hit_deadline) =
+            read_to_capped_tail_until(&mut EndlessReader, 4096, start + Duration::from_millis(200));
+        assert!(
+            hit_deadline,
+            "continuous output past the deadline must report a timeout"
+        );
+        assert_eq!(data.len(), 4096, "output stays capped");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return at the deadline, not loop forever on flowing data"
+        );
     }
 
     #[test]
