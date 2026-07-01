@@ -7,3 +7,11 @@
 [[profile.default.overrides]]
 filter = 'kind(test)'
 retries = 2
+
+# A named exception among the unit tests: this one asserts a *timing ratio* (reused-shell cost stays
+# ~flat vs. a growing full rebuild). Despite generous bounds it can exceed them under noisy CI
+# scheduling, unrelated to any code change. Retry just this test by name so its environmental flake
+# doesn't red the run; every other unit test stays non-retried so a real regression still fails.
+[[profile.default.overrides]]
+filter = 'test(reused_shell_cost_is_flat_in_agent_count_while_rebuild_grows)'
+retries = 2
