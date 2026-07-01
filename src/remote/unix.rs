@@ -3367,7 +3367,17 @@ fn bridge_connection(
                 return;
             }
             if hung_up || poll_failed || local_closed.load(Ordering::SeqCst) {
-                thread::sleep(BRIDGE_SHUTDOWN_GRACE);
+                // Give the transport a grace window to exit on its own, but poll `watchdog_finished`
+                // during it: when the bridge exits promptly after the disconnect (the common case),
+                // the main thread signals `watchdog_done` mid-grace, and a single blocking sleep would
+                // otherwise make `watchdog.join()` stall the whole teardown for the full grace period.
+                let grace_deadline = Instant::now() + BRIDGE_SHUTDOWN_GRACE;
+                while Instant::now() < grace_deadline {
+                    if watchdog_finished.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
                 if !watchdog_finished.load(Ordering::SeqCst) {
                     // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
                     unsafe {
