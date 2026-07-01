@@ -156,9 +156,11 @@ fn parse_file(
     // Total bytes of alias/hostname/user strings retained so far (see `MAX_TOTAL_PAYLOAD_BYTES`).
     payload_bytes: &mut usize,
     // The aliases of the current `Host` block, awaiting `HostName`/`User` lines beneath them.
-    // Threaded through `Include` so the active block is shared across the include boundary (OpenSSH
-    // inserts included contents inline): a per-host include attributes to the including block, and a
-    // `Host` opened in the include continues as the active block on return. A `Match` clears it.
+    // Threaded through `Include` so pre-`Host` directives in an included file attribute to the
+    // including block (OpenSSH inline-insertion for a shared include). The `Include` arm saves and
+    // restores this around the recursive call, matching OpenSSH: a `Host` opened inside the included
+    // file does NOT persist as the active block after the include returns (verified with `ssh -G`),
+    // so a later parent `HostName`/`User` still attaches to the parent block. A `Match` clears it.
     current_aliases: &mut Vec<usize>,
     // Request-wide remaining glob-scan budget (see `MAX_TOTAL_GLOB_SCANS`).
     glob_scans_remaining: &mut usize,
@@ -305,6 +307,14 @@ fn parse_file(
                     }
                     None => gates.to_vec(),
                 };
+                // Save the active block so it is restored after the include. OpenSSH restores the
+                // including file's active `Host` scope once the include returns: a `Host` line inside
+                // the included file does NOT leak forward, so a later parent `HostName`/`User` still
+                // attaches to the parent block (verified against `ssh -G`). Pre-`Host` directives in
+                // the included file still mutate the parent block during the call, because
+                // `current_aliases` still holds the parent aliases until the child opens its own
+                // `Host` — that shared-include attribution is preserved.
+                let saved_aliases = current_aliases.clone();
                 for included in resolve_includes(rest, glob_scans_remaining) {
                     parse_file(
                         &included,
@@ -319,6 +329,7 @@ fn parse_file(
                         &child_gates,
                     );
                 }
+                *current_aliases = saved_aliases;
             }
             _ => {}
         }
@@ -996,6 +1007,28 @@ mod tests {
         assert!(
             !aliases.contains(&"staging".to_string()),
             "a Host that cannot match the enclosing concrete Host is not discoverable"
+        );
+    }
+
+    #[test]
+    fn parent_directive_after_include_that_opens_a_host_still_attaches_to_parent() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex: OpenSSH restores the including file's active Host scope after an Include — a `Host`
+        // opened in the included file does not leak forward. Verified with `ssh -G parent` on this
+        // exact config: hostname=parent.host AND user=deploy both attach to `parent`, even though
+        // `User deploy` follows an Include whose child opened `Host child`.
+        let fixture = ConfigFixture::new(
+            "include-restore-scope",
+            "Host parent\n  HostName parent.host\n  Include config.d/child\n  User deploy\n",
+        );
+        fixture.write_extra("config.d/child", "Host child\n  HostName child.host\n");
+        let hosts = discover_hosts();
+        let parent = hosts.iter().find(|h| h.alias == "parent").expect("parent");
+        assert_eq!(parent.hostname.as_deref(), Some("parent.host"));
+        assert_eq!(
+            parent.user.as_deref(),
+            Some("deploy"),
+            "User after an Include that opened its own Host must still attach to the parent block"
         );
     }
 
