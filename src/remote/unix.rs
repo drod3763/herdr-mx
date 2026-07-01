@@ -2604,11 +2604,15 @@ trap - EXIT
     // Close stdin so the remote `cat` sees EOF and the child can exit.
     drop(child_stdin);
 
-    // Reap the child, then drain stderr while the watchdog is STILL armed: a descendant that
-    // inherited stderr could outlive the direct child and block this join forever, so the deadline
-    // must be able to kill the group first. Only then cancel + join the watchdog (before propagating
-    // any error, so it can't outlive this function and later SIGKILL a reused process group).
+    // Reap the child, then clear any descendant that inherited stderr so the drain gets EOF promptly.
+    // Without this, a successful install whose descendant holds stderr would wait out the drain's
+    // 300s deadline — outliving the client's 90s idle watchdog and false-failing a completed install.
+    // The leader has exited, so the kill only reaps lingering group members (an empty group is a
+    // harmless ESRCH no-op). Safety: `install_pid` leads its own group (set above).
     let wait_result = child.wait();
+    unsafe {
+        libc::kill(-install_pid, libc::SIGKILL);
+    }
     let stderr = stderr_reader.join().unwrap_or_default();
     install_done.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
