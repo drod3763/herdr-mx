@@ -2664,7 +2664,22 @@ fn install_remote_herdr(
     // 300s deadline — outliving the client's 90s idle watchdog and false-failing a completed install.
     // The leader has exited, so the kill only reaps lingering group members (an empty group is a
     // harmless ESRCH no-op). Safety: `install_pid` leads its own group (set above).
-    let wait_result = child.wait();
+    //
+    // Keep beating progress through this reap so the post-upload wait stays observable: a transport
+    // that consumes the whole payload then hangs before exiting must not let the client's idle
+    // timeout fire — that would clear the operation and let a retry start a second install while this
+    // child is still mutating the remote. The install watchdog SIGKILLs the group at the absolute
+    // deadline, which makes `try_wait` observe the exit and this loop return.
+    let wait_result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                maybe_beat(&mut last_beat);
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => break Err(err),
+        }
+    };
     unsafe {
         libc::kill(-install_pid, libc::SIGKILL);
     }
@@ -4213,6 +4228,66 @@ mod tests {
             "must return shortly after stop, not park on the wedged writer"
         );
         drop(reader_never_drains);
+    }
+
+    #[test]
+    fn install_remote_herdr_reaps_a_lingering_custom_transport() {
+        // End-to-end install over a custom transport that runs the install script LOCALLY, then
+        // lingers before exiting — modelling a transport that consumed the whole payload but is slow
+        // to exit. The post-upload reap must observe the exit and return the real status via the
+        // heartbeat-aware `try_wait` loop (codex-8-1), not a bare `child.wait()`, and the binary must
+        // land intact. HOME is redirected so the script installs into a temp dir; nextest runs each
+        // test in its own process, so mutating HOME here is isolated (same pattern as the config
+        // tests above).
+        let tmp = std::env::temp_dir().join(format!("herdr-install-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create temp HOME");
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+
+        let payload = vec![0xAB_u8; 4096];
+        let source = tmp.join("herdr-source");
+        std::fs::write(&source, &payload).expect("write source binary");
+
+        // `program` runs the remote command locally, then sleeps briefly so the transport child
+        // outlives the install itself — exercising the reap loop's `try_wait` polling.
+        let target = SshTarget {
+            destination: "unused-host".into(),
+            options: vec![],
+            transport: TransportSpec::Custom {
+                program: "sh".into(),
+                args: vec!["-c".into(), "{remote_command}; sleep 0.3".into()],
+            },
+        };
+        let remote_herdr =
+            RemoteHerdr::for_install_suffix(RemotePlatform::local(), ".local/bin/herdr-e2e".into());
+
+        let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let beats_sink = Arc::clone(&beats);
+        let progress = move |_stage: RemoteProvisionStage| {
+            beats_sink.fetch_add(1, Ordering::SeqCst);
+        };
+
+        let start = Instant::now();
+        let result = install_remote_herdr(&target, &remote_herdr, &source, &progress);
+        let elapsed = start.elapsed();
+
+        // Restore HOME before asserting so a failure doesn't leak the override into later work.
+        match prev_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(result.is_ok(), "install should succeed: {result:?}");
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "reap loop must return once the lingering transport exits, not park indefinitely"
+        );
+        let installed = tmp.join(".local/bin/herdr-e2e");
+        let got = std::fs::read(&installed).expect("installed binary readable");
+        assert_eq!(got, payload, "installed bytes must match the source binary");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
