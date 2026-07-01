@@ -941,6 +941,25 @@ impl ClientSupervisorModel {
         id
     }
 
+    /// Insert a secondary for `definition` ONLY if one with the same id isn't already present. A
+    /// concurrent `remote.list` refresh can sync a just-added remote into the model before the batch
+    /// `SshHostsAdded` result arrives, so applying that result must be idempotent — returns the
+    /// `ServerId` when newly inserted (caller schedules the connect), or `None` when it already
+    /// exists (no duplicate sidebar host or retry).
+    pub(crate) fn add_secondary_if_absent(
+        &mut self,
+        definition: crate::remote_registry::RemoteDefinitionSnapshot,
+        connection_state: ConnectionState,
+    ) -> Option<ServerId> {
+        let id = ServerId::secondary(definition.id.clone());
+        if self.servers.iter().any(|server| server.id == id) {
+            return None;
+        }
+        self.servers
+            .push(managed_secondary(definition, connection_state));
+        Some(id)
+    }
+
     pub(crate) fn sync_remote_registry(
         &mut self,
         remotes: Vec<crate::remote_registry::RemoteDefinitionSnapshot>,
@@ -6264,6 +6283,29 @@ mod tests {
             model.handle_ssh_host_picker_key(picker_key(KeyCode::Enter)),
             SshHostPickerOutcome::Submit(vec!["a".into()])
         );
+    }
+
+    #[test]
+    fn add_secondary_if_absent_is_idempotent_against_a_prior_sync() {
+        // codex (re-run): a concurrent remote.list refresh can sync a batch-added remote in before
+        // SshHostsAdded is applied. Re-applying it must not duplicate the secondary or its retry.
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = ssh_remote("remote-1", "prod", "prod");
+        model.sync_remote_registry(vec![remote.clone()]);
+
+        // Already present from the sync → no insert, no ServerId to schedule.
+        assert!(model
+            .add_secondary_if_absent(remote, ConnectionState::Connecting)
+            .is_none());
+
+        // A genuinely new remote inserts and returns its id; re-applying it is then a no-op.
+        let fresh = ssh_remote("remote-2", "stage", "stage");
+        assert!(model
+            .add_secondary_if_absent(fresh.clone(), ConnectionState::Connecting)
+            .is_some());
+        assert!(model
+            .add_secondary_if_absent(fresh, ConnectionState::Connecting)
+            .is_none());
     }
 
     #[test]

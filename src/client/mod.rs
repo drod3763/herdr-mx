@@ -6247,18 +6247,23 @@ async fn run_client_loop(
                     for (alias, result) in results {
                         match result {
                             Ok(remote) => {
-                                let server_id = model.add_secondary_with_state(
+                                // Idempotent: a concurrent remote.list refresh may already have
+                                // synced this remote into the model. Only insert + schedule a connect
+                                // when it's genuinely new, so a batch add can't duplicate the sidebar
+                                // host or its retry.
+                                if let Some(server_id) = model.add_secondary_if_absent(
                                     remote,
                                     supervisor::ConnectionState::Connecting,
-                                );
-                                model.set_update_progress(
-                                    &server_id,
-                                    Some("waiting to connect…".to_string()),
-                                );
+                                ) {
+                                    model.set_update_progress(
+                                        &server_id,
+                                        Some("waiting to connect…".to_string()),
+                                    );
+                                    added_server_ids.push(server_id);
+                                }
                                 if current {
                                     model.mark_ssh_host_added(&alias);
                                 }
-                                added_server_ids.push(server_id);
                             }
                             Err(err) => errors.push(format!("{alias}: {err}")),
                         }
