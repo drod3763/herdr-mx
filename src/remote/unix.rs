@@ -2462,11 +2462,14 @@ fn set_nonblocking(fd: std::os::unix::io::RawFd) -> io::Result<()> {
 }
 
 /// Block until `pid` terminates **without reaping it** (leaves it as a zombie for a later reaping
-/// wait). Used before a process-group `kill(-pid)`: once a child is reaped its pid — and therefore
-/// its process-group id — can be recycled by the OS, so signalling `-pid` after the reap could hit
-/// an unrelated group. Waiting non-reaping keeps the leader (hence the pgid) reserved so the group
-/// kill is unambiguously ours; the caller must still reap afterward (e.g. via [`Child::wait`]).
-fn wait_for_exit_without_reaping(pid: i32) -> io::Result<()> {
+/// wait), returning `true` only for a clean exit with status 0. Used before a process-group
+/// `kill(-pid)`: once a child is reaped its pid — and therefore its process-group id — can be
+/// recycled by the OS, so signalling `-pid` after the reap could hit an unrelated group. Waiting
+/// non-reaping keeps the leader (hence the pgid) reserved so the group kill is unambiguously ours,
+/// and the returned success flag lets the caller preserve a legitimately backgrounded in-group helper
+/// on a clean success while reaping the group on a failed/killed exit. The caller must still reap
+/// afterward (e.g. via [`Child::wait`]).
+fn wait_exit_success_without_reaping(pid: i32) -> io::Result<bool> {
     loop {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // WEXITED: wait for termination. WNOWAIT: leave it waitable so `Child::wait` still reaps it.
@@ -2479,7 +2482,9 @@ fn wait_for_exit_without_reaping(pid: i32) -> io::Result<()> {
             )
         };
         if rc == 0 {
-            return Ok(());
+            // A clean exit reports `CLD_EXITED` with a 0 status; a nonzero exit code or a terminating
+            // signal (`CLD_KILLED`/`CLD_DUMPED`) is not a success.
+            return Ok(info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0);
         }
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::Interrupted {
@@ -2490,9 +2495,9 @@ fn wait_for_exit_without_reaping(pid: i32) -> io::Result<()> {
 }
 
 /// Non-reaping poll of `pid`: `Ok(true)` if it has terminated (left as a zombie for a later reaping
-/// wait), `Ok(false)` if still running. The non-reaping companion to [`wait_for_exit_without_reaping`]
-/// for callers that must keep doing work (e.g. emit progress) while waiting, and that will send a
-/// process-group signal before the final reap.
+/// wait), `Ok(false)` if still running. The non-blocking companion to
+/// [`wait_exit_success_without_reaping`] for callers that must keep doing work (e.g. emit progress)
+/// while waiting, and that will send a process-group signal before the final reap.
 fn child_exited_without_reaping(pid: i32) -> io::Result<bool> {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let rc = unsafe {
@@ -2803,13 +2808,22 @@ fn install_remote_herdr(
         }
     };
     // Stop the watchdog; it already SIGKILLed the whole transport group if the install exceeded its
-    // absolute deadline (the forced-timeout teardown, while the leader was still unreaped). On a clean
-    // exit we do NOT kill the group here, for the same reason as the probe/bridge paths: a valid
-    // transport may background an in-group helper (e.g. a ControlPersist-style master) that must
-    // survive a successful install. A descendant holding stderr open is handled by `stderr_stop`.
+    // absolute deadline (the forced-timeout teardown, while the leader was still unreaped).
     install_done.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
     exit_wait?;
+    // Peek the exit result without reaping, then reap the group unless the install *cleanly
+    // succeeded*: a failed/killed install may have left an in-group helper that would otherwise
+    // accumulate across provision retries. A clean success preserves a valid backgrounded in-group
+    // helper (e.g. a ControlPersist-style master); a descendant holding stderr open is handled by
+    // `stderr_stop`. Leader still unreaped → `-install_pid` is our group.
+    let install_success = wait_exit_success_without_reaping(install_pid).unwrap_or(false);
+    if !install_success {
+        // Safety: `install_pid` leads its own group (set above) and is not yet reaped.
+        unsafe {
+            libc::kill(-install_pid, libc::SIGKILL);
+        }
+    }
     let status = child.wait()?; // reap the leader last
     copy_result?;
 
@@ -2932,14 +2946,21 @@ fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Ou
     done.store(true, Ordering::SeqCst);
     let watchdog_killed = watchdog.join().unwrap_or(false);
     let timed_out = watchdog_killed || stdout_timed_out || stderr_timed_out;
-    // Only reap the group on a timeout/held-pipe outcome, where an in-group descendant is keeping the
-    // probe from completing. On a clean success (both readers hit EOF, no watchdog kill) there is
-    // nothing holding the pipes, so a group SIGKILL would be gratuitously destructive — a valid
-    // transport may deliberately background an in-group helper (e.g. a ControlPersist-style master)
-    // and close its stdio, and that helper must survive a normal probe. The leader is still unreaped
-    // here, so `-pid` is unambiguously our group.
-    // Safety: `pid` leads its own group (set above) and is not yet reaped; `kill` has no other effect.
-    if timed_out {
+    // Decide the group kill while the leader is still unreaped (so `-pid` is unambiguously our group).
+    // Reap the group unless the command *cleanly succeeded*, so a timeout or a non-success exit can't
+    // leave an in-group helper accumulating across retrying probes; only a confirmed clean success
+    // preserves a legitimately backgrounded in-group helper (e.g. a ControlPersist-style master that
+    // closes its stdio). On a timeout we must NOT block peeking status first: a timed-out child may
+    // not have exited yet (the watchdog kill races the `done` flag), so peeking would park until the
+    // child's natural end. On a clean completion the readers hit EOF, so the leader is already exiting
+    // and the non-reaping success peek returns promptly.
+    let kill_group = if timed_out {
+        true
+    } else {
+        !wait_exit_success_without_reaping(pid).unwrap_or(false)
+    };
+    if kill_group {
+        // Safety: `pid` leads its own group (set above) and is not yet reaped; `kill` has no other effect.
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
         }
@@ -3265,22 +3286,29 @@ fn bridge_connection(
 
     // Wait for the transport to exit WITHOUT reaping it (the watchdog above kills a wedged transport
     // to make this return). Keeping the leader unreaped holds its pid — and thus the group id —
-    // reserved, so the watchdog's `kill(-pid)` can never land on a recycled pid belonging to an
-    // unrelated local process group.
-    let wait_result = wait_for_exit_without_reaping(pid);
-    // Stop the copy threads and the watchdog. The watchdog already SIGKILLed the whole transport group
-    // if it had to force a disconnect (the autossh-style "own process group" teardown). On a clean,
-    // remote-initiated exit we deliberately do NOT kill the group here: there is nothing holding the
-    // pipes (the copy threads are cancellable via `teardown`), and a valid transport may run a
-    // backgrounded in-group helper (e.g. a ControlPersist-style master) that must survive.
+    // reserved, so the group kill below can never land on a recycled pid belonging to an unrelated
+    // local process group. The success flag decides that kill.
+    let exit_success = wait_exit_success_without_reaping(pid);
+    // Stop the copy threads and the watchdog first so no other thread will signal the group.
     teardown.store(true, Ordering::SeqCst);
     watchdog_done.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
+    // Reap the group unless the transport cleanly exited: a failed/killed bridge (or the watchdog's
+    // forced disconnect) may have left an in-group helper that would otherwise accumulate across
+    // reconnects. A clean, remote-initiated exit preserves a legitimately backgrounded in-group helper
+    // (e.g. a ControlPersist-style master); the copy threads are cancellable via `teardown`, so their
+    // joins don't depend on this kill. Leader still unreaped → `-pid` is our group.
+    if !matches!(exit_success, Ok(true)) {
+        // Safety: `pid` leads its own group (set above) and is not yet reaped; `kill` has no other effect.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
     let reap_result = child.wait(); // reap the leader last
     let _ = upload.join();
     let _ = download.join();
     // Surface a non-reaping-wait error first, then the reaped exit status.
-    wait_result?;
+    exit_success?;
     let status = reap_result?;
 
     if status.success() {
@@ -4736,9 +4764,9 @@ mod tests {
     fn non_reaping_wait_helpers_detect_exit_then_allow_a_clean_reap() {
         // The reuse-safe cleanup detects the child's exit WITHOUT reaping it (so its pid — and thus
         // the group id — stays reserved for a safe `kill(-pid)`), then reaps with `Child::wait`.
-        // Guard both primitives: the poll reports "running" before exit and "exited" after, the
-        // blocking wait returns, and the later reap still yields the real status with no double-reap
-        // or lost zombie (codex-11-1).
+        // Guard the primitives: the poll reports "running" before exit and "exited" after, the
+        // blocking success-peek reports the real success/failure, and the later reap still yields the
+        // real status with no double-reap or lost zombie (codex-11-1 / codex-14-1).
         let mut child = Command::new("sh")
             .arg("-c")
             .arg("sleep 0.2; exit 7")
@@ -4749,7 +4777,11 @@ mod tests {
             !child_exited_without_reaping(pid).expect("poll running child"),
             "a still-running child must not report exited"
         );
-        wait_for_exit_without_reaping(pid).expect("non-reaping wait returns on exit");
+        assert!(
+            !wait_exit_success_without_reaping(pid)
+                .expect("non-reaping success peek returns on exit"),
+            "a nonzero exit must not report success"
+        );
         assert!(
             child_exited_without_reaping(pid).expect("poll exited child"),
             "an exited-but-unreaped child must report exited"
@@ -4798,6 +4830,49 @@ mod tests {
         assert!(
             alive,
             "a backgrounded in-group helper must survive a clean successful probe"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_kills_background_helper_on_failed_exit() {
+        // codex-14-1: a transport that backgrounds an in-group helper (stdio closed) then exits
+        // NONZERO must not leave the helper alive — a failed probe's helpers would otherwise
+        // accumulate across reconnect/provision retries. Only a clean success preserves the helper.
+        let pidfile =
+            std::env::temp_dir().join(format!("herdr-bounded-failhelper-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let script = format!(
+            "sleep 600 </dev/null >/dev/null 2>&1 & echo $! > '{}'; exit 1",
+            pidfile.display()
+        );
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&script);
+        let output = run_bounded_output(command, Duration::from_secs(5))
+            .expect("a failed command returns output, not a timeout error");
+        assert!(!output.status.success(), "probe exited nonzero");
+
+        let helper: i32 = std::fs::read_to_string(&pidfile)
+            .expect("pidfile written")
+            .trim()
+            .parse()
+            .expect("helper pid parses");
+        let mut alive = true;
+        for _ in 0..100 {
+            if unsafe { libc::kill(helper, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if alive {
+            unsafe {
+                libc::kill(helper, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(
+            !alive,
+            "a failed probe's backgrounded in-group helper must be killed with the group"
         );
     }
 
