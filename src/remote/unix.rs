@@ -486,21 +486,34 @@ fn resolve_transport() -> io::Result<TransportSpec> {
             *guard = Some(spec.clone());
         }
     };
-    // The transport-section state is indeterminate (config won't parse, or its `[remote]` section
-    // is invalid). Decide from what the *current* config declares — checked before any cached value
-    // so a transport the user has since removed is not reused:
-    // - No  → no transport declared now: use built-in ssh (a typo elsewhere must not break it, and a
-    //         stale cached custom transport must not outlive its removal).
-    // - Yes/Unknown → a transport is declared (or can't be ruled out): keep a previously valid
-    //         *custom* transport, else fail closed rather than bypass it over ssh.
-    let keep_or_default = || -> io::Result<TransportSpec> {
+    // The transport-section state is indeterminate (config won't parse, or its `[remote]` section is
+    // invalid). Decide from what the *current* config declares. `structural_trustworthy` says whether
+    // that declaration comes from a real parse (`config_declares_transport` parsed the TOML to a value
+    // and inspected `remote.transport`) or only from the best-effort text scan used when the file is
+    // unparseable — a scan a truncated / partially written file can fool into reporting "no transport".
+    //
+    // - Yes/Unknown → a transport is declared or can't be ruled out: keep a previously valid *custom*
+    //   transport, else fail closed rather than bypass it over ssh.
+    // - No + trustworthy (a legible removal in an otherwise-parseable file) → fall back to ssh.
+    // - No + NOT trustworthy (unparseable file, scan saw nothing) → do NOT let that low-trust "No"
+    //   downgrade a previously valid custom transport to ssh: keep the custom (fail closed, matching
+    //   the loader's keep-current behavior for a bad config). With no prior custom there is no
+    //   boundary to preserve, so ssh is the safe default a typo elsewhere must not break.
+    let keep_or_default = |structural_trustworthy: bool| -> io::Result<TransportSpec> {
         match config_declares_transport() {
-            TransportDeclared::No => {
+            TransportDeclared::No if structural_trustworthy => {
                 // Record ssh as the current valid spec so the now-removed custom transport can't be
                 // resurrected by a later invalid-custom config (whose fallback consults `previous`).
                 remember(&TransportSpec::Ssh);
                 Ok(TransportSpec::Ssh)
             }
+            TransportDeclared::No => match previous() {
+                Some(spec @ TransportSpec::Custom { .. }) => Ok(spec),
+                _ => {
+                    remember(&TransportSpec::Ssh);
+                    Ok(TransportSpec::Ssh)
+                }
+            },
             TransportDeclared::Yes | TransportDeclared::Unknown => match previous() {
                 Some(spec @ TransportSpec::Custom { .. }) => Ok(spec),
                 _ => Err(io::Error::new(
@@ -513,20 +526,22 @@ fn resolve_transport() -> io::Result<TransportSpec> {
     };
 
     // Config currently fails to parse/read (`load_live_config` returns `Ok(default)` when the file
-    // is absent, `Err` only when a present file fails to read/parse).
+    // is absent, `Err` only when a present file fails to read/parse). Unparseable → any transport
+    // declaration can only come from the text scan, so it is NOT structurally trustworthy.
     let Ok(loaded) = crate::config::load_live_config() else {
-        return keep_or_default();
+        return keep_or_default(false);
     };
     // `load_live_config` returns Ok even when the `[remote]` section fails to deserialize: it
     // records the section in `invalid_sections` and leaves `config.remote` at its default. Deriving
     // a transport from that default would silently drop a configured custom transport, so treat an
-    // invalid `[remote]` section the same way.
+    // invalid `[remote]` section the same way. Here the file DID parse to a TOML value, so
+    // `config_declares_transport`'s structural lookup is reliable → trustworthy.
     if loaded
         .invalid_sections
         .iter()
         .any(|section| section == "remote")
     {
-        return keep_or_default();
+        return keep_or_default(true);
     }
     match TransportSpec::from_config(&loaded.config.remote) {
         TransportResolution::Spec(spec) => {
@@ -4054,42 +4069,84 @@ mod tests {
     }
 
     #[test]
-    fn resolve_transport_drops_cached_custom_when_config_removes_transport() {
+    fn resolve_transport_drops_cached_custom_on_legible_removal_not_unparseable() {
         // nextest isolates each test in its own process (own env var + own last-valid static).
         let dir = std::env::temp_dir().join(format!("herdr-transport-drop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let cfg = dir.join("config.toml");
+        let custom = TransportSpec::Custom {
+            program: "autossh".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
         std::fs::write(
             &cfg,
             "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
         )
         .expect("write valid config");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
-        assert_eq!(
-            resolve_transport().expect("custom resolves"),
-            TransportSpec::Custom {
-                program: "autossh".into(),
-                args: vec!["{host}".into(), "{remote_command}".into()],
-            }
-        );
+        assert_eq!(resolve_transport().expect("custom resolves"), custom);
 
-        // The user removed `[remote.transport]` but left an unrelated TOML syntax error. The current
-        // config declares no transport, so resolution must fall back to ssh — not reuse the cached
-        // custom transport, which could route to a now-unintended host.
+        // An UNPARSEABLE config that no longer shows the transport must NOT drop the boundary to ssh:
+        // a truncated / partially written file can hide a still-intended `[remote.transport]`, so the
+        // best-effort "no transport" scan is not authoritative. Keep the last valid custom transport
+        // (fail closed), matching the loader's keep-current behavior for a bad config (codex-13-1).
         std::fs::write(&cfg, "oops = = broken\n").expect("write transport-less broken config");
         assert_eq!(
-            resolve_transport().expect("ssh fallback"),
+            resolve_transport().expect("keeps custom on unparseable config"),
+            custom
+        );
+
+        // A *legible* removal — a cleanly parsing config with no `[remote.transport]` — is
+        // authoritative: fall back to ssh (the transport was genuinely removed).
+        std::fs::write(&cfg, "onboarding = false\n").expect("write valid transport-less config");
+        assert_eq!(
+            resolve_transport().expect("ssh on legible removal"),
             TransportSpec::Ssh
         );
 
-        // After the transport was removed (cache now ssh, not the old custom), adding an invalid
-        // custom transport must fail closed — the stale custom must not be resurrected.
+        // After that legible removal (cache now ssh, not the old custom), adding an invalid custom
+        // transport must fail closed — the stale custom must not be resurrected.
         std::fs::write(
             &cfg,
             "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\"]\n",
         )
         .expect("write invalid-template config");
         assert!(resolve_transport().is_err());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_keeps_custom_on_unparseable_config_without_visible_transport() {
+        // Direct regression for codex-13-1: a valid custom transport, then a fully unparseable config
+        // whose (best-effort) scan shows no transport at all, must keep the custom transport rather
+        // than silently routing remote operations over built-in ssh and bypassing the user's
+        // wrapper/proxy boundary during a transient bad edit.
+        let dir =
+            std::env::temp_dir().join(format!("herdr-transport-unparse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        let custom = TransportSpec::Custom {
+            program: "corp-proxy".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"corp-proxy\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(resolve_transport().expect("custom resolves"), custom);
+
+        // Truncated mid-edit: valid up to a point, then cut off (unparseable) and missing the whole
+        // `[remote.transport]` stanza the scan would need to see.
+        std::fs::write(&cfg, "onboarding = false\n[remote\n").expect("write truncated config");
+        assert_eq!(
+            resolve_transport().expect("keeps custom, never ssh"),
+            custom,
+            "an unparseable config with no visible transport must not downgrade to ssh"
+        );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
