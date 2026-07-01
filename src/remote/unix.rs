@@ -2787,13 +2787,13 @@ fn install_remote_herdr(
             Err(err) => break Err(err),
         }
     };
-    // Stop the watchdog first, then reap the group while the leader is still unreaped (pid guaranteed
-    // ours). Safety: `install_pid` leads its own group (set above) and is not yet reaped.
+    // Stop the watchdog; it already SIGKILLed the whole transport group if the install exceeded its
+    // absolute deadline (the forced-timeout teardown, while the leader was still unreaped). On a clean
+    // exit we do NOT kill the group here, for the same reason as the probe/bridge paths: a valid
+    // transport may background an in-group helper (e.g. a ControlPersist-style master) that must
+    // survive a successful install. A descendant holding stderr open is handled by `stderr_stop`.
     install_done.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
-    unsafe {
-        libc::kill(-install_pid, libc::SIGKILL);
-    }
     exit_wait?;
     let status = child.wait()?; // reap the leader last
     copy_result?;
@@ -2916,12 +2916,20 @@ fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Ou
     // unambiguously our group; on the clean path this is a harmless ESRCH no-op.
     done.store(true, Ordering::SeqCst);
     let watchdog_killed = watchdog.join().unwrap_or(false);
-    // Safety: `pid` leads its own group (set above) and is not yet reaped; `kill` has no other effect.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
-    let status = child.wait()?; // reap the leader (and its now-killed group) last
     let timed_out = watchdog_killed || stdout_timed_out || stderr_timed_out;
+    // Only reap the group on a timeout/held-pipe outcome, where an in-group descendant is keeping the
+    // probe from completing. On a clean success (both readers hit EOF, no watchdog kill) there is
+    // nothing holding the pipes, so a group SIGKILL would be gratuitously destructive — a valid
+    // transport may deliberately background an in-group helper (e.g. a ControlPersist-style master)
+    // and close its stdio, and that helper must survive a normal probe. The leader is still unreaped
+    // here, so `-pid` is unambiguously our group.
+    // Safety: `pid` leads its own group (set above) and is not yet reaped; `kill` has no other effect.
+    if timed_out {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let status = child.wait()?; // reap the leader last
 
     if timed_out {
         return Err(io::Error::new(
@@ -3242,20 +3250,17 @@ fn bridge_connection(
 
     // Wait for the transport to exit WITHOUT reaping it (the watchdog above kills a wedged transport
     // to make this return). Keeping the leader unreaped holds its pid — and thus the group id —
-    // reserved, so the group kill below can't land on a recycled pid belonging to an unrelated local
-    // process group. Any kill the watchdog already sent also happened while the leader was unreaped.
+    // reserved, so the watchdog's `kill(-pid)` can never land on a recycled pid belonging to an
+    // unrelated local process group.
     let wait_result = wait_for_exit_without_reaping(pid);
-    // Stop the copy threads and the watchdog first so no other thread will signal the group.
+    // Stop the copy threads and the watchdog. The watchdog already SIGKILLed the whole transport group
+    // if it had to force a disconnect (the autossh-style "own process group" teardown). On a clean,
+    // remote-initiated exit we deliberately do NOT kill the group here: there is nothing holding the
+    // pipes (the copy threads are cancellable via `teardown`), and a valid transport may run a
+    // backgrounded in-group helper (e.g. a ControlPersist-style master) that must survive.
     teardown.store(true, Ordering::SeqCst);
     watchdog_done.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
-    // Now reap the group while the leader is still unreaped (pid guaranteed ours): this clears any
-    // in-group descendant that inherited the pipes so a natural exit can't leak it. The copy threads
-    // are cancellable via `teardown`, so their joins are already bounded without this kill.
-    // Safety: `pid` leads its own group (set above) and is not yet reaped; `kill` has no other effect.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
     let reap_result = child.wait(); // reap the leader last
     let _ = upload.join();
     let _ = download.join();
@@ -4697,6 +4702,45 @@ mod tests {
             status.code(),
             Some(7),
             "the real exit status survives the non-reaping waits"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_leaves_a_clean_success_background_helper_alive() {
+        // A valid transport may background an in-group helper that closes its stdio (e.g. a
+        // ControlPersist-style master), then exit 0. On a clean, non-timed-out probe there is no held
+        // pipe to clean up, so the cleanup must NOT SIGKILL the group — doing so would destroy that
+        // helper on every normal probe (codex-12-1). Verify the helper survives a successful probe.
+        let pidfile =
+            std::env::temp_dir().join(format!("herdr-bounded-helper-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        // The helper redirects its stdio away from the probe pipes, so stdout hits EOF immediately and
+        // the probe completes successfully (no deadline, no watchdog kill).
+        let script = format!(
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}'; exit 0",
+            pidfile.display()
+        );
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&script);
+        let output =
+            run_bounded_output(command, Duration::from_secs(5)).expect("clean probe succeeds");
+        assert!(output.status.success(), "probe exits successfully");
+
+        let helper: i32 = std::fs::read_to_string(&pidfile)
+            .expect("pidfile written")
+            .trim()
+            .parse()
+            .expect("helper pid parses");
+        // `kill(pid, 0)` succeeds while the process exists.
+        let alive = unsafe { libc::kill(helper, 0) } == 0;
+        // Clean up the helper regardless of the assertion outcome.
+        unsafe {
+            libc::kill(helper, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(
+            alive,
+            "a backgrounded in-group helper must survive a clean successful probe"
         );
     }
 
