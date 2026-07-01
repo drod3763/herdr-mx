@@ -105,29 +105,49 @@ impl App {
         request: crate::api::schema::Request,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        use std::sync::atomic::Ordering;
         let id = request.id;
-        // Single-flight: cap discovery to one worker thread at a time so a flood of local API calls
-        // can't pile up concurrent filesystem scans. A request that arrives while one is running is
-        // answered immediately with a `discovery_busy` error rather than spawning another thread.
-        if self.ssh_discovery_in_flight.swap(true, Ordering::SeqCst) {
-            let _ = respond_to.send(encode_error(
-                id,
-                "discovery_busy",
-                "ssh config discovery already in progress",
-            ));
-            return true;
+        // Single-flight with a recovery lease: cap discovery to one worker so a flood of local API
+        // calls can't pile up filesystem scans, but if the prior worker has been running longer than
+        // the lease (it hung on a bad/network-mounted `~/.ssh`), take over instead of returning
+        // `discovery_busy` forever until server restart. The `started` timestamp is the ownership
+        // token so a late-exiting hung worker can't clear a newer discovery's claim.
+        const SSH_DISCOVERY_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
+        let started = std::time::Instant::now();
+        {
+            let mut in_flight = self
+                .ssh_discovery_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(prior) = *in_flight {
+                if prior.elapsed() < SSH_DISCOVERY_LEASE {
+                    drop(in_flight);
+                    let _ = respond_to.send(encode_error(
+                        id,
+                        "discovery_busy",
+                        "ssh config discovery already in progress",
+                    ));
+                    return true;
+                }
+            }
+            *in_flight = Some(started);
         }
-        // Reset the flag via an RAII guard so it clears when the worker's scope exits — AFTER the
-        // response is sent (a second request can't start mid-serialization), and even if discovery or
-        // send panics (unwind runs Drop), so the flag can never get stuck `true`.
-        struct InFlightGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        // Reset the flag via an RAII guard when the worker's scope exits — AFTER the response is sent
+        // (a second request can't start mid-serialization) and even on panic (unwind runs Drop). It
+        // only clears when it still owns the claim (`started` matches), so a hung worker that finally
+        // exits after a lease takeover doesn't clobber the newer discovery.
+        struct InFlightGuard(
+            std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+            std::time::Instant,
+        );
         impl Drop for InFlightGuard {
             fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+                let mut in_flight = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                if *in_flight == Some(self.1) {
+                    *in_flight = None;
+                }
             }
         }
-        let guard = InFlightGuard(self.ssh_discovery_in_flight.clone());
+        let guard = InFlightGuard(self.ssh_discovery_in_flight.clone(), started);
         std::thread::spawn(move || {
             let _guard = guard;
             let hosts = crate::ssh_config::discover_hosts();
@@ -505,10 +525,10 @@ mod tests {
     #[test]
     fn ssh_config_hosts_single_flight_returns_busy_when_already_running() {
         // codex (re-run): a flood of remote.ssh_config_hosts must not spawn unbounded discovery
-        // threads. While one discovery is in flight, further requests get a `discovery_busy` error.
-        use std::sync::atomic::Ordering;
+        // threads. While a RECENT discovery is in flight, further requests get a `discovery_busy`
+        // error; a STALE in-flight (past the lease) is taken over instead of poisoning discovery.
         let mut app = test_app();
-        app.ssh_discovery_in_flight.store(true, Ordering::SeqCst);
+        *app.ssh_discovery_in_flight.lock().unwrap() = Some(std::time::Instant::now());
 
         let (tx, rx) = std::sync::mpsc::channel();
         let request: Request = serde_json::from_str(
@@ -522,6 +542,44 @@ mod tests {
             .expect("busy response should answer immediately");
         let error: ErrorResponse = serde_json::from_str(&raw).unwrap();
         assert_eq!(error.error.code, "discovery_busy");
+    }
+
+    #[test]
+    fn ssh_config_hosts_recovers_from_a_stale_in_flight_lease() {
+        // codex (re-run): a hung prior worker must not poison discovery forever. A stale in-flight
+        // (older than the lease) is taken over — the request proceeds instead of returning busy.
+        let _env_lock = crate::ssh_config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("herdr-api-ssh-cfg-lease");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config");
+        std::fs::write(&config_path, "Host prod\n").unwrap();
+        let _guard = SetEnvGuard::set(crate::ssh_config::SSH_CONFIG_PATH_ENV_VAR, &config_path);
+
+        let mut app = test_app();
+        // Simulate a worker that claimed the flag long ago and hung.
+        let stale = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(120))
+            .unwrap();
+        *app.ssh_discovery_in_flight.lock().unwrap() = Some(stale);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request: Request = serde_json::from_str(
+            r#"{"id":"hosts","method":"remote.ssh_config_hosts","params":{}}"#,
+        )
+        .unwrap();
+        assert!(app.handle_deferred_remote_ssh_config_hosts(request, tx));
+
+        // The stale lease is taken over → a real result, not a discovery_busy error.
+        let raw = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stale lease should be taken over and answered");
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["type"], "ssh_config_hosts");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -562,7 +620,6 @@ mod tests {
     fn deferred_ssh_config_hosts_clears_single_flight_after_completion() {
         // codex-copilot (re-run): the single-flight flag must reset once the worker finishes (via an
         // RAII guard, AFTER the response is sent), so a later request is not permanently `busy`.
-        use std::sync::atomic::Ordering;
         let _env_lock = crate::ssh_config::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -586,7 +643,7 @@ mod tests {
         // The guard clears the flag right after the send; wait briefly for that drop to run.
         let mut cleared = false;
         for _ in 0..200 {
-            if !app.ssh_discovery_in_flight.load(Ordering::SeqCst) {
+            if app.ssh_discovery_in_flight.lock().unwrap().is_none() {
                 cleared = true;
                 break;
             }
