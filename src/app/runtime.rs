@@ -85,10 +85,7 @@ impl App {
         // #11: ssh_config discovery is bounded but does blocking filesystem IO and touches no app
         // state, so answer it off the synchronous loop on a worker thread rather than stalling input,
         // rendering, and other API/remote-lifecycle work while it reads the config tree.
-        if matches!(
-            &msg.request.method,
-            crate::api::schema::Method::RemoteSshConfigHosts(_)
-        ) {
+        if msg.request.method.runs_ssh_config_discovery_off_loop() {
             let handled = self.handle_deferred_remote_ssh_config_hosts(msg.request, msg.respond_to);
             debug_assert!(handled);
             if !skip_default_workspace {

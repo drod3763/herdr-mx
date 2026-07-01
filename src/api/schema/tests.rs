@@ -860,3 +860,17 @@ fn plugin_pane_open_request_round_trips() {
     let restored: Request = serde_json::from_value(json).unwrap();
     assert_eq!(restored, request);
 }
+
+// #11: both the TUI runtime and headless server dispatchers gate on this predicate to route
+// ssh_config discovery onto a worker thread. Lock it here so neither dispatcher can regress to the
+// synchronous, loop-blocking path without a failing test.
+#[test]
+fn only_ssh_config_hosts_runs_discovery_off_loop() {
+    assert!(
+        Method::RemoteSshConfigHosts(EmptyParams::default()).runs_ssh_config_discovery_off_loop()
+    );
+    // A representative sample of other remote/worktree methods must NOT take the off-loop path.
+    assert!(!Method::RemoteList(EmptyParams::default()).runs_ssh_config_discovery_off_loop());
+    assert!(!Method::WorktreeCreate(WorktreeCreateParams::default())
+        .runs_ssh_config_discovery_off_loop());
+}

@@ -2653,6 +2653,15 @@ impl HeadlessServer {
                 .handle_deferred_worktree_api_request(msg.request, msg.respond_to);
             return changed | deferred_changed;
         }
+        // #11: mirror the TUI runtime dispatcher — ssh_config discovery does bounded but blocking
+        // filesystem IO and must answer off the synchronous server loop on a worker thread, so a slow
+        // or wedged config tree cannot stall API handling, client forwarding, or shutdown here.
+        if msg.request.method.runs_ssh_config_discovery_off_loop() {
+            let deferred_changed = self
+                .app
+                .handle_deferred_remote_ssh_config_hosts(msg.request, msg.respond_to);
+            return changed | deferred_changed;
+        }
         let response = if matches!(
             &msg.request.method,
             api::schema::Method::ServerReloadConfig(_)
