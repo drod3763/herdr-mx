@@ -307,14 +307,16 @@ fn first_token(rest: &str) -> Option<String> {
 }
 
 /// A `Host` token is connectable only if it is a literal alias: no glob wildcards (`*`/`?`), no
-/// negated pattern (`!...`), and no embedded whitespace. Those match-only patterns aren't
-/// destinations ssh can connect to, and a whitespace alias (from a quoted `Host "a b"` pattern)
-/// would make the picker's `ssh <alias>` target ambiguous, so it is dropped at discovery.
+/// character-class pattern (`[...]`), no negated pattern (`!...`), and no embedded whitespace. Those
+/// match-only patterns aren't destinations ssh can connect to, and a whitespace alias (from a quoted
+/// `Host "a b"` pattern) would make the picker's `ssh <alias>` target ambiguous, so all are dropped.
 fn is_connectable_alias(token: &str) -> bool {
     !token.is_empty()
         && !token.starts_with('!')
         && !token.contains('*')
         && !token.contains('?')
+        && !token.contains('[')
+        && !token.contains(']')
         && !token.chars().any(char::is_whitespace)
 }
 
@@ -563,10 +565,10 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _fixture = ConfigFixture::new(
             "wildcards",
-            "Host *\n  User everyone\n\nHost gw-? \n  HostName gw\n\nHost !secret real\n  HostName r\n",
+            "Host *\n  User everyone\n\nHost gw-? \n  HostName gw\n\nHost db-[0-9]\n  HostName db\n\nHost !secret real\n  HostName r\n",
         );
         let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
-        // `*`, `gw-?`, and `!secret` are dropped; only the literal `real` survives.
+        // `*`, `gw-?`, `db-[0-9]` (char class), and `!secret` are dropped; only `real` survives.
         assert_eq!(aliases, vec!["real".to_string()]);
     }
 
