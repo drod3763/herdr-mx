@@ -2446,6 +2446,56 @@ fn set_nonblocking(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Block until `pid` terminates **without reaping it** (leaves it as a zombie for a later reaping
+/// wait). Used before a process-group `kill(-pid)`: once a child is reaped its pid — and therefore
+/// its process-group id — can be recycled by the OS, so signalling `-pid` after the reap could hit
+/// an unrelated group. Waiting non-reaping keeps the leader (hence the pgid) reserved so the group
+/// kill is unambiguously ours; the caller must still reap afterward (e.g. via [`Child::wait`]).
+fn wait_for_exit_without_reaping(pid: i32) -> io::Result<()> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // WEXITED: wait for termination. WNOWAIT: leave it waitable so `Child::wait` still reaps it.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+/// Non-reaping poll of `pid`: `Ok(true)` if it has terminated (left as a zombie for a later reaping
+/// wait), `Ok(false)` if still running. The non-reaping companion to [`wait_for_exit_without_reaping`]
+/// for callers that must keep doing work (e.g. emit progress) while waiting, and that will send a
+/// process-group signal before the final reap.
+fn child_exited_without_reaping(pid: i32) -> io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // `info` was zeroed, and `WNOHANG` leaves `si_signo` at 0 when no child state is available; a
+    // terminated child sets it to `SIGCHLD`.
+    Ok(info.si_signo != 0)
+}
+
 /// Drain a **non-blocking** reader to EOF or until `deadline`, retaining only the last `cap` bytes.
 /// Returns `(tail, hit_deadline)`. Unlike a blocking drain, this returns even when a descendant that
 /// escaped the process group (e.g. via `setsid`) keeps the pipe's write end open and EOF never
@@ -2723,22 +2773,29 @@ fn install_remote_herdr(
     // timeout fire — that would clear the operation and let a retry start a second install while this
     // child is still mutating the remote. The install watchdog SIGKILLs the group at the absolute
     // deadline, which makes `try_wait` observe the exit and this loop return.
-    let wait_result = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => {
+    // Wait for the child to exit WITHOUT reaping it, beating progress so the post-upload wait stays
+    // observable (see codex note above). Non-reaping keeps the leader's pid — and thus the group id —
+    // reserved so the `kill(-install_pid)` below can't land on a recycled pid belonging to an
+    // unrelated local process group.
+    let exit_wait = loop {
+        match child_exited_without_reaping(install_pid) {
+            Ok(true) => break Ok(()),
+            Ok(false) => {
                 maybe_beat(&mut last_beat);
                 thread::sleep(Duration::from_millis(100));
             }
             Err(err) => break Err(err),
         }
     };
+    // Stop the watchdog first, then reap the group while the leader is still unreaped (pid guaranteed
+    // ours). Safety: `install_pid` leads its own group (set above) and is not yet reaped.
+    install_done.store(true, Ordering::SeqCst);
+    let _ = watchdog.join();
     unsafe {
         libc::kill(-install_pid, libc::SIGKILL);
     }
-    install_done.store(true, Ordering::SeqCst);
-    let _ = watchdog.join();
-    let status = wait_result?;
+    exit_wait?;
+    let status = child.wait()?; // reap the leader last
     copy_result?;
 
     if status.success() {
@@ -2844,23 +2901,26 @@ fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Ou
         true
     });
 
-    let wait_result = child.wait();
     // The deadline-aware readers always return (even on an escaped pipe holder), so these joins are
     // bounded. `hit_deadline` from either reader, or a watchdog kill, means the operation timed out.
+    // Do NOT reap the child yet: every `kill(-pid)` below must run while the leader is still unreaped
+    // so its pid — and therefore the group id — is guaranteed ours. Reaping first would free the pid
+    // for up to the whole deadline (the readers can block that long on an escaped pipe holder), and a
+    // recycled pid could redirect the group kill at an unrelated local process group.
     let (stdout, stdout_timed_out) = stdout_reader.join().unwrap_or_default();
     let (stderr, stderr_timed_out) = stderr_reader.join().unwrap_or_default();
-    // Reap the group unconditionally before releasing the watchdog. If the direct child exits fast
-    // but leaves an in-group descendant holding a pipe, the readers return at the deadline and we set
-    // `done` — which can make the watchdog skip its own kill (it lost the deadline race). Killing here
-    // guarantees such a descendant is gone instead of leaking across retrying probes; the leader has
-    // exited, so on the clean path this is a harmless ESRCH no-op.
-    // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
+    // Stop the watchdog first (any kill it already sent was while the leader was unreaped), then reap
+    // the group ourselves. If the direct child exited fast but left an in-group descendant holding a
+    // pipe, the watchdog may have lost the deadline race; killing here guarantees that descendant is
+    // gone instead of leaking across retrying probes. The leader is still unreaped, so `-pid` is
+    // unambiguously our group; on the clean path this is a harmless ESRCH no-op.
+    done.store(true, Ordering::SeqCst);
+    let watchdog_killed = watchdog.join().unwrap_or(false);
+    // Safety: `pid` leads its own group (set above) and is not yet reaped; `kill` has no other effect.
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
-    done.store(true, Ordering::SeqCst);
-    let watchdog_killed = watchdog.join().unwrap_or(false);
-    let status = wait_result?;
+    let status = child.wait()?; // reap the leader (and its now-killed group) last
     let timed_out = watchdog_killed || stdout_timed_out || stderr_timed_out;
 
     if timed_out {
@@ -3180,25 +3240,28 @@ fn bridge_connection(
         }
     });
 
-    let wait_result = child.wait();
-    // The bridge child has exited (cleanly because the remote closed, or because the watchdog killed
-    // it). Clear any descendant that inherited the pipes so the copy-thread joins below can't block
-    // forever, then release the watchdog and reap the workers. The leader has exited, so this kill
-    // only reaps lingering group members; an empty group is a harmless ESRCH no-op.
-    // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
-    // Signal the copy threads to stop. `kill(-pid)` closes the pipes held by the group, which
-    // normally unblocks the copies via EOF; the flag additionally bounds the case where an
-    // escaped descendant keeps a pipe open past the leader's death (see `copy_flush_until_stop`),
-    // so these joins return within one poll interval instead of parking forever.
+    // Wait for the transport to exit WITHOUT reaping it (the watchdog above kills a wedged transport
+    // to make this return). Keeping the leader unreaped holds its pid — and thus the group id —
+    // reserved, so the group kill below can't land on a recycled pid belonging to an unrelated local
+    // process group. Any kill the watchdog already sent also happened while the leader was unreaped.
+    let wait_result = wait_for_exit_without_reaping(pid);
+    // Stop the copy threads and the watchdog first so no other thread will signal the group.
     teardown.store(true, Ordering::SeqCst);
     watchdog_done.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
+    // Now reap the group while the leader is still unreaped (pid guaranteed ours): this clears any
+    // in-group descendant that inherited the pipes so a natural exit can't leak it. The copy threads
+    // are cancellable via `teardown`, so their joins are already bounded without this kill.
+    // Safety: `pid` leads its own group (set above) and is not yet reaped; `kill` has no other effect.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let reap_result = child.wait(); // reap the leader last
     let _ = upload.join();
     let _ = download.join();
-    let status = wait_result?;
+    // Surface a non-reaping-wait error first, then the reaped exit status.
+    wait_result?;
+    let status = reap_result?;
 
     if status.success() {
         Ok(())
@@ -4604,6 +4667,36 @@ mod tests {
         assert!(
             !alive,
             "the pipe-holding descendant must be killed with the group after a timeout"
+        );
+    }
+
+    #[test]
+    fn non_reaping_wait_helpers_detect_exit_then_allow_a_clean_reap() {
+        // The reuse-safe cleanup detects the child's exit WITHOUT reaping it (so its pid — and thus
+        // the group id — stays reserved for a safe `kill(-pid)`), then reaps with `Child::wait`.
+        // Guard both primitives: the poll reports "running" before exit and "exited" after, the
+        // blocking wait returns, and the later reap still yields the real status with no double-reap
+        // or lost zombie (codex-11-1).
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.2; exit 7")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id() as i32;
+        assert!(
+            !child_exited_without_reaping(pid).expect("poll running child"),
+            "a still-running child must not report exited"
+        );
+        wait_for_exit_without_reaping(pid).expect("non-reaping wait returns on exit");
+        assert!(
+            child_exited_without_reaping(pid).expect("poll exited child"),
+            "an exited-but-unreaped child must report exited"
+        );
+        let status = child.wait().expect("reap the preserved zombie");
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "the real exit status survives the non-reaping waits"
         );
     }
 
