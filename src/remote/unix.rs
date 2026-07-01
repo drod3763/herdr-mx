@@ -2454,12 +2454,28 @@ const INSTALL_FAILURE_STDERR_DRAIN: Duration = Duration::from_secs(3);
 /// chatty child cannot deadlock on a full stderr buffer, but never grows memory past `cap`.
 /// Put a file descriptor into non-blocking mode so reads return `WouldBlock` instead of parking.
 fn set_nonblocking(fd: std::os::unix::io::RawFd) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
+    // Retry on EINTR, consistent with the other syscall wrappers here, so a signal delivered during
+    // the fcntl can't spuriously fail a remote operation.
+    let flags = loop {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        break flags;
+    };
+    loop {
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        break;
     }
     Ok(())
 }
@@ -3378,9 +3394,17 @@ fn write_all_until_stop<W: io::Write>(
                     events: libc::POLLOUT,
                     revents: 0,
                 };
-                // Wake on writable or after the interval to re-check `stop`. Ignore the result: a
-                // spurious wake just retries the write, and a real error surfaces on the next write.
-                unsafe { libc::poll(&mut poll_fd, 1, STOP_POLL_INTERVAL_MS) };
+                // Wake on writable or after the interval to re-check `stop`. Handle the poll result
+                // like the reader side does: EINTR just retries (a signal storm can't tight-spin
+                // because the write + `stop` check re-run each pass), and any other poll error is
+                // surfaced rather than silently dropped.
+                let ready = unsafe { libc::poll(&mut poll_fd, 1, STOP_POLL_INTERVAL_MS) };
+                if ready < 0 {
+                    let poll_err = io::Error::last_os_error();
+                    if poll_err.kind() != io::ErrorKind::Interrupted {
+                        return Err(poll_err);
+                    }
+                }
             }
             Err(err) => return Err(err),
         }
