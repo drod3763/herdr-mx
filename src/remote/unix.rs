@@ -3325,13 +3325,26 @@ fn bridge_connection(
                 revents: 0,
             };
             let ready = unsafe { libc::poll(&mut poll_fd, 1, 200) };
+            let mut poll_failed = false;
+            if ready < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    // A signal interrupted the poll; retry (the 200ms timeout paces the loop, so a
+                    // one-off EINTR doesn't hot-spin).
+                    continue;
+                }
+                // A real poll error (e.g. EBADF) means we can no longer observe the local socket.
+                // Fail safe: treat it as a hangup and tear the transport down rather than looping
+                // forever without teardown, which would leak a persistent transport (autossh).
+                poll_failed = true;
+            }
             let hung_up = ready > 0
                 && (poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0;
 
             if watchdog_finished.load(Ordering::SeqCst) {
                 return;
             }
-            if hung_up || local_closed.load(Ordering::SeqCst) {
+            if hung_up || poll_failed || local_closed.load(Ordering::SeqCst) {
                 thread::sleep(BRIDGE_SHUTDOWN_GRACE);
                 if !watchdog_finished.load(Ordering::SeqCst) {
                     // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
