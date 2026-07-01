@@ -546,6 +546,11 @@ fn glob_expand(pattern: &Path, glob_scans_remaining: &mut usize) -> Vec<PathBuf>
     // every scanned entry (a long pattern over a big directory would otherwise be pattern_len × scan
     // allocations/work).
     let pat: Vec<char> = file_pattern.chars().collect();
+    // POSIX glob(3) — which OpenSSH uses for `Include` expansion — does not let a `*`/`?` wildcard
+    // match a leading-dot filename; a dotfile is only matched when the pattern itself starts with `.`.
+    // So `Include config.d/*` skips `.disabled`/`.bak`/editor temp files (verified with `ssh -G`),
+    // and surfacing hosts from them would offer aliases ssh never loads.
+    let pattern_matches_dotfiles = pat.first() == Some(&'.');
     let Ok(entries) = std::fs::read_dir(parent) else {
         return Vec::new();
     };
@@ -563,6 +568,9 @@ fn glob_expand(pattern: &Path, glob_scans_remaining: &mut usize) -> Vec<PathBuf>
         }
         *glob_scans_remaining -= 1;
         if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with('.') && !pattern_matches_dotfiles {
+                continue;
+            }
             if glob_match_chars(&pat, name) {
                 matched.push(entry.path());
             }
@@ -916,6 +924,49 @@ mod tests {
         assert!(
             !aliases.contains(&"db-1".to_string()),
             "an alias under a negated bracket-class Host gate must not be surfaced (unprovable exclusion)"
+        );
+    }
+
+    #[test]
+    fn include_glob_star_skips_dotfiles_but_dot_pattern_matches_them() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex: POSIX glob(3) (used by OpenSSH Include) does not let `*` match a leading-dot file.
+        // Verified with `ssh -G`: `Include config.d/*` loads `visible` but NOT `.hidden`. A `.*`
+        // pattern, whose leading char is a literal dot, does match dotfiles.
+        let fixture = ConfigFixture::new(
+            "include-glob-dotfiles",
+            "Include config.d/*\nInclude config.d/.*\n",
+        );
+        fixture.write_extra("config.d/visible", "Host visiblehost\n  HostName v.host\n");
+        fixture.write_extra("config.d/.hidden", "Host hiddenhost\n  HostName h.host\n");
+        fixture.write_extra("config.d/.secret", "Host secrethost\n  HostName s.host\n");
+        let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
+
+        assert!(
+            aliases.contains(&"visiblehost".to_string()),
+            "`*` matches the visible file"
+        );
+        // `.hidden`/`.secret` are surfaced here only because of the explicit `Include config.d/.*`
+        // line; they must NOT come from the `config.d/*` line.
+        assert!(
+            aliases.contains(&"hiddenhost".to_string()),
+            "an explicit `.*` glob matches dotfiles"
+        );
+    }
+
+    #[test]
+    fn include_glob_star_alone_does_not_surface_dotfile_hosts() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // The isolating half: with ONLY `Include config.d/*`, a dotfile's Host is never surfaced.
+        let fixture = ConfigFixture::new("include-glob-star-only", "Include config.d/*\n");
+        fixture.write_extra("config.d/visible", "Host visiblehost\n  HostName v.host\n");
+        fixture.write_extra("config.d/.hidden", "Host hiddenhost\n  HostName h.host\n");
+        let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
+
+        assert!(aliases.contains(&"visiblehost".to_string()));
+        assert!(
+            !aliases.contains(&"hiddenhost".to_string()),
+            "`Include config.d/*` must not load leading-dot files (matches OpenSSH glob)"
         );
     }
 
