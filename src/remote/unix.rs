@@ -2631,15 +2631,23 @@ fn install_remote_herdr(
     unsafe {
         libc::kill(-install_pid, libc::SIGKILL);
     }
-    let stderr = stderr_reader.join().unwrap_or_default();
     install_done.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
     let status = wait_result?;
     copy_result?;
 
     if status.success() {
+        // Do NOT block on the stderr drain for a successful install: the tail only enriches a
+        // failure message, and a daemonized/setsid descendant that escaped the process group could
+        // hold stderr open until the reader's own deadline — outliving the client's 90s idle window
+        // and false-failing a completed install. The reader is deadline-bounded, so detaching it
+        // (dropping the handle) lets it finish on its own without leaking.
+        drop(stderr_reader);
         Ok(())
     } else {
+        // Failure: the stderr tail helps diagnose it. The reader is deadline-bounded, so this join
+        // cannot hang forever even if a descendant holds stderr.
+        let stderr = stderr_reader.join().unwrap_or_default();
         let stderr = String::from_utf8_lossy(&stderr);
         let stderr = stderr.trim();
         Err(io::Error::other(if stderr.is_empty() {
