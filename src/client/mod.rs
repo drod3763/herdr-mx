@@ -4452,14 +4452,24 @@ fn refetch_secondary_runtime_status(
     server_id: &supervisor::ServerId,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
-    let Some(ssh_target) = state.supervisor_model.as_ref().and_then(|model| {
-        model
-            .server_ssh_target(server_id)
-            .and_then(|(destination, options)| {
-                crate::remote::SshTarget::resolved(destination, options).ok()
-            })
-    }) else {
+    // Only ssh hosts have a refetch path; a non-ssh host (or a gone host) is a silent no-op. But an
+    // ssh host whose `[remote.transport]` fails to resolve is NOT the same as "not an ssh host":
+    // swallowing that with `.ok()` would drop the diagnostic while every other failure below logs a
+    // warning. Distinguish the two so an invalid transport is surfaced instead of silently leaving a
+    // stale mismatch readout.
+    let Some((destination, options)) = state
+        .supervisor_model
+        .as_ref()
+        .and_then(|model| model.server_ssh_target(server_id))
+    else {
         return;
+    };
+    let ssh_target = match crate::remote::SshTarget::resolved(destination, options) {
+        Ok(target) => target,
+        Err(err) => {
+            warn!(err = %err, "post-update runtime status refetch skipped: invalid remote transport");
+            return;
+        }
     };
     let server_id = server_id.clone();
     let event_tx = event_tx.clone();
