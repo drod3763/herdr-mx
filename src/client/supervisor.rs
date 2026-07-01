@@ -1859,16 +1859,20 @@ impl ClientSupervisorModel {
         }
     }
 
-    /// Surface an error on the Add Remote overlay's error line ONLY when that overlay is still open —
-    /// used by the off-loop ssh-config fetch so a user-initiated failure is visible, while a late
-    /// result that arrives after the overlay closed stays log-only. Returns whether it surfaced.
-    pub(crate) fn set_add_remote_error_if_open(&mut self, error: impl Into<String>) -> bool {
-        if self.add_remote_form().is_some() {
+    /// Report a failed ssh-config fetch: always clear the in-flight flag, and surface the error on
+    /// the Add Remote overlay ONLY when it is still the launcher of THIS fetch (fetch in flight) and
+    /// no manual add has since started. If a manual add is in progress, the stale fetch error is
+    /// dropped so it can't clobber the add's own progress/error state (mirrors the success gate).
+    /// Returns whether the error was surfaced.
+    pub(crate) fn fail_ssh_host_fetch(&mut self, error: impl Into<String>) -> bool {
+        let surface = self
+            .add_remote_form()
+            .is_some_and(|form| form.ssh_fetch_in_flight && !form.in_progress);
+        self.clear_ssh_host_fetch();
+        if surface {
             self.set_add_remote_error(error);
-            true
-        } else {
-            false
         }
+        surface
     }
 
     /// Mark the add-remote submission as in flight: clears any prior error/progress and switches the
@@ -6182,20 +6186,35 @@ mod tests {
     }
 
     #[test]
-    fn set_add_remote_error_if_open_only_surfaces_while_the_overlay_is_open() {
-        // PRRT...3fS: a user-initiated ssh-config fetch failure is shown on the Add Remote overlay's
-        // error line while it is open, but a late result after it closed stays log-only (no-op).
+    fn fail_ssh_host_fetch_surfaces_only_for_the_launcher_and_not_during_a_manual_add() {
+        // PRRT...3fS + codex (re-run): a user-initiated fetch failure shows on the Add Remote overlay
+        // while it is still the launcher; a late result after it closed is dropped; and a stale error
+        // must NOT clobber a manual add that started after the fetch was launched.
+
+        // No overlay → nothing surfaced, no-op.
         let mut idle = ClientSupervisorModel::new("local");
-        assert!(!idle.set_add_remote_error_if_open("boom"));
+        assert!(!idle.fail_ssh_host_fetch("boom"));
         assert!(idle.add_remote_form().is_none());
 
+        // Launcher, no manual add → error surfaces and the in-flight flag clears.
         let mut adding = ClientSupervisorModel::new("local");
         adding.open_add_remote_form();
-        assert!(adding.set_add_remote_error_if_open("couldn't read ~/.ssh/config"));
-        assert_eq!(
-            adding.add_remote_form().and_then(|f| f.error.as_deref()),
-            Some("couldn't read ~/.ssh/config")
-        );
+        assert!(adding.begin_ssh_host_fetch());
+        assert!(adding.fail_ssh_host_fetch("couldn't load ssh hosts: x"));
+        let form = adding.add_remote_form().unwrap();
+        assert_eq!(form.error.as_deref(), Some("couldn't load ssh hosts: x"));
+        assert!(!form.ssh_fetch_in_flight);
+
+        // A manual add started after launching the fetch → stale error dropped, add progress kept.
+        let mut racing = ClientSupervisorModel::new("local");
+        racing.open_add_remote_form();
+        assert!(racing.begin_ssh_host_fetch());
+        racing.set_add_remote_in_progress();
+        assert!(!racing.fail_ssh_host_fetch("stale error"));
+        let form = racing.add_remote_form().unwrap();
+        assert!(form.in_progress, "manual add progress preserved");
+        assert!(form.error.is_none(), "stale fetch error dropped");
+        assert!(!form.ssh_fetch_in_flight, "in-flight flag still cleared");
     }
 
     #[test]

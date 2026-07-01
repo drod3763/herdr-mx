@@ -6206,15 +6206,12 @@ async fn run_client_loop(
                     }
                     Err(err) => {
                         warn!(err = %err, "failed to fetch ssh-config hosts");
-                        // Surface the failure on the Add Remote overlay if it's still open (the user
-                        // launched this fetch from it); a late result after it closed stays log-only.
+                        // Surface the failure on the Add Remote overlay only if it's still the
+                        // launcher of this fetch and no manual add has since started; otherwise clear
+                        // the flag and drop the stale error. The fetch can fail for reasons other than
+                        // a local file read (unsupported method on an older server, socket failure).
                         if let Some(model) = &mut state.supervisor_model {
-                            model.clear_ssh_host_fetch();
-                            // Generic: the fetch can fail for reasons other than a local file read
-                            // (unsupported API method on an older server, socket failure, etc.).
-                            model.set_add_remote_error_if_open(format!(
-                                "couldn't load ssh hosts: {err}"
-                            ));
+                            model.fail_ssh_host_fetch(format!("couldn't load ssh hosts: {err}"));
                         }
                     }
                 }
