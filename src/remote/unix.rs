@@ -624,7 +624,12 @@ fn config_declares_transport() -> TransportDeclared {
             in_remote_table = compact.starts_with("[remote]");
             return false;
         }
-        in_remote_table && compact.starts_with("transport=")
+        // Inside `[remote]`: a `transport = ...`, a dotted subkey `transport.program = ...`, or a
+        // quoted `"transport" = ...` all declare a custom transport.
+        in_remote_table
+            && (compact.starts_with("transport=")
+                || compact.starts_with("transport.")
+                || compact.starts_with("\"transport\""))
     });
     if scanned {
         TransportDeclared::Yes
@@ -3744,6 +3749,25 @@ mod tests {
             "remote = { transport = { program = \"corp-wrapper\", args = [\"{host}\", \"{remote_command}\"] } }\noops = = broken\n",
         )
         .expect("write inline-transport unparseable config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_fails_closed_on_unparseable_config_with_dotted_subkey_transport() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-sub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // Transport declared with a dotted subkey under [remote], plus a TOML syntax error so the
+        // structured parse fails and the fallback scan must still detect the declaration.
+        std::fs::write(
+            &cfg,
+            "[remote]\ntransport.program = \"autossh\"\ntransport.args = [\"{host}\", \"{remote_command}\"]\noops = = broken\n",
+        )
+        .expect("write dotted-subkey unparseable config");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
         assert!(resolve_transport().is_err());
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
