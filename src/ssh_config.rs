@@ -227,10 +227,14 @@ fn parse_file(
                 current_aliases.clear();
             }
             "hostname" => {
-                // Ignore an over-length value (not a real DNS name); a set adds to the payload
-                // budget so display fields can't blow past the total byte cap either.
+                // Ignore an over-length value (not a real DNS name). Each set adds to the payload
+                // budget AND stops the fan-out once the budget is reached, so cloning the value onto
+                // a many-alias Host block can't blow past the total byte cap.
                 if let Some(value) = first_token(rest).filter(|v| v.len() <= MAX_FIELD_LEN) {
                     for &index in current_aliases.iter() {
+                        if *payload_bytes >= MAX_TOTAL_PAYLOAD_BYTES {
+                            break;
+                        }
                         if hosts[index].hostname.is_none() {
                             *payload_bytes += value.len();
                             hosts[index].hostname = Some(value.clone());
@@ -241,6 +245,9 @@ fn parse_file(
             "user" => {
                 if let Some(value) = first_token(rest).filter(|v| v.len() <= MAX_FIELD_LEN) {
                     for &index in current_aliases.iter() {
+                        if *payload_bytes >= MAX_TOTAL_PAYLOAD_BYTES {
+                            break;
+                        }
                         if hosts[index].user.is_none() {
                             *payload_bytes += value.len();
                             hosts[index].user = Some(value.clone());
@@ -829,6 +836,35 @@ mod tests {
             "the byte budget must truncate discovery before all {} aliases: got {}",
             per_file * 3,
             hosts.len()
+        );
+    }
+
+    #[test]
+    fn hostname_user_fanout_respects_the_payload_budget() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex (re-run): a single Host line with thousands of aliases, then a 256-byte HostName +
+        // User, must not clone the value onto every alias past the payload budget.
+        let big_value = "h".repeat(MAX_FIELD_LEN);
+        let mut line = String::from("Host");
+        for i in 0..(MAX_HOSTS + 100) {
+            line.push(' ');
+            line.push_str(&format!("a{i}"));
+        }
+        let body = format!("{line}\n  HostName {big_value}\n  User {big_value}\n");
+        let _fixture = ConfigFixture::new("fanout-budget", &body);
+        let hosts = discover_hosts();
+
+        let retained: usize = hosts
+            .iter()
+            .map(|h| {
+                h.alias.len()
+                    + h.hostname.as_ref().map_or(0, |s| s.len())
+                    + h.user.as_ref().map_or(0, |s| s.len())
+            })
+            .sum();
+        assert!(
+            retained <= MAX_TOTAL_PAYLOAD_BYTES + MAX_FIELD_LEN,
+            "retained payload {retained} must stay within the budget even with field fan-out"
         );
     }
 
