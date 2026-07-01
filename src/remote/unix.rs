@@ -588,14 +588,17 @@ fn config_declares_transport() -> TransportDeclared {
     let path = crate::config::config_path();
     let content = match std::fs::read_to_string(&path) {
         Ok(content) => content,
-        // Present but unreadable (permission denied, is-a-directory, transient IO): we cannot rule
-        // out a configured transport. Treat as Unknown so the caller fails closed. A genuinely
-        // absent file means no transport is configured.
-        Err(_) => {
-            return if path.exists() {
-                TransportDeclared::Unknown
-            } else {
+        // Present but unreadable (permission denied, is-a-directory, an unreadable parent, transient
+        // IO): we cannot rule out a configured transport. Treat as Unknown so the caller fails closed.
+        // Only a genuinely absent file (`NotFound`) means no transport is configured. Do NOT use
+        // `Path::exists()` to make this call: it also returns false on non-`NotFound` errors (e.g.
+        // `EACCES`/`ENOTDIR` while stat-ing), which would misclassify an unreadable config as absent
+        // and fall *open* to ssh.
+        Err(err) => {
+            return if err.kind() == io::ErrorKind::NotFound {
                 TransportDeclared::No
+            } else {
+                TransportDeclared::Unknown
             };
         }
     };
@@ -4176,6 +4179,49 @@ mod tests {
             "an unparseable config with no visible transport must not downgrade to ssh"
         );
 
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_declares_transport_is_unknown_on_a_non_notfound_read_error() {
+        // A read error that is NOT "file absent" must fail closed as Unknown, not be misclassified as
+        // No via `Path::exists()` (which also returns false for such errors) — otherwise a
+        // permission/IO problem would fall open to ssh (copilot-2). Model a non-`NotFound` error
+        // portably by routing the config path *through a regular file*, so the read fails with
+        // `ENOTDIR` and `Path::exists()` returns false.
+        let dir = std::env::temp_dir().join(format!("herdr-cfg-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let cfg = blocker.join("config.toml"); // traverses through a file → ENOTDIR on read
+        assert!(
+            std::fs::read_to_string(&cfg).is_err(),
+            "reading through a file must error"
+        );
+        assert!(!cfg.exists(), "Path::exists() is false for this non-NotFound error");
+
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(
+            config_declares_transport(),
+            TransportDeclared::Unknown,
+            "a present-but-unreadable config must fail closed as Unknown, not No"
+        );
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_declares_transport_is_no_when_the_file_is_absent() {
+        // The genuine "no config file" case (NotFound) still reports No so a user who never
+        // configured a custom transport is not forced into a fail-closed error.
+        let dir = std::env::temp_dir().join(format!("herdr-cfg-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("does-not-exist.toml");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(config_declares_transport(), TransportDeclared::No);
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(&dir);
     }
