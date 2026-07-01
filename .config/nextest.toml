@@ -1,17 +1,15 @@
-# Integration tests under `tests/` spawn real servers, PTYs, and Unix sockets. On loaded CI
-# (macOS especially) they occasionally flake on timing — e.g. a broadcast frame or socket not yet
-# observable within a fixed wait — even though they assert correct behavior. Retry only these
-# integration tests so an environmental hiccup does not red an otherwise-green run. Retries never
-# mask a real regression: a deterministic failure still fails every attempt. Unit tests (compiled
-# into the lib/bin targets) are deterministic and are intentionally NOT retried.
+# Retry ONLY specific, evidence-backed environmental flakes by name — deliberately NOT a blanket
+# `kind(test)` retry. This branch is dominated by watchdog / process-group / pipe-draining / timeout
+# code whose real regressions surface as intermittent hangs or races, so a blanket integration-suite
+# retry could mask a nondeterministic transport-teardown regression as green. Single-running the rest
+# of the suite preserves that signal; a genuinely new flake should be added here by name (with
+# tracking) or quarantined, never blanket-retried. Retries never mask a deterministic failure — it
+# still fails every attempt.
+#
+# - multi_client_broadcasts_frame_updates_to_all_clients: integration test; a broadcast frame is
+#   occasionally not observable within its fixed wait under noisy macOS CI scheduling.
+# - reused_shell_cost_is_flat_in_agent_count_while_rebuild_grows: unit test asserting a timing ratio
+#   that can exceed even its generous bounds under noisy CI scheduling.
 [[profile.default.overrides]]
-filter = 'kind(test)'
-retries = 2
-
-# A named exception among the unit tests: this one asserts a *timing ratio* (reused-shell cost stays
-# ~flat vs. a growing full rebuild). Despite generous bounds it can exceed them under noisy CI
-# scheduling, unrelated to any code change. Retry just this test by name so its environmental flake
-# doesn't red the run; every other unit test stays non-retried so a real regression still fails.
-[[profile.default.overrides]]
-filter = 'test(reused_shell_cost_is_flat_in_agent_count_while_rebuild_grows)'
+filter = 'test(multi_client_broadcasts_frame_updates_to_all_clients) | test(reused_shell_cost_is_flat_in_agent_count_while_rebuild_grows)'
 retries = 2
