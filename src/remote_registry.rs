@@ -556,6 +556,49 @@ mod tests {
     }
 
     #[test]
+    fn ssh_aliases_sharing_a_prefix_need_explicit_names_to_stay_distinct() {
+        // codex (re-run): `name: None` derives from `default_display_name`, which truncates
+        // `local:prod`/`local:stage` to `local` — so distinct ssh-config aliases collide as a
+        // duplicate name. The picker therefore passes the alias itself as the name.
+        let mut derived = RemoteRegistrySnapshot::default();
+        derived
+            .add(
+                None,
+                "ssh local:prod".into(),
+                RemoteKeybindingsSnapshot::Local,
+            )
+            .unwrap();
+        assert_eq!(
+            derived
+                .add(
+                    None,
+                    "ssh local:stage".into(),
+                    RemoteKeybindingsSnapshot::Local
+                )
+                .unwrap_err(),
+            RemoteRegistryError::DuplicateName,
+        );
+
+        // Explicit alias names (what the ssh-config picker sends) keep them distinct.
+        let mut named = RemoteRegistrySnapshot::default();
+        named
+            .add(
+                Some("local:prod".into()),
+                "ssh local:prod".into(),
+                RemoteKeybindingsSnapshot::Local,
+            )
+            .unwrap();
+        named
+            .add(
+                Some("local:stage".into()),
+                "ssh local:stage".into(),
+                RemoteKeybindingsSnapshot::Local,
+            )
+            .unwrap();
+        assert_eq!(named.remotes.len(), 2);
+    }
+
+    #[test]
     fn rejects_duplicate_local_default_targets() {
         let mut registry = RemoteRegistrySnapshot::default();
 

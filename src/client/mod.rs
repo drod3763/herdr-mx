@@ -3707,7 +3707,10 @@ fn spawn_client_ssh_hosts_add(
                         // codex-1-1: force ssh semantics so an alias like `localhost`/`local:prod`
                         // registers as an ssh destination, not herdr's local session target.
                         target: supervisor::ssh_config_alias_target(&alias),
-                        name: None,
+                        // Name the remote after the exact alias. `name: None` would derive it from
+                        // `default_display_name`, which truncates `local:prod`/`local:stage` to
+                        // `local` — colliding distinct aliases as duplicate names (codex re-run).
+                        name: Some(alias.clone()),
                         keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
                     },
                 );

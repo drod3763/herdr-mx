@@ -2046,12 +2046,6 @@ impl ClientSupervisorModel {
     }
 
     /// Surface a per-host failure on the picker's error line (mirrors `set_add_remote_error`).
-    pub(crate) fn set_ssh_host_picker_error(&mut self, error: impl Into<String>) {
-        if let Some(overlay) = self.ssh_host_picker_mut() {
-            overlay.error = Some(error.into());
-        }
-    }
-
     /// A batch add finished with failures: clear the in-flight `submit_generation` so Enter is
     /// re-enabled (the user can retry the still-checked failed rows) and surface the error. Without
     /// clearing the generation the picker would be a dead end after any partial failure.
