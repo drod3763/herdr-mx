@@ -51,6 +51,16 @@ const MAX_TOTAL_GLOB_SCANS: usize = 65536;
 /// Far above any realistic personal ssh config.
 const MAX_HOSTS: usize = 4096;
 
+/// Max bytes for a single alias / `HostName` / `User` value. A real ssh alias or DNS name fits
+/// easily; a longer token is a pattern or garbage and is dropped/ignored so one line can't push a
+/// huge string into the response.
+const MAX_FIELD_LEN: usize = 256;
+
+/// Total bytes of alias/hostname/user strings retained across the whole discovery. Even within the
+/// host-count and per-field caps the aggregate could approach the wire frame limit, so stop once the
+/// retained payload reaches this budget (well under the 2 MiB `MAX_FRAME_SIZE`).
+const MAX_TOTAL_PAYLOAD_BYTES: usize = 1 << 20;
+
 /// A single connectable ssh alias discovered in the config, with its resolved display fields.
 ///
 /// Doubles as the `remote.ssh_config_hosts` wire payload (referenced from `ResponseResult`), so it
@@ -82,6 +92,7 @@ pub fn discover_hosts() -> Vec<SshConfigHost> {
     // bounds the total reads.
     let mut include_stack = HashSet::new();
     let mut files_read = 0usize;
+    let mut payload_bytes = 0usize;
     // The active `Host` block, shared across `Include` boundaries so a per-host include attributes
     // its directives to the including file's block (OpenSSH inline-insertion semantics).
     let mut current_aliases = Vec::new();
@@ -94,6 +105,7 @@ pub fn discover_hosts() -> Vec<SshConfigHost> {
         &mut seen_aliases,
         &mut include_stack,
         &mut files_read,
+        &mut payload_bytes,
         &mut current_aliases,
         &mut glob_scans_remaining,
     );
@@ -140,6 +152,8 @@ fn parse_file(
     include_stack: &mut HashSet<PathBuf>,
     // Total files actually read this discovery pass; bounds re-reads of a shared include.
     files_read: &mut usize,
+    // Total bytes of alias/hostname/user strings retained so far (see `MAX_TOTAL_PAYLOAD_BYTES`).
+    payload_bytes: &mut usize,
     // The aliases of the current `Host` block, awaiting `HostName`/`User` lines beneath them.
     // Threaded through `Include` so the active block is shared across the include boundary (OpenSSH
     // inserts included contents inline): a per-host include attributes to the including block, and a
@@ -166,8 +180,8 @@ fn parse_file(
     if !meta.is_file() || meta.len() > MAX_CONFIG_FILE_BYTES {
         return;
     }
-    // Output cap: once enough aliases are collected, stop traversing (don't read/parse more files).
-    if hosts.len() >= MAX_HOSTS {
+    // Output cap: once enough aliases or bytes are collected, stop traversing (read no more files).
+    if hosts.len() >= MAX_HOSTS || *payload_bytes >= MAX_TOTAL_PAYLOAD_BYTES {
         return;
     }
     let Ok(contents) = std::fs::read_to_string(path) else {
@@ -184,7 +198,7 @@ fn parse_file(
             "host" => {
                 current_aliases.clear();
                 for token in tokenize(rest) {
-                    if hosts.len() >= MAX_HOSTS {
+                    if hosts.len() >= MAX_HOSTS || *payload_bytes >= MAX_TOTAL_PAYLOAD_BYTES {
                         break;
                     }
                     if !is_connectable_alias(&token) {
@@ -198,6 +212,7 @@ fn parse_file(
                         }
                         continue;
                     }
+                    *payload_bytes += token.len();
                     current_aliases.push(hosts.len());
                     hosts.push(SshConfigHost {
                         alias: token,
@@ -212,18 +227,22 @@ fn parse_file(
                 current_aliases.clear();
             }
             "hostname" => {
-                if let Some(value) = first_token(rest) {
+                // Ignore an over-length value (not a real DNS name); a set adds to the payload
+                // budget so display fields can't blow past the total byte cap either.
+                if let Some(value) = first_token(rest).filter(|v| v.len() <= MAX_FIELD_LEN) {
                     for &index in current_aliases.iter() {
                         if hosts[index].hostname.is_none() {
+                            *payload_bytes += value.len();
                             hosts[index].hostname = Some(value.clone());
                         }
                     }
                 }
             }
             "user" => {
-                if let Some(value) = first_token(rest) {
+                if let Some(value) = first_token(rest).filter(|v| v.len() <= MAX_FIELD_LEN) {
                     for &index in current_aliases.iter() {
                         if hosts[index].user.is_none() {
+                            *payload_bytes += value.len();
                             hosts[index].user = Some(value.clone());
                         }
                     }
@@ -248,6 +267,7 @@ fn parse_file(
                         seen_aliases,
                         include_stack,
                         files_read,
+                        payload_bytes,
                         current_aliases,
                         glob_scans_remaining,
                     );
@@ -312,6 +332,7 @@ fn first_token(rest: &str) -> Option<String> {
 /// `Host "a b"` pattern) would make the picker's `ssh <alias>` target ambiguous, so all are dropped.
 fn is_connectable_alias(token: &str) -> bool {
     !token.is_empty()
+        && token.len() <= MAX_FIELD_LEN
         && !token.starts_with('!')
         && !token.contains('*')
         && !token.contains('?')
@@ -753,6 +774,61 @@ mod tests {
         assert!(
             aliases.contains(&"trailing".to_string()),
             "a Host after a budget-exhausted Include must still be parsed"
+        );
+    }
+
+    #[test]
+    fn caps_oversized_alias_and_field_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex (re-run): a single line can't push a huge string into the response. An over-length
+        // alias is dropped; an over-length HostName/User is ignored; an at-cap alias is kept.
+        let long = "a".repeat(MAX_FIELD_LEN + 1);
+        let at_cap = "b".repeat(MAX_FIELD_LEN);
+        let body = format!(
+            "Host {long}\n  HostName h.host\n\nHost prod\n  HostName {long}\n  User {long}\n\nHost {at_cap}\n"
+        );
+        let _fixture = ConfigFixture::new("field-caps", &body);
+        let hosts = discover_hosts();
+        let aliases: Vec<_> = hosts.iter().map(|h| h.alias.clone()).collect();
+
+        assert!(
+            !aliases.iter().any(|a| a.len() > MAX_FIELD_LEN),
+            "no over-length alias survives"
+        );
+        assert!(aliases.contains(&"prod".to_string()));
+        assert!(aliases.contains(&at_cap), "an at-cap alias is kept");
+        let prod = hosts.iter().find(|h| h.alias == "prod").unwrap();
+        assert!(prod.hostname.is_none(), "oversized HostName ignored");
+        assert!(prod.user.is_none(), "oversized User ignored");
+    }
+
+    #[test]
+    fn caps_total_discovered_payload_bytes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex (re-run): discovery stops once the retained alias/field payload reaches the byte
+        // budget, so the response stays bounded even within the host-count and per-file caps. Split
+        // ~1.3 MiB of long aliases across include files (each under the 1 MiB per-file cap).
+        let fixture = ConfigFixture::new(
+            "payload-budget",
+            "Include config.d/a\nInclude config.d/b\nInclude config.d/c\n",
+        );
+        let per_file = 2000usize; // 2000 * ~250 bytes ≈ 0.5 MiB/file, 3 files > 1 MiB budget
+        for (fi, name) in ["a", "b", "c"].iter().enumerate() {
+            let mut body = String::new();
+            for i in 0..per_file {
+                let alias = format!("{:0>240}", fi * per_file + i); // unique ~240-char aliases
+                body.push_str("Host ");
+                body.push_str(&alias);
+                body.push('\n');
+            }
+            fixture.write_extra(&format!("config.d/{name}"), &body);
+        }
+        let hosts = discover_hosts();
+        assert!(
+            hosts.len() < per_file * 3,
+            "the byte budget must truncate discovery before all {} aliases: got {}",
+            per_file * 3,
+            hosts.len()
         );
     }
 
