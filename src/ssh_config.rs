@@ -246,11 +246,12 @@ fn parse_file(
             }
             "match" => {
                 // We only enumerate `Host` blocks; a `Match` block's directives must not attach to
-                // the previous host. Don't crash on `Match` selectors — just stop attributing. A
-                // `Match` opens an opaque conditional scope, so any `Include` beneath it is
-                // conditional on a selector we can't evaluate statically.
+                // the previous host. Don't crash on `Match` selectors — just stop attributing. An
+                // unconditional `Match all` (optionally after `canonical`/`final`) matches every
+                // connection, so an `Include` beneath it stays as reachable as the enclosing scope; a
+                // `Match` with real selectors we can't evaluate statically opens an opaque gate.
                 current_aliases.clear();
-                active_gate = Some(IncludeGate::MatchOpaque);
+                active_gate = match_gate(rest);
             }
             "hostname" => {
                 // Ignore an over-length value (not a real DNS name). Each set adds to the payload
@@ -404,6 +405,27 @@ enum IncludeGate {
     /// A `Match` block. Its selectors (`exec`, `host`, `user`, …) can't be evaluated statically for
     /// an arbitrary future target, so nothing beneath it is treated as unconditionally discoverable.
     MatchOpaque,
+}
+
+/// The gate a `Match` line opens for includes beneath it. `Match all` (optionally preceded by the
+/// `canonical`/`final` pass keywords) is unconditional — ssh processes such a block for every
+/// connection — so it adds no constraint and returns `None` (the enclosing scope is inherited
+/// unchanged). Any `Match` with real selectors (`host`, `exec`, `user`, …) can't be evaluated for an
+/// arbitrary future target, so it opens an opaque gate that admits nothing. #11.
+fn match_gate(rest: &str) -> Option<IncludeGate> {
+    let tokens: Vec<String> = tokenize(rest)
+        .iter()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    let unconditional = tokens.iter().any(|t| t == "all")
+        && tokens
+            .iter()
+            .all(|t| matches!(t.as_str(), "all" | "canonical" | "final"));
+    if unconditional {
+        None
+    } else {
+        Some(IncludeGate::MatchOpaque)
+    }
 }
 
 impl IncludeGate {
@@ -820,6 +842,30 @@ mod tests {
         assert!(
             !aliases.contains(&"matchhost".to_string()),
             "a Host inside an Include under a Match block is not discoverable"
+        );
+    }
+
+    #[test]
+    fn include_under_match_all_surfaces_its_hosts() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // codex (re-run): `Match all` is unconditional — ssh processes the include for every
+        // connection — so a concrete Host inside that include is a real discoverable alias. A `Match`
+        // with real selectors (`Match host …`) stays opaque and its include is suppressed.
+        let fixture = ConfigFixture::new(
+            "match-all-include",
+            "Match all\n  Include config.d/hosts\n\nMatch host bastion\n  Include config.d/gated\n",
+        );
+        fixture.write_extra("config.d/hosts", "Host always\n  HostName a.host\n");
+        fixture.write_extra("config.d/gated", "Host gatedhost\n  HostName g.host\n");
+        let aliases: Vec<_> = discover_hosts().into_iter().map(|h| h.alias).collect();
+
+        assert!(
+            aliases.contains(&"always".to_string()),
+            "a Host under a `Match all` include is discoverable"
+        );
+        assert!(
+            !aliases.contains(&"gatedhost".to_string()),
+            "a Host under a conditional `Match host` include is not discoverable"
         );
     }
 
