@@ -2425,6 +2425,13 @@ const INSTALL_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(15);
 /// custom transport could otherwise grow this without bound.
 const INSTALL_STDERR_TAIL_CAP: usize = 8 * 1024;
 
+/// How long a *failed* install waits to drain the last buffered stderr after the child has exited,
+/// before giving up on the reader. Well under the client idle window (90s): the child is already
+/// gone, so its error output is already buffered; this only bounds the wait for a descendant that
+/// escaped the process group and holds stderr open, so the failure path can't go silent to the 300s
+/// install deadline and let the caller time out into an overlapping retry.
+const INSTALL_FAILURE_STDERR_DRAIN: Duration = Duration::from_secs(3);
+
 /// Read `reader` to EOF, retaining only the last `cap` bytes. Always drains the pipe fully so a
 /// chatty child cannot deadlock on a full stderr buffer, but never grows memory past `cap`.
 /// Put a file descriptor into non-blocking mode so reads return `WouldBlock` instead of parking.
@@ -2475,6 +2482,48 @@ fn read_to_capped_tail_until<R: io::Read>(
                 thread::sleep(Duration::from_millis(20));
             }
             Err(_) => return (tail, false),
+        }
+    }
+}
+
+/// Like [`read_to_capped_tail_until`] but also stops when `stop` is set, returning whatever tail has
+/// been drained so far. Used by the install stderr reader: a *failed* install joins this reader for
+/// its error tail, and the reader's own deadline is the long absolute install cap. If a descendant
+/// that escaped the process group holds stderr open past the child's exit, EOF never arrives, so the
+/// failure path sets `stop` after a brief buffered-drain window to keep that join well under the
+/// caller's idle timeout instead of parking to the install deadline.
+fn read_to_capped_tail_until_stop<R: io::Read>(
+    reader: &mut R,
+    cap: usize,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> Vec<u8> {
+    let mut tail: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return tail;
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => return tail,
+            Ok(read) => {
+                tail.extend_from_slice(&chunk[..read]);
+                if tail.len() > cap {
+                    let overflow = tail.len() - cap;
+                    tail.drain(..overflow);
+                }
+                if Instant::now() >= deadline {
+                    return tail;
+                }
+            }
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return tail;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return tail,
         }
     }
 }
@@ -2565,15 +2614,19 @@ fn install_remote_herdr(
         )
     })?;
     // Deadline-aware drain so an stderr holder that escaped the process group can't park this join.
+    // The reader also observes `stderr_stop` so the terminal paths below can end it promptly (well
+    // under the caller's idle timeout) instead of waiting out the absolute install deadline.
     set_nonblocking(child_stderr.as_raw_fd())?;
     let install_deadline_at = Instant::now() + INSTALL_TRANSPORT_TIMEOUT;
+    let stderr_stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = Arc::clone(&stderr_stop);
     let stderr_reader = thread::spawn(move || {
-        read_to_capped_tail_until(
+        read_to_capped_tail_until_stop(
             &mut child_stderr,
             INSTALL_STDERR_TAIL_CAP,
             install_deadline_at,
+            &reader_stop,
         )
-        .0
     });
 
     // Watchdog: SIGKILL the install transport group if it has not finished within the deadline. A
@@ -2692,13 +2745,23 @@ fn install_remote_herdr(
         // Do NOT block on the stderr drain for a successful install: the tail only enriches a
         // failure message, and a daemonized/setsid descendant that escaped the process group could
         // hold stderr open until the reader's own deadline — outliving the client's 90s idle window
-        // and false-failing a completed install. The reader is deadline-bounded, so detaching it
-        // (dropping the handle) lets it finish on its own without leaking.
+        // and false-failing a completed install. Signal the reader to stop, then detach it (dropping
+        // the handle) so it ends promptly on its own without leaking or blocking this return.
+        stderr_stop.store(true, Ordering::SeqCst);
         drop(stderr_reader);
         Ok(())
     } else {
-        // Failure: the stderr tail helps diagnose it. The reader is deadline-bounded, so this join
-        // cannot hang forever even if a descendant holds stderr.
+        // Failure: the stderr tail helps diagnose it, but the reader's deadline is the 300s install
+        // cap. The child has already exited, so its error output is buffered; give the reader a brief
+        // window to surface it (beating progress so this doesn't go silent), then stop it so a
+        // descendant that escaped the process group and holds stderr open can't push this join past
+        // the caller's idle timeout into an overlapping retry.
+        let drain_deadline = Instant::now() + INSTALL_FAILURE_STDERR_DRAIN;
+        while !stderr_reader.is_finished() && Instant::now() < drain_deadline {
+            maybe_beat(&mut last_beat);
+            thread::sleep(Duration::from_millis(50));
+        }
+        stderr_stop.store(true, Ordering::SeqCst);
         let stderr = stderr_reader.join().unwrap_or_default();
         let stderr = String::from_utf8_lossy(&stderr);
         let stderr = stderr.trim();
@@ -4137,6 +4200,41 @@ mod tests {
             "EOF before the deadline must not report a timeout"
         );
         assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn read_to_capped_tail_until_stop_returns_when_stopped_with_pipe_open() {
+        // A failed install joins the stderr reader for its error tail, but a descendant that escaped
+        // the process group can hold stderr open so EOF never arrives — the reader's own deadline is
+        // the 300s install cap. The failure path sets `stop` after a short window; the drain must
+        // then return promptly (with whatever it buffered) instead of parking to the deadline
+        // (codex-9-1). A far deadline here proves only `stop` ends it.
+        use std::io::Write as _;
+        use std::os::unix::io::AsRawFd as _;
+        let (mut reader, mut writer) =
+            std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        writer.write_all(b"boom").expect("write buffered stderr");
+        set_nonblocking(reader.as_raw_fd()).expect("set non-blocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            read_to_capped_tail_until_stop(
+                &mut reader,
+                4096,
+                Instant::now() + Duration::from_secs(300),
+                &thread_stop,
+            )
+        });
+        thread::sleep(Duration::from_millis(100)); // let it drain "boom" then park (writer still open)
+        let start = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        let tail = worker.join().expect("worker joins");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return shortly after stop, not park to the install deadline"
+        );
+        assert_eq!(tail, b"boom", "buffered stderr is still returned");
+        drop(writer); // (held open above to keep the read end from seeing EOF)
     }
 
     #[test]
