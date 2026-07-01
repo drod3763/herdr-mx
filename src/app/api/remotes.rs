@@ -118,10 +118,19 @@ impl App {
             ));
             return true;
         }
-        let in_flight = self.ssh_discovery_in_flight.clone();
+        // Reset the flag via an RAII guard so it clears when the worker's scope exits — AFTER the
+        // response is sent (a second request can't start mid-serialization), and even if discovery or
+        // send panics (unwind runs Drop), so the flag can never get stuck `true`.
+        struct InFlightGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let guard = InFlightGuard(self.ssh_discovery_in_flight.clone());
         std::thread::spawn(move || {
+            let _guard = guard;
             let hosts = crate::ssh_config::discover_hosts();
-            in_flight.store(false, Ordering::SeqCst);
             let response = encode_success(id, ResponseResult::SshConfigHosts { hosts });
             let _ = respond_to.send(response);
         });
@@ -545,6 +554,48 @@ mod tests {
         assert_eq!(response["result"]["type"], "ssh_config_hosts");
         assert_eq!(response["result"]["hosts"][0]["alias"], "prod");
         assert!(!app.state.session_dirty, "discovery must not dirty session");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_ssh_config_hosts_clears_single_flight_after_completion() {
+        // codex-copilot (re-run): the single-flight flag must reset once the worker finishes (via an
+        // RAII guard, AFTER the response is sent), so a later request is not permanently `busy`.
+        use std::sync::atomic::Ordering;
+        let _env_lock = crate::ssh_config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("herdr-api-ssh-cfg-singleflight");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config");
+        std::fs::write(&config_path, "Host prod\n").unwrap();
+        let _guard = SetEnvGuard::set(crate::ssh_config::SSH_CONFIG_PATH_ENV_VAR, &config_path);
+
+        let mut app = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request: Request = serde_json::from_str(
+            r#"{"id":"hosts","method":"remote.ssh_config_hosts","params":{}}"#,
+        )
+        .unwrap();
+        assert!(app.handle_deferred_remote_ssh_config_hosts(request, tx));
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deferred discovery should answer the channel");
+
+        // The guard clears the flag right after the send; wait briefly for that drop to run.
+        let mut cleared = false;
+        for _ in 0..200 {
+            if !app.ssh_discovery_in_flight.load(Ordering::SeqCst) {
+                cleared = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            cleared,
+            "single-flight flag must clear after the worker completes"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
