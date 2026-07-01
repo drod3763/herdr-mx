@@ -399,8 +399,10 @@ enum IncludeGate {
     /// pattern and no negated (`!`) pattern — ssh's Host-pattern matching for the `*`/`?` wildcards.
     /// `Host *` admits every alias; `Host *.corp` admits only `*.corp` names; a concrete `Host prod`
     /// admits only `prod`. Bracket character classes (`Host db-[0-9]`) are matched literally, not
-    /// expanded, so a gate using one admits nothing — a conservative under-report (a rare pattern in a
-    /// gating position), never a false offer of an unreachable alias.
+    /// expanded. This can only ever under-report, never mis-admit: the candidate alias is always
+    /// bracket-free (`is_connectable_alias` rejects `[`/`]` before the gate runs), so a gate pattern
+    /// with literal brackets can never match it — it just drops the reachable `db-[0-9]`-style alias.
+    /// A rare pattern in a rare (gating) position; the fallback is typing the alias by hand.
     HostPatterns {
         positive: Vec<String>,
         negated: Vec<String>,
