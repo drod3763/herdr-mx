@@ -3657,14 +3657,14 @@ fn spawn_client_ssh_hosts_fetch(event_tx: &tokio::sync::mpsc::Sender<ClientLoopE
     });
 }
 
-/// The blocking body of [`spawn_client_ssh_hosts_fetch`]: one `remote.ssh_config_hosts` round-trip
-/// against the local main socket.
 /// Timeout for the `remote.ssh_config_hosts` round-trip. Larger than the 2s supervisor default
 /// because server-side discovery may read up to 256 files and scan up to 65k directory entries — a
 /// large or network-mounted `~/.ssh` can legitimately exceed 2s. The fetch runs on a worker thread,
 /// so this longer wait doesn't stall the UI loop; it still bounds a hung server.
 const SSH_CONFIG_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The blocking body of [`spawn_client_ssh_hosts_fetch`]: one `remote.ssh_config_hosts` round-trip
+/// against the local main socket.
 fn fetch_ssh_config_hosts() -> Result<Vec<crate::ssh_config::SshConfigHost>, String> {
     let api = crate::api::client::ApiClient::local();
     let response = api
