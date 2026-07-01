@@ -363,8 +363,11 @@ enum ClientInputDispatch {
     },
     AddRemote(supervisor::AddRemoteDraft),
     /// Fetch the local `~/.ssh/config` hosts off the UI loop (the add-remote "pick" affordance); the
-    /// result opens the multi-select ssh-host picker.
-    FetchSshHosts,
+    /// result opens the multi-select ssh-host picker. Carries the fetch generation so a stale worker
+    /// result can be matched back to the overlay session that launched it.
+    FetchSshHosts {
+        generation: u64,
+    },
     /// Batch-register the checked picker aliases off the UI loop, one `remote.add` per alias.
     AddSshHosts(Vec<String>),
     // item 3 (Area 5): toggle / delete a remote off the UI loop against ServerId::main().
@@ -1040,7 +1043,7 @@ fn dispatch_requires_loop_handling(dispatch: &ClientInputDispatch) -> bool {
     matches!(
         dispatch,
         ClientInputDispatch::AddRemote(_)
-            | ClientInputDispatch::FetchSshHosts
+            | ClientInputDispatch::FetchSshHosts { .. }
             | ClientInputDispatch::AddSshHosts(_)
             | ClientInputDispatch::SetRemoteEnabled { .. }
             | ClientInputDispatch::SetRemoteAutoUpdate { .. }
@@ -1692,8 +1695,8 @@ fn dispatch_sidebar_hit_target(
         // the result opens the multi-select picker (`SshHostsFetched`). `begin_ssh_host_fetch` marks
         // the fetch in flight and rejects a duplicate while one is already running.
         compositor::SidebarHitTarget::OpenSshHostPicker => {
-            if model.begin_ssh_host_fetch() {
-                ClientInputDispatch::FetchSshHosts
+            if let Some(generation) = model.begin_ssh_host_fetch() {
+                ClientInputDispatch::FetchSshHosts { generation }
             } else {
                 ClientInputDispatch::Redraw
             }
@@ -2489,7 +2492,10 @@ enum ClientLoopEvent {
     },
     /// The off-loop `remote.ssh_config_hosts` fetch (the add-remote "pick" affordance) finished. On
     /// Ok the multi-select picker opens with the parsed hosts, deduped against the current registry.
+    /// `generation` ties the result back to the overlay session that launched it, so a stale result
+    /// (the overlay was closed/reopened, or a newer fetch started) is dropped rather than applied.
     SshHostsFetched {
+        generation: u64,
         result: Result<Vec<crate::ssh_config::SshConfigHost>, String>,
     },
     /// The off-loop batch `remote.add` of the checked picker aliases finished. Each tuple is
@@ -3649,11 +3655,14 @@ fn fetch_worktree_picker_items(
 /// Fetch the local main server's `~/.ssh/config` hosts off the UI loop (the add-remote "pick"
 /// affordance). The round-trip runs on a worker thread and lands as `SshHostsFetched`. Modeled on
 /// `spawn_worktree_list_fetch`, but always against the LOCAL main API.
-fn spawn_client_ssh_hosts_fetch(event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>) {
+fn spawn_client_ssh_hosts_fetch(
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    generation: u64,
+) {
     let event_tx = event_tx.clone();
     std::thread::spawn(move || {
         let result = fetch_ssh_config_hosts();
-        let _ = event_tx.blocking_send(ClientLoopEvent::SshHostsFetched { result });
+        let _ = event_tx.blocking_send(ClientLoopEvent::SshHostsFetched { generation, result });
     });
 }
 
@@ -5311,8 +5320,8 @@ async fn run_client_loop(
                             // The add-remote "pick from ~/.ssh/config" affordance: fetch the local ssh
                             // hosts off the UI loop; the result opens the multi-select picker
                             // (`SshHostsFetched`).
-                            ClientInputDispatch::FetchSshHosts => {
-                                spawn_client_ssh_hosts_fetch(&event_tx);
+                            ClientInputDispatch::FetchSshHosts { generation } => {
+                                spawn_client_ssh_hosts_fetch(&event_tx, generation);
                                 state.request_full_redraw();
                                 render_cached_composited_frame(&mut state);
                                 continue;
@@ -6204,25 +6213,30 @@ async fn run_client_loop(
             // The add-remote "pick" affordance's ssh-config fetch finished: on Ok open the
             // multi-select picker, deduped against the current registry snapshot; on Err log a
             // warning and surface the failure on the Add Remote overlay if it is still open.
-            ClientLoopEvent::SshHostsFetched { result } => {
+            ClientLoopEvent::SshHostsFetched { generation, result } => {
                 match result {
                     Ok(hosts) => {
                         if let Some(model) = &mut state.supervisor_model {
                             let existing = model.synced_remotes().to_vec();
-                            // Atomic open-then-clear: only opens if the Add Remote overlay the fetch
-                            // was launched from is still active and uninterrupted; otherwise drops the
-                            // late/duplicate result and clears the in-flight flag.
-                            model.complete_ssh_host_fetch(hosts, &existing);
+                            // Atomic open-then-clear, gated on the launching fetch generation: only
+                            // opens if the Add Remote overlay THIS fetch was launched from is still
+                            // active and uninterrupted; otherwise drops the late/stale result (a
+                            // close/reopen or newer fetch) and clears only this generation's flag.
+                            model.complete_ssh_host_fetch(generation, hosts, &existing);
                         }
                     }
                     Err(err) => {
                         warn!(err = %err, "failed to fetch ssh-config hosts");
                         // Surface the failure on the Add Remote overlay only if it's still the
-                        // launcher of this fetch and no manual add has since started; otherwise clear
-                        // the flag and drop the stale error. The fetch can fail for reasons other than
-                        // a local file read (unsupported method on an older server, socket failure).
+                        // launcher of THIS fetch (generation matches) and no manual add has since
+                        // started; otherwise clear this generation's flag and drop the stale error.
+                        // The fetch can fail for reasons other than a local file read (unsupported
+                        // method on an older server, socket failure).
                         if let Some(model) = &mut state.supervisor_model {
-                            model.fail_ssh_host_fetch(format!("couldn't load ssh hosts: {err}"));
+                            model.fail_ssh_host_fetch(
+                                generation,
+                                format!("couldn't load ssh hosts: {err}"),
+                            );
                         }
                     }
                 }

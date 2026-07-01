@@ -345,10 +345,14 @@ pub(crate) struct AddRemoteForm {
     /// on the in-progress status row in place of the static "connecting to remote…" so seeding a
     /// fresh machine reads as live progress (issue #32). `None` until the first stage arrives.
     pub(crate) progress: Option<String>,
-    /// True while an ssh-config discovery fetch (the "pick from ~/.ssh/config" affordance) is in
-    /// flight. Gates the affordance so a fast double-click cannot spawn duplicate fetch threads, and
-    /// renders it disabled so the visuals match the inert hit-test (PRRT...HqO / PRRT...Hqu).
-    pub(crate) ssh_fetch_in_flight: bool,
+    /// The generation of the in-flight ssh-config discovery fetch (the "pick from ~/.ssh/config"
+    /// affordance), or `None` when no fetch is running. `Some` gates the affordance so a fast
+    /// double-click cannot spawn duplicate fetch threads, and renders it disabled so the visuals match
+    /// the inert hit-test (PRRT...HqO / PRRT...Hqu). The generation (allocated per fetch from the
+    /// model) ties a worker result back to the exact overlay session that launched it: if the user
+    /// closes and reopens Add Remote and starts a new fetch, a straggling earlier result no longer
+    /// matches and is dropped instead of opening the picker or clobbering the new fetch's state.
+    pub(crate) ssh_fetch_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -745,6 +749,10 @@ pub(crate) struct ClientSupervisorModel {
     /// Monotonic generation handed to each ssh-host batch `remote.add`, so a late `SshHostsAdded`
     /// result can be matched back to the picker session that submitted it (re-entrancy guard).
     next_ssh_add_generation: u64,
+    /// Monotonic generation handed to each ssh-config discovery fetch, so a late `SshHostsFetched`
+    /// result can be matched back to the Add Remote overlay session that launched it (re-entrancy
+    /// guard against close/reopen/retry races).
+    next_ssh_fetch_generation: u64,
 }
 
 const SUPERVISOR_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -830,6 +838,7 @@ impl ClientSupervisorModel {
             update_outcomes: std::collections::HashMap::new(),
             synced_remotes: Vec::new(),
             next_ssh_add_generation: 0,
+            next_ssh_fetch_generation: 0,
         }
     }
 
@@ -1730,45 +1739,62 @@ impl ClientSupervisorModel {
             error: None,
             in_progress: false,
             progress: None,
-            ssh_fetch_in_flight: false,
+            ssh_fetch_generation: None,
         });
     }
 
-    /// Begin an ssh-config discovery fetch from the Add Remote overlay. Returns `true` (and marks the
-    /// fetch in flight) only when the overlay is open, no add is in progress, and no fetch is already
-    /// running — so a fast double-click can't spawn duplicate fetch threads. Returns `false` (no-op)
-    /// otherwise.
-    pub(crate) fn begin_ssh_host_fetch(&mut self) -> bool {
+    /// Begin an ssh-config discovery fetch from the Add Remote overlay. Returns `Some(generation)`
+    /// (and marks the fetch in flight with that generation) only when the overlay is open, no add is
+    /// in progress, and no fetch is already running — so a fast double-click can't spawn duplicate
+    /// fetch threads. The generation flows through the worker back into `SshHostsFetched`, so a result
+    /// is only applied while it still matches the overlay session that launched it. Returns `None`
+    /// (no-op) otherwise.
+    pub(crate) fn begin_ssh_host_fetch(&mut self) -> Option<u64> {
+        let generation = self.next_ssh_fetch_generation;
+        let started = if let Some(form) = self.add_remote_form_mut() {
+            if !form.in_progress && form.ssh_fetch_generation.is_none() {
+                form.ssh_fetch_generation = Some(generation);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if started {
+            self.next_ssh_fetch_generation = self.next_ssh_fetch_generation.wrapping_add(1);
+            Some(generation)
+        } else {
+            None
+        }
+    }
+
+    /// Clear the in-flight ssh-config fetch generation, but only when it still matches `generation` —
+    /// so a straggling earlier fetch resolving does not clear a newer fetch's in-flight state. No-op
+    /// if the Add Remote overlay is no longer open (e.g. the picker already replaced it).
+    pub(crate) fn clear_ssh_host_fetch_if_current(&mut self, generation: u64) {
         if let Some(form) = self.add_remote_form_mut() {
-            if !form.in_progress && !form.ssh_fetch_in_flight {
-                form.ssh_fetch_in_flight = true;
-                return true;
+            if form.ssh_fetch_generation == Some(generation) {
+                form.ssh_fetch_generation = None;
             }
         }
-        false
     }
 
-    /// Clear the in-flight ssh-config fetch flag (the fetch resolved). No-op if the Add Remote
-    /// overlay is no longer open (e.g. the picker already replaced it).
-    pub(crate) fn clear_ssh_host_fetch(&mut self) {
-        if let Some(form) = self.add_remote_form_mut() {
-            form.ssh_fetch_in_flight = false;
-        }
-    }
-
-    /// Consume a successful ssh-config fetch atomically: open the picker if this is still the
-    /// in-flight fetch on an uninterrupted Add Remote overlay, otherwise clear the in-flight flag.
-    /// Opening MUST happen while `ssh_fetch_in_flight` is still set (the open gate requires it), so
-    /// this keeps the open-before-clear order in one place — a caller can't reintroduce the
-    /// clear-before-open bug that silently dropped every successful fetch. Returns whether it opened.
+    /// Consume a successful ssh-config fetch atomically: open the picker if `generation` is still the
+    /// in-flight fetch on an uninterrupted Add Remote overlay, otherwise clear that generation's
+    /// in-flight flag (leaving a newer fetch untouched). Opening MUST happen while the matching
+    /// generation is still set (the open gate requires it), so this keeps the open-before-clear order
+    /// in one place — a caller can't reintroduce the clear-before-open bug that silently dropped every
+    /// successful fetch. Returns whether it opened.
     pub(crate) fn complete_ssh_host_fetch(
         &mut self,
+        generation: u64,
         hosts: Vec<crate::ssh_config::SshConfigHost>,
         existing: &[crate::remote_registry::RemoteDefinitionSnapshot],
     ) -> bool {
-        let opened = self.open_ssh_host_picker_if_adding(hosts, existing);
+        let opened = self.open_ssh_host_picker_if_adding(generation, hosts, existing);
         if !opened {
-            self.clear_ssh_host_fetch();
+            self.clear_ssh_host_fetch_if_current(generation);
         }
         opened
     }
@@ -1878,16 +1904,21 @@ impl ClientSupervisorModel {
         }
     }
 
-    /// Report a failed ssh-config fetch: always clear the in-flight flag, and surface the error on
-    /// the Add Remote overlay ONLY when it is still the launcher of THIS fetch (fetch in flight) and
-    /// no manual add has since started. If a manual add is in progress, the stale fetch error is
-    /// dropped so it can't clobber the add's own progress/error state (mirrors the success gate).
-    /// Returns whether the error was surfaced.
-    pub(crate) fn fail_ssh_host_fetch(&mut self, error: impl Into<String>) -> bool {
+    /// Report a failed ssh-config fetch: surface the error on the Add Remote overlay ONLY when it is
+    /// still the launcher of THIS fetch (the in-flight generation matches) and no manual add has since
+    /// started, and clear only that generation's in-flight flag. A stale result whose generation no
+    /// longer matches (the overlay was closed/reopened, or a manual add started) is dropped so it
+    /// can't clobber a newer fetch or the add's own progress/error state. Returns whether the error
+    /// was surfaced.
+    pub(crate) fn fail_ssh_host_fetch(
+        &mut self,
+        generation: u64,
+        error: impl Into<String>,
+    ) -> bool {
         let surface = self
             .add_remote_form()
-            .is_some_and(|form| form.ssh_fetch_in_flight && !form.in_progress);
-        self.clear_ssh_host_fetch();
+            .is_some_and(|form| form.ssh_fetch_generation == Some(generation) && !form.in_progress);
+        self.clear_ssh_host_fetch_if_current(generation);
         if surface {
             self.set_add_remote_error(error);
         }
@@ -2009,19 +2040,20 @@ impl ClientSupervisorModel {
     }
 
     /// Open the picker from a completed `remote.ssh_config_hosts` fetch, but ONLY when the Add Remote
-    /// overlay is still open with THIS fetch still in flight and no manual add in progress — i.e. the
-    /// fetch the user launched from the button, uninterrupted. Dropped otherwise: the overlay was
-    /// closed, a picker is already open (double-click), or the user submitted a manual add while the
-    /// fetch was pending (replacing that in-progress overlay would hide its progress/error). Returns
-    /// whether it opened.
+    /// overlay is still open with THIS fetch's `generation` still in flight and no manual add in
+    /// progress — i.e. the fetch the user launched from the button, uninterrupted. Dropped otherwise:
+    /// the overlay was closed (and possibly reopened with a newer fetch), a picker is already open
+    /// (double-click), or the user submitted a manual add while the fetch was pending (replacing that
+    /// in-progress overlay would hide its progress/error). Returns whether it opened.
     pub(crate) fn open_ssh_host_picker_if_adding(
         &mut self,
+        generation: u64,
         hosts: Vec<crate::ssh_config::SshConfigHost>,
         existing: &[crate::remote_registry::RemoteDefinitionSnapshot],
     ) -> bool {
         let ready = self
             .add_remote_form()
-            .is_some_and(|form| form.ssh_fetch_in_flight && !form.in_progress);
+            .is_some_and(|form| form.ssh_fetch_generation == Some(generation) && !form.in_progress);
         if !ready {
             return false;
         }
@@ -6094,7 +6126,7 @@ mod tests {
                 error: None,
                 in_progress: false,
                 progress: None,
-                ssh_fetch_in_flight: false,
+                ssh_fetch_generation: None,
             })
         );
     }
@@ -6216,28 +6248,27 @@ mod tests {
 
         // No overlay → nothing surfaced, no-op.
         let mut idle = ClientSupervisorModel::new("local");
-        assert!(!idle.fail_ssh_host_fetch("boom"));
+        assert!(!idle.fail_ssh_host_fetch(0, "boom"));
         assert!(idle.add_remote_form().is_none());
 
         // Launcher, no manual add → error surfaces and the in-flight flag clears.
         let mut adding = ClientSupervisorModel::new("local");
         adding.open_add_remote_form();
-        assert!(adding.begin_ssh_host_fetch());
-        assert!(adding.fail_ssh_host_fetch("couldn't load ssh hosts: x"));
+        let gen = adding.begin_ssh_host_fetch().expect("fetch begins");
+        assert!(adding.fail_ssh_host_fetch(gen, "couldn't load ssh hosts: x"));
         let form = adding.add_remote_form().unwrap();
         assert_eq!(form.error.as_deref(), Some("couldn't load ssh hosts: x"));
-        assert!(!form.ssh_fetch_in_flight);
+        assert!(form.ssh_fetch_generation.is_none());
 
         // A manual add started after launching the fetch → stale error dropped, add progress kept.
         let mut racing = ClientSupervisorModel::new("local");
         racing.open_add_remote_form();
-        assert!(racing.begin_ssh_host_fetch());
+        let gen = racing.begin_ssh_host_fetch().expect("fetch begins");
         racing.set_add_remote_in_progress();
-        assert!(!racing.fail_ssh_host_fetch("stale error"));
+        assert!(!racing.fail_ssh_host_fetch(gen, "stale error"));
         let form = racing.add_remote_form().unwrap();
         assert!(form.in_progress, "manual add progress preserved");
         assert!(form.error.is_none(), "stale fetch error dropped");
-        assert!(!form.ssh_fetch_in_flight, "in-flight flag still cleared");
     }
 
     #[test]
@@ -6245,16 +6276,33 @@ mod tests {
         // PRRT...Hqu: a fast double-click must not spawn duplicate fetch threads. begin_ssh_host_fetch
         // marks the fetch in flight and rejects a second start until it is cleared.
         let mut model = ClientSupervisorModel::new("local");
-        assert!(!model.begin_ssh_host_fetch(), "no overlay → cannot begin");
+        assert!(
+            model.begin_ssh_host_fetch().is_none(),
+            "no overlay → cannot begin"
+        );
 
         model.open_add_remote_form();
-        assert!(model.begin_ssh_host_fetch());
-        assert!(model.add_remote_form().unwrap().ssh_fetch_in_flight);
-        assert!(!model.begin_ssh_host_fetch(), "duplicate fetch rejected");
+        let gen = model.begin_ssh_host_fetch().expect("first fetch begins");
+        assert!(model
+            .add_remote_form()
+            .unwrap()
+            .ssh_fetch_generation
+            .is_some());
+        assert!(
+            model.begin_ssh_host_fetch().is_none(),
+            "duplicate fetch rejected"
+        );
 
-        model.clear_ssh_host_fetch();
-        assert!(!model.add_remote_form().unwrap().ssh_fetch_in_flight);
-        assert!(model.begin_ssh_host_fetch(), "begins again after clear");
+        model.clear_ssh_host_fetch_if_current(gen);
+        assert!(model
+            .add_remote_form()
+            .unwrap()
+            .ssh_fetch_generation
+            .is_none());
+        let next = model
+            .begin_ssh_host_fetch()
+            .expect("begins again after clear");
+        assert_ne!(next, gen, "a fresh fetch gets a new generation");
     }
 
     #[test]
@@ -6389,20 +6437,55 @@ mod tests {
 
         // No overlay open → the result is dropped.
         let mut idle = ClientSupervisorModel::new("local");
-        assert!(!idle.open_ssh_host_picker_if_adding(hosts.clone(), &[]));
+        assert!(!idle.open_ssh_host_picker_if_adding(0, hosts.clone(), &[]));
         assert!(idle.ssh_host_picker().is_none());
 
         // Add Remote overlay open with the fetch in flight → the picker opens.
         let mut adding = ClientSupervisorModel::new("local");
         adding.open_add_remote_form();
-        assert!(adding.begin_ssh_host_fetch());
-        assert!(adding.open_ssh_host_picker_if_adding(hosts.clone(), &[]));
+        let gen = adding.begin_ssh_host_fetch().expect("fetch begins");
+        assert!(adding.open_ssh_host_picker_if_adding(gen, hosts.clone(), &[]));
         assert!(adding.ssh_host_picker().is_some());
 
         // A second (duplicate) result now finds the picker — not the Add Remote overlay — open, so it
         // is dropped and does not reset the first picker.
-        assert!(!adding.open_ssh_host_picker_if_adding(hosts, &[]));
+        assert!(!adding.open_ssh_host_picker_if_adding(gen, hosts, &[]));
         assert!(adding.ssh_host_picker().is_some());
+    }
+
+    #[test]
+    fn stale_fetch_result_does_not_apply_to_a_reopened_add_remote_overlay() {
+        // codex: tie a fetch result to the overlay session that launched it. Fetch A on the first
+        // overlay, then close+reopen Add Remote and start fetch B; A's late result (its generation no
+        // longer current) must NOT open the picker or clear B's in-flight state, and B's result still
+        // works.
+        let hosts = vec![ssh_host("alpha", None, None)];
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        let gen_a = model.begin_ssh_host_fetch().expect("fetch A begins");
+
+        // User closes Add Remote and reopens it, then launches a second fetch.
+        model.close_client_overlay();
+        model.open_add_remote_form();
+        let gen_b = model.begin_ssh_host_fetch().expect("fetch B begins");
+        assert_ne!(gen_a, gen_b);
+
+        // Fetch A's straggling result arrives: dropped, and B stays in flight.
+        assert!(!model.complete_ssh_host_fetch(gen_a, hosts.clone(), &[]));
+        assert!(
+            model.ssh_host_picker().is_none(),
+            "stale A must not open the picker"
+        );
+        assert!(
+            model
+                .add_remote_form()
+                .is_some_and(|f| f.ssh_fetch_generation == Some(gen_b)),
+            "B's in-flight generation is untouched by A"
+        );
+
+        // Fetch B's result then opens the picker normally.
+        assert!(model.complete_ssh_host_fetch(gen_b, hosts, &[]));
+        assert!(model.ssh_host_picker().is_some());
     }
 
     #[test]
@@ -6413,8 +6496,8 @@ mod tests {
         // picker; an intervening manual add still drops the result and clears the flag.
         let mut model = ClientSupervisorModel::new("local");
         model.open_add_remote_form();
-        assert!(model.begin_ssh_host_fetch());
-        assert!(model.complete_ssh_host_fetch(vec![ssh_host("a", None, None)], &[]));
+        let gen = model.begin_ssh_host_fetch().expect("fetch begins");
+        assert!(model.complete_ssh_host_fetch(gen, vec![ssh_host("a", None, None)], &[]));
         assert!(
             model.ssh_host_picker().is_some(),
             "a successful fetch must open the picker"
@@ -6422,13 +6505,13 @@ mod tests {
 
         let mut racing = ClientSupervisorModel::new("local");
         racing.open_add_remote_form();
-        assert!(racing.begin_ssh_host_fetch());
+        let gen = racing.begin_ssh_host_fetch().expect("fetch begins");
         racing.set_add_remote_in_progress();
-        assert!(!racing.complete_ssh_host_fetch(vec![ssh_host("a", None, None)], &[]));
+        assert!(!racing.complete_ssh_host_fetch(gen, vec![ssh_host("a", None, None)], &[]));
         assert!(racing.ssh_host_picker().is_none());
         assert!(racing
             .add_remote_form()
-            .is_some_and(|f| !f.ssh_fetch_in_flight));
+            .is_some_and(|f| f.ssh_fetch_generation.is_none()));
     }
 
     #[test]
@@ -6438,10 +6521,10 @@ mod tests {
         // the add's progress/error). The fetch result is dropped while an add is in progress.
         let mut model = ClientSupervisorModel::new("local");
         model.open_add_remote_form();
-        assert!(model.begin_ssh_host_fetch());
+        let gen = model.begin_ssh_host_fetch().expect("fetch begins");
         model.set_add_remote_in_progress();
 
-        assert!(!model.open_ssh_host_picker_if_adding(vec![ssh_host("a", None, None)], &[]));
+        assert!(!model.open_ssh_host_picker_if_adding(gen, vec![ssh_host("a", None, None)], &[]));
         assert!(model.ssh_host_picker().is_none());
         assert!(
             model.add_remote_form().is_some_and(|f| f.in_progress),
