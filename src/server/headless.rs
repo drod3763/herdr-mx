@@ -2657,10 +2657,16 @@ impl HeadlessServer {
         // filesystem IO and must answer off the synchronous server loop on a worker thread, so a slow
         // or wedged config tree cannot stall API handling, client forwarding, or shutdown here.
         if msg.request.method.runs_ssh_config_discovery_off_loop() {
-            let deferred_changed = self
+            // The deferred handler returns a "handled" flag (always true), not a state-changed
+            // signal. Discovery is read-only and answered on a worker thread, so it dirties no app
+            // state — return the pre-existing `changed` rather than OR-ing the handled flag in, which
+            // would force an unnecessary render/forward pass on every discovery request (mirrors the
+            // TUI runtime dispatcher, which also ignores the flag for the changed signal).
+            let handled = self
                 .app
                 .handle_deferred_remote_ssh_config_hosts(msg.request, msg.respond_to);
-            return changed | deferred_changed;
+            debug_assert!(handled);
+            return changed;
         }
         let response = if matches!(
             &msg.request.method,
