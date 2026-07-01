@@ -2474,34 +2474,47 @@ fn read_to_capped_tail_until<R: io::Read>(
     }
 }
 
-fn install_remote_herdr(
-    target: &SshTarget,
-    remote_herdr: &RemoteHerdr,
-    source_path: &Path,
-    progress: &ProgressSink,
-) -> io::Result<()> {
-    // mktemp the staging file rather than a predictable "$dest.tmp.$$": `cat >` follows symlinks, so
-    // a guessable name in $HOME could be pre-planted (symlink redirect / pre-created file). mktemp
-    // creates an exclusive, unpredictable, owner-only file (no symlink follow), then we chmod+mv it
-    // into place.
-    let script = format!(
+/// The remote install shell script. Stages the streamed binary in an unpredictable mktemp file
+/// (`cat >` follows symlinks, so a guessable `$dest.tmp` in `$HOME` could be pre-planted), then
+/// **verifies the staged byte count equals `expected_len` before `mv`**. A local read error or a
+/// custom transport that closes stdin after only part of the payload would otherwise make the remote
+/// `cat/mv` succeed and overwrite a working binary with a truncated one; on a size mismatch the
+/// script deletes the temp file (via the EXIT trap) and exits non-zero, leaving the destination
+/// untouched.
+fn build_install_script(install_suffix: &str, expected_len: u64) -> String {
+    format!(
         r#"dest="$HOME/{install_suffix}"
 dir="${{dest%/*}}"
 mkdir -p "$dir"
 tmp="$(mktemp "${{dest}}.tmp.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 cat > "$tmp"
+got="$(wc -c < "$tmp" | tr -d '[:space:]')"
+if [ "$got" != "{expected_len}" ]; then
+  echo "install payload truncated: staged $got bytes, expected {expected_len}" >&2
+  exit 1
+fi
 chmod 755 "$tmp"
 mv "$tmp" "$dest"
 trap - EXIT
-"#,
-        install_suffix = remote_herdr.install_suffix
-    );
+"#
+    )
+}
 
+fn install_remote_herdr(
+    target: &SshTarget,
+    remote_herdr: &RemoteHerdr,
+    source_path: &Path,
+    progress: &ProgressSink,
+) -> io::Result<()> {
     // Open the source binary BEFORE starting the remote transport: a failure here must not leave a
     // spawned child/watchdog behind (the watchdog would later SIGKILL a possibly-reused process
-    // group), and must not let the remote `cat` see an immediate EOF and install an empty file.
+    // group), and must not let the remote `cat` see an immediate EOF and install an empty file. Its
+    // length is embedded in the install script so the remote verifies the staged file before
+    // replacing the destination (see below).
     let mut source = File::open(source_path)?;
+    let expected_len = source.metadata()?.len();
+    let script = build_install_script(&remote_herdr.install_suffix, expected_len);
 
     // Capture (never inherit) the install child's output: this also runs inside the in-client
     // add-remote worker, where the raw-mode TUI owns the terminal, so any inherited byte (ssh's
@@ -3862,6 +3875,76 @@ mod tests {
             "EOF before the deadline must not report a timeout"
         );
         assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn install_script_rejects_a_truncated_payload_without_replacing_dest() {
+        // Run the generated install script locally with a HOME override, feeding FEWER bytes than
+        // expected (a transport that closed stdin early). It must exit non-zero and leave any
+        // existing binary untouched.
+        let dir = std::env::temp_dir().join(format!("herdr-install-trunc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp HOME");
+        let dest = dir.join(".local/bin/herdr");
+        std::fs::create_dir_all(dest.parent().unwrap()).expect("create bin dir");
+        std::fs::write(&dest, b"OLD-GOOD-BINARY").expect("seed existing binary");
+
+        let script = build_install_script(".local/bin/herdr", 100); // expect 100 bytes
+        let output = std::process::Command::new("sh")
+            .arg("-eu")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write as _;
+                child.stdin.take().unwrap().write_all(b"only-a-few-bytes")?; // < 100
+                child.wait_with_output()
+            })
+            .expect("run install script");
+
+        assert!(
+            !output.status.success(),
+            "truncated payload must fail the install"
+        );
+        assert_eq!(
+            std::fs::read(&dest).expect("dest still present"),
+            b"OLD-GOOD-BINARY",
+            "existing binary must not be replaced by a truncated payload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_script_replaces_dest_on_a_complete_payload() {
+        let dir = std::env::temp_dir().join(format!("herdr-install-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp HOME");
+        let payload = b"NEW-COMPLETE-BINARY";
+        let script = build_install_script(".local/bin/herdr", payload.len() as u64);
+        let output = std::process::Command::new("sh")
+            .arg("-eu")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write as _;
+                child.stdin.take().unwrap().write_all(payload)?;
+                child.wait_with_output()
+            })
+            .expect("run install script");
+
+        assert!(output.status.success(), "a complete payload must install");
+        assert_eq!(
+            std::fs::read(dir.join(".local/bin/herdr")).expect("dest written"),
+            payload
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
