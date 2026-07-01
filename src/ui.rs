@@ -59,12 +59,13 @@ use self::status::{
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
-        add_remote_button_rects, add_remote_popup_rect, client_menu_popup_rect_at,
-        client_menu_row_rect, confirm_close_button_rects, confirm_close_popup_rect,
-        confirm_close_workspace_button_rects, confirm_close_workspace_popup_rect,
-        confirm_delete_worktree_popup_rect, new_linked_worktree_button_rects,
-        new_linked_worktree_inner_rect, new_workspace_picker_button_rects,
-        new_workspace_picker_popup_rect, new_workspace_picker_row_rect, new_worktree_popup_rect,
+        add_remote_button_rects, add_remote_pick_button_rect, add_remote_popup_rect,
+        client_menu_popup_rect_at, client_menu_row_rect, confirm_close_button_rects,
+        confirm_close_popup_rect, confirm_close_workspace_button_rects,
+        confirm_close_workspace_popup_rect, confirm_delete_worktree_popup_rect,
+        new_linked_worktree_button_rects, new_linked_worktree_inner_rect,
+        new_workspace_picker_button_rects, new_workspace_picker_popup_rect,
+        new_workspace_picker_row_rect, new_worktree_popup_rect,
         open_existing_worktree_button_rects, open_existing_worktree_inner_rect,
         open_existing_worktree_max_visible_rows, open_existing_worktree_visible_start,
         remote_manage_confirm_button_rects, remote_manage_confirm_popup_rect,
@@ -74,9 +75,11 @@ pub(crate) use self::{
         render_confirm_close_workspace_overlay, render_confirm_delete_worktree_overlay,
         render_new_workspace_picker_overlay, render_new_worktree_overlay,
         render_remote_manage_overlay, render_rename_workspace_overlay,
-        render_worktree_picker_overlay, worktree_picker_popup_rect, AddRemoteOverlayView,
-        ClientMenuRowView, ClientMenuView, DestinationView, RemoteManageRowView, RemoteStateGlyph,
-        WorktreePickerRowView,
+        render_ssh_host_picker_overlay, render_worktree_picker_overlay,
+        ssh_host_picker_button_rects, ssh_host_picker_max_rows, ssh_host_picker_popup_rect,
+        ssh_host_picker_row_rect, ssh_host_picker_scroll_start, worktree_picker_popup_rect,
+        AddRemoteOverlayView, ClientMenuRowView, ClientMenuView, DestinationView,
+        RemoteManageRowView, RemoteStateGlyph, SshHostRowView, WorktreePickerRowView,
     },
     settings::{
         settings_button_rects, settings_popup_height, settings_show_primary_action,
@@ -100,7 +103,7 @@ pub(crate) use self::{
 pub(crate) use self::{
     dialogs::{
         add_remote_inner_rect, client_menu_inner_rect_at, new_workspace_picker_inner_rect,
-        remote_manage_inner_rect,
+        remote_manage_inner_rect, ssh_host_picker_inner_rect,
     },
     sidebar::host_drop_indicator_row,
 };

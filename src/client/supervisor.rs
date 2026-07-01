@@ -345,6 +345,14 @@ pub(crate) struct AddRemoteForm {
     /// on the in-progress status row in place of the static "connecting to remote…" so seeding a
     /// fresh machine reads as live progress (issue #32). `None` until the first stage arrives.
     pub(crate) progress: Option<String>,
+    /// The generation of the in-flight ssh-config discovery fetch (the "pick from ~/.ssh/config"
+    /// affordance), or `None` when no fetch is running. `Some` gates the affordance so a fast
+    /// double-click cannot spawn duplicate fetch threads, and renders it disabled so the visuals match
+    /// the inert hit-test (PRRT...HqO / PRRT...Hqu). The generation (allocated per fetch from the
+    /// model) ties a worker result back to the exact overlay session that launched it: if the user
+    /// closes and reopens Add Remote and starts a new fetch, a straggling earlier result no longer
+    /// matches and is dropped instead of opening the picker or clobbering the new fetch's state.
+    pub(crate) ssh_fetch_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +366,46 @@ pub(crate) struct AddRemoteDraft {
 pub(crate) enum AddRemoteFormOutcome {
     Redraw,
     Submit(AddRemoteDraft),
+}
+
+/// One row of the "pick from ~/.ssh/config" multi-select picker: a host alias plus its resolved
+/// `hostname`/`user` from the ssh config. `already_added` marks an alias that is already a remote
+/// in the registry — those rows render as "(added)" and are not selectable/are skipped on submit.
+/// Mirrors the data-only shape of `WorktreePickerItem`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshHostRow {
+    pub(crate) alias: String,
+    pub(crate) hostname: Option<String>,
+    pub(crate) user: Option<String>,
+    pub(crate) already_added: bool,
+}
+
+/// The multi-select "pick ssh hosts" overlay: the parsed `~/.ssh/config` rows, the highlighted
+/// row, the set of checked rows, the scroll hint, and an error line. Mouse-first: a click toggles a
+/// row's checkmark, Space toggles the highlighted row, ↑/↓ move the highlight, Enter confirms,
+/// Esc cancels. Mirrors `RemoteManageOverlay`'s selectable-list shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshHostPickerOverlay {
+    pub(crate) rows: Vec<SshHostRow>,
+    pub(crate) selected: usize,
+    pub(crate) checked: std::collections::HashSet<usize>,
+    pub(crate) scroll: usize,
+    pub(crate) error: Option<String>,
+    /// Generation of the in-flight batch `remote.add` this picker submitted, if any. A late
+    /// `SshHostsAdded` result only closes/mutates the overlay when its generation matches this — so a
+    /// stale result from a previous picker session can't dismiss or write errors into a newer one,
+    /// and `Some(_)` also blocks a repeat submit while the batch is running.
+    pub(crate) submit_generation: Option<u64>,
+}
+
+/// The typed outcome of a key press in the ssh-host picker. `Submit` carries the checked,
+/// not-already-added aliases (always at least one) the client turns into a batch of `remote.add`
+/// round-trips. Enter with nothing checked closes the overlay and yields `Redraw` instead — it is
+/// never an empty `Submit`. Mirrors `AddRemoteFormOutcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SshHostPickerOutcome {
+    Redraw,
+    Submit(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,6 +426,9 @@ enum ClientOverlayState {
     NewWorktree(NewWorktreeForm),
     ConfirmDeleteWorktree(ConfirmDeleteWorktree),
     WorktreePicker(WorktreePicker),
+    // The mouse-first multi-select "pick from ~/.ssh/config" overlay, promoted from the add-remote
+    // form's "pick" button after the ssh hosts are fetched off the UI loop.
+    SshHostPicker(SshHostPickerOverlay),
 }
 
 /// #23: the inline rename text overlay. Mirrors `AddRemoteForm` (a single editable text field +
@@ -691,6 +742,17 @@ pub(crate) struct ClientSupervisorModel {
     /// vanishing. Set by `set_update_outcome`; the client loop expires it on a timer (the model holds
     /// no clock). Threaded into `host_banner_specs` and takes precedence over `update_progress`.
     update_outcomes: std::collections::HashMap<ServerId, crate::app::state::HostUpdateOutcome>,
+    /// The last registry snapshot applied via `sync_remote_registry`, kept so the ssh-host picker
+    /// can dedup its rows against the already-registered remotes (`already_added`) without a fresh
+    /// `remote.list` round-trip. This is the SAME source `remote_manage_rows` derives from.
+    synced_remotes: Vec<crate::remote_registry::RemoteDefinitionSnapshot>,
+    /// Monotonic generation handed to each ssh-host batch `remote.add`, so a late `SshHostsAdded`
+    /// result can be matched back to the picker session that submitted it (re-entrancy guard).
+    next_ssh_add_generation: u64,
+    /// Monotonic generation handed to each ssh-config discovery fetch, so a late `SshHostsFetched`
+    /// result can be matched back to the Add Remote overlay session that launched it (re-entrancy
+    /// guard against close/reopen/retry races).
+    next_ssh_fetch_generation: u64,
 }
 
 const SUPERVISOR_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -774,6 +836,9 @@ impl ClientSupervisorModel {
             optimistic_focus: None,
             update_progress: std::collections::HashMap::new(),
             update_outcomes: std::collections::HashMap::new(),
+            synced_remotes: Vec::new(),
+            next_ssh_add_generation: 0,
+            next_ssh_fetch_generation: 0,
         }
     }
 
@@ -885,10 +950,32 @@ impl ClientSupervisorModel {
         id
     }
 
+    /// Insert a secondary for `definition` ONLY if one with the same id isn't already present. A
+    /// concurrent `remote.list` refresh can sync a just-added remote into the model before the batch
+    /// `SshHostsAdded` result arrives, so applying that result must be idempotent — returns the
+    /// `ServerId` when newly inserted (caller schedules the connect), or `None` when it already
+    /// exists (no duplicate sidebar host or retry).
+    pub(crate) fn add_secondary_if_absent(
+        &mut self,
+        definition: crate::remote_registry::RemoteDefinitionSnapshot,
+        connection_state: ConnectionState,
+    ) -> Option<ServerId> {
+        let id = ServerId::secondary(definition.id.clone());
+        if self.servers.iter().any(|server| server.id == id) {
+            return None;
+        }
+        self.servers
+            .push(managed_secondary(definition, connection_state));
+        Some(id)
+    }
+
     pub(crate) fn sync_remote_registry(
         &mut self,
         remotes: Vec<crate::remote_registry::RemoteDefinitionSnapshot>,
     ) {
+        // Keep the applied registry snapshot so the ssh-host picker can dedup against it without a
+        // fresh `remote.list` round-trip (captured before `remotes` is consumed by the rebuild).
+        self.synced_remotes = remotes.clone();
         // #40: capture the current client-local host ordering BEFORE the rebuild so a user's
         // host drag-reorder survives this registry-driven sync. Secondaries are re-sorted by their
         // prior position below; genuinely-new remotes (absent from this map) sort last in the
@@ -1376,7 +1463,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -1390,7 +1478,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -1411,6 +1500,7 @@ impl ClientSupervisorModel {
             || self.remote_manage_overlay().is_some()
             || self.rename_workspace_form().is_some()
             || self.confirm_close_workspace().is_some()
+            || self.ssh_host_picker().is_some()
     }
 
     /// #47: the first selectable row — the initial highlight, so a menu never opens on a
@@ -1649,7 +1739,64 @@ impl ClientSupervisorModel {
             error: None,
             in_progress: false,
             progress: None,
+            ssh_fetch_generation: None,
         });
+    }
+
+    /// Begin an ssh-config discovery fetch from the Add Remote overlay. Returns `Some(generation)`
+    /// (and marks the fetch in flight with that generation) only when the overlay is open, no add is
+    /// in progress, and no fetch is already running — so a fast double-click can't spawn duplicate
+    /// fetch threads. The generation flows through the worker back into `SshHostsFetched`, so a result
+    /// is only applied while it still matches the overlay session that launched it. Returns `None`
+    /// (no-op) otherwise.
+    pub(crate) fn begin_ssh_host_fetch(&mut self) -> Option<u64> {
+        let generation = self.next_ssh_fetch_generation;
+        let started = if let Some(form) = self.add_remote_form_mut() {
+            if !form.in_progress && form.ssh_fetch_generation.is_none() {
+                form.ssh_fetch_generation = Some(generation);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if started {
+            self.next_ssh_fetch_generation = self.next_ssh_fetch_generation.wrapping_add(1);
+            Some(generation)
+        } else {
+            None
+        }
+    }
+
+    /// Clear the in-flight ssh-config fetch generation, but only when it still matches `generation` —
+    /// so a straggling earlier fetch resolving does not clear a newer fetch's in-flight state. No-op
+    /// if the Add Remote overlay is no longer open (e.g. the picker already replaced it).
+    pub(crate) fn clear_ssh_host_fetch_if_current(&mut self, generation: u64) {
+        if let Some(form) = self.add_remote_form_mut() {
+            if form.ssh_fetch_generation == Some(generation) {
+                form.ssh_fetch_generation = None;
+            }
+        }
+    }
+
+    /// Consume a successful ssh-config fetch atomically: open the picker if `generation` is still the
+    /// in-flight fetch on an uninterrupted Add Remote overlay, otherwise clear that generation's
+    /// in-flight flag (leaving a newer fetch untouched). Opening MUST happen while the matching
+    /// generation is still set (the open gate requires it), so this keeps the open-before-clear order
+    /// in one place — a caller can't reintroduce the clear-before-open bug that silently dropped every
+    /// successful fetch. Returns whether it opened.
+    pub(crate) fn complete_ssh_host_fetch(
+        &mut self,
+        generation: u64,
+        hosts: Vec<crate::ssh_config::SshConfigHost>,
+        existing: &[crate::remote_registry::RemoteDefinitionSnapshot],
+    ) -> bool {
+        let opened = self.open_ssh_host_picker_if_adding(generation, hosts, existing);
+        if !opened {
+            self.clear_ssh_host_fetch_if_current(generation);
+        }
+        opened
     }
 
     pub(crate) fn add_remote_form(&self) -> Option<&AddRemoteForm> {
@@ -1662,7 +1809,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -1756,6 +1904,27 @@ impl ClientSupervisorModel {
         }
     }
 
+    /// Report a failed ssh-config fetch: surface the error on the Add Remote overlay ONLY when it is
+    /// still the launcher of THIS fetch (the in-flight generation matches) and no manual add has since
+    /// started, and clear only that generation's in-flight flag. A stale result whose generation no
+    /// longer matches (the overlay was closed/reopened, or a manual add started) is dropped so it
+    /// can't clobber a newer fetch or the add's own progress/error state. Returns whether the error
+    /// was surfaced.
+    pub(crate) fn fail_ssh_host_fetch(
+        &mut self,
+        generation: u64,
+        error: impl Into<String>,
+    ) -> bool {
+        let surface = self
+            .add_remote_form()
+            .is_some_and(|form| form.ssh_fetch_generation == Some(generation) && !form.in_progress);
+        self.clear_ssh_host_fetch_if_current(generation);
+        if surface {
+            self.set_add_remote_error(error);
+        }
+        surface
+    }
+
     /// Mark the add-remote submission as in flight: clears any prior error/progress and switches the
     /// status row to the animated progress line.
     pub(crate) fn set_add_remote_in_progress(&mut self) {
@@ -1781,7 +1950,258 @@ impl ClientSupervisorModel {
     }
 
     pub(crate) fn finish_add_remote(&mut self) {
-        self.close_client_overlay();
+        // Only dismiss the Add Remote overlay. A late AddRemoteFinished must not close a different
+        // overlay the user has since opened (e.g. the ssh-host picker), which would drop their
+        // selection or hide its error line (PRRT...qyR).
+        if matches!(self.client_overlay, ClientOverlayState::AddRemote(_)) {
+            self.close_client_overlay();
+        }
+    }
+
+    /// Dismiss the ssh-host picker ONLY when it is still the active overlay. A late `SshHostsAdded`
+    /// success must not close whatever overlay the user has since opened (the user can submit, then
+    /// cancel and start a manual add before the batch worker returns), which would hide that
+    /// overlay's progress/errors and lose their interaction.
+    pub(crate) fn close_ssh_host_picker(&mut self) {
+        if matches!(self.client_overlay, ClientOverlayState::SshHostPicker(_)) {
+            self.close_client_overlay();
+        }
+    }
+
+    // ----- ssh-host picker overlay ("pick from ~/.ssh/config") --------------------------------
+
+    /// The last registry snapshot applied via `sync_remote_registry`. Used by the client loop to
+    /// build the ssh-host picker's `already_added` dedup source (mirrors the ManageRemotes source).
+    pub(crate) fn synced_remotes(&self) -> &[crate::remote_registry::RemoteDefinitionSnapshot] {
+        &self.synced_remotes
+    }
+
+    // (helper defined at module scope below; see `ssh_config_alias_target`.)
+
+    /// Open the multi-select ssh-host picker from a fetched `~/.ssh/config` host list. Each row's
+    /// `already_added` flag is computed by parsing the alias into a target and comparing its
+    /// `canonical_key()` against `existing` (the registry remotes) — already-registered hosts render
+    /// as "(added)" and are not selectable/are skipped on submit. Mirrors `open_add_remote_form`.
+    pub(crate) fn open_ssh_host_picker(
+        &mut self,
+        hosts: Vec<crate::ssh_config::SshConfigHost>,
+        existing: &[crate::remote_registry::RemoteDefinitionSnapshot],
+    ) {
+        let existing_keys: std::collections::HashSet<String> = existing
+            .iter()
+            .map(|remote| remote.target.canonical_key())
+            .collect();
+        let rows: Vec<SshHostRow> = hosts
+            .into_iter()
+            .map(|host| {
+                let already_added = crate::remote_registry::RemoteTargetSnapshot::parse(
+                    &ssh_config_alias_target(&host.alias),
+                )
+                .map(|target| existing_keys.contains(&target.canonical_key()))
+                .unwrap_or(false);
+                SshHostRow {
+                    alias: host.alias,
+                    hostname: host.hostname,
+                    user: host.user,
+                    already_added,
+                }
+            })
+            .collect();
+        self.new_workspace_picker = None;
+        self.overlay_drag_offset = (0, 0);
+        self.client_overlay = ClientOverlayState::SshHostPicker(SshHostPickerOverlay {
+            rows,
+            selected: 0,
+            checked: std::collections::HashSet::new(),
+            scroll: 0,
+            error: None,
+            submit_generation: None,
+        });
+    }
+
+    /// Allocate a generation for a batch `remote.add` the active picker is submitting, stamping it on
+    /// the overlay so a late `SshHostsAdded` can be matched back to THIS picker. Returns the
+    /// generation. No active picker (overlay already gone) still returns a fresh, unmatched id.
+    pub(crate) fn begin_ssh_host_add(&mut self) -> u64 {
+        let generation = self.next_ssh_add_generation;
+        self.next_ssh_add_generation = self.next_ssh_add_generation.wrapping_add(1);
+        if let Some(overlay) = self.ssh_host_picker_mut() {
+            overlay.submit_generation = Some(generation);
+        }
+        generation
+    }
+
+    /// Whether the currently-active ssh-host picker is the one that submitted batch `generation` —
+    /// i.e. a late `SshHostsAdded` should still apply to it (close / show errors). False if no picker
+    /// is open or a different picker session is now active.
+    pub(crate) fn ssh_host_add_is_current(&self, generation: u64) -> bool {
+        self.ssh_host_picker()
+            .is_some_and(|overlay| overlay.submit_generation == Some(generation))
+    }
+
+    /// Open the picker from a completed `remote.ssh_config_hosts` fetch, but ONLY when the Add Remote
+    /// overlay is still open with THIS fetch's `generation` still in flight and no manual add in
+    /// progress — i.e. the fetch the user launched from the button, uninterrupted. Dropped otherwise:
+    /// the overlay was closed (and possibly reopened with a newer fetch), a picker is already open
+    /// (double-click), or the user submitted a manual add while the fetch was pending (replacing that
+    /// in-progress overlay would hide its progress/error). Returns whether it opened.
+    pub(crate) fn open_ssh_host_picker_if_adding(
+        &mut self,
+        generation: u64,
+        hosts: Vec<crate::ssh_config::SshConfigHost>,
+        existing: &[crate::remote_registry::RemoteDefinitionSnapshot],
+    ) -> bool {
+        let ready = self
+            .add_remote_form()
+            .is_some_and(|form| form.ssh_fetch_generation == Some(generation) && !form.in_progress);
+        if !ready {
+            return false;
+        }
+        self.open_ssh_host_picker(hosts, existing);
+        true
+    }
+
+    pub(crate) fn ssh_host_picker(&self) -> Option<&SshHostPickerOverlay> {
+        match &self.client_overlay {
+            ClientOverlayState::SshHostPicker(overlay) => Some(overlay),
+            _ => None,
+        }
+    }
+
+    fn ssh_host_picker_mut(&mut self) -> Option<&mut SshHostPickerOverlay> {
+        match &mut self.client_overlay {
+            ClientOverlayState::SshHostPicker(overlay) => Some(overlay),
+            _ => None,
+        }
+    }
+
+    /// Mark every picker row matching `alias` as already-added (renders "(added)", no longer
+    /// selectable) and clear its check, so a partial-failure re-submit skips the hosts that already
+    /// landed in the registry. No-op when the picker is closed.
+    pub(crate) fn mark_ssh_host_added(&mut self, alias: &str) {
+        if let Some(overlay) = self.ssh_host_picker_mut() {
+            let indices: Vec<usize> = overlay
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.alias == alias)
+                .map(|(index, _)| index)
+                .collect();
+            for index in indices {
+                if let Some(row) = overlay.rows.get_mut(index) {
+                    row.already_added = true;
+                }
+                overlay.checked.remove(&index);
+            }
+        }
+    }
+
+    /// Surface a per-host failure on the picker's error line (mirrors `set_add_remote_error`).
+    /// A batch add finished with failures: clear the in-flight `submit_generation` so Enter is
+    /// re-enabled (the user can retry the still-checked failed rows) and surface the error. Without
+    /// clearing the generation the picker would be a dead end after any partial failure.
+    pub(crate) fn fail_ssh_host_submit(&mut self, error: impl Into<String>) {
+        if let Some(overlay) = self.ssh_host_picker_mut() {
+            overlay.submit_generation = None;
+            overlay.error = Some(error.into());
+        }
+    }
+
+    /// Toggle the checkmark for row `index` (mouse click), ignoring already-added rows. Out-of-range
+    /// indices are ignored. Mirrors `set_remote_manage_selected` + a toggle.
+    pub(crate) fn toggle_ssh_host_picker_row(&mut self, index: usize) {
+        if let Some(overlay) = self.ssh_host_picker_mut() {
+            let selectable = overlay
+                .rows
+                .get(index)
+                .is_some_and(|row| !row.already_added);
+            if !selectable {
+                return;
+            }
+            overlay.selected = index;
+            overlay.error = None;
+            if !overlay.checked.remove(&index) {
+                overlay.checked.insert(index);
+            }
+        }
+    }
+
+    /// Esc closes; ↑/↓ move the highlight (clamped); Space toggles the highlighted row's checkmark
+    /// (ignored for already-added rows); Enter submits the checked, not-already-added aliases.
+    /// Mirrors `handle_add_remote_key` / `handle_worktree_picker_key`.
+    pub(crate) fn handle_ssh_host_picker_key(
+        &mut self,
+        key: crate::input::TerminalKey,
+    ) -> SshHostPickerOutcome {
+        use crossterm::event::{KeyCode, KeyEventKind};
+
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return SshHostPickerOutcome::Redraw;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_client_overlay();
+                SshHostPickerOutcome::Redraw
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(overlay) = self.ssh_host_picker_mut() {
+                    overlay.selected = overlay.selected.saturating_sub(1);
+                }
+                SshHostPickerOutcome::Redraw
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(overlay) = self.ssh_host_picker_mut() {
+                    if overlay.selected + 1 < overlay.rows.len() {
+                        overlay.selected += 1;
+                    }
+                }
+                SshHostPickerOutcome::Redraw
+            }
+            KeyCode::Char(' ') => {
+                if let Some(overlay) = self.ssh_host_picker_mut() {
+                    let selected = overlay.selected;
+                    let selectable = overlay
+                        .rows
+                        .get(selected)
+                        .is_some_and(|row| !row.already_added);
+                    if selectable {
+                        overlay.error = None;
+                        if !overlay.checked.remove(&selected) {
+                            overlay.checked.insert(selected);
+                        }
+                    }
+                }
+                SshHostPickerOutcome::Redraw
+            }
+            KeyCode::Enter => {
+                let Some(overlay) = self.ssh_host_picker() else {
+                    return SshHostPickerOutcome::Redraw;
+                };
+                // Ignore a repeat submit while a batch add from this picker is already in flight.
+                if overlay.submit_generation.is_some() {
+                    return SshHostPickerOutcome::Redraw;
+                }
+                // Preserve row order so the batch-add reads top-to-bottom; skip already-added rows
+                // (the server dedup also protects against a stale check).
+                let aliases: Vec<String> = overlay
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, row)| !row.already_added && overlay.checked.contains(index))
+                    .map(|(_, row)| row.alias.clone())
+                    .collect();
+                // Enter with nothing checked is a close, not a no-op confirm — matches the worktree
+                // picker and the `SshHostPickerOutcome` doc. A non-empty selection submits.
+                if aliases.is_empty() {
+                    self.close_client_overlay();
+                    SshHostPickerOutcome::Redraw
+                } else {
+                    SshHostPickerOutcome::Submit(aliases)
+                }
+            }
+            _ => SshHostPickerOutcome::Redraw,
+        }
     }
 
     // ----- item 3 (Area 5): remote-management overlay -----------------------------------------
@@ -1808,7 +2228,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -1822,7 +2243,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -2328,7 +2750,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -2342,7 +2765,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -3181,7 +3605,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
             ClientOverlayState::NewWorktree(_)
             | ClientOverlayState::ConfirmDeleteWorktree(_)
-            | ClientOverlayState::WorktreePicker(_) => None,
+            | ClientOverlayState::WorktreePicker(_)
+            | ClientOverlayState::SshHostPicker(_) => None,
         }
     }
 
@@ -3371,6 +3796,24 @@ fn unavailable_reason(connection_state: &ConnectionState) -> &'static str {
 fn trimmed_optional(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// #11 (codex-1-1): map a discovered `~/.ssh/config` `Host` alias to its remote target string,
+/// forcing SSH semantics. A bare alias handed to `RemoteTargetSnapshot::parse` would hit the
+/// `localhost` / `local:*` special cases first, so a legitimate ssh `Host localhost` would be
+/// rejected as the local target and `Host local:prod` would be stored as a local session. Prefixing
+/// `ssh ` routes the alias through `parse_ssh`, yielding `Ssh { target: <alias> }`. ssh `Host` alias
+/// tokens never contain whitespace (whitespace separates patterns) and wildcard tokens are already
+/// filtered out during discovery, so the bare prefix needs no quoting. The submit path and the
+/// `already_added` dedup both call this so they agree on one canonical key.
+pub(crate) fn ssh_config_alias_target(alias: &str) -> String {
+    // Quote the alias so the string round-trips losslessly back through `RemoteTargetSnapshot::parse`
+    // (which `shlex`-splits this): an alias containing shell metacharacters (e.g. backslash, quotes,
+    // `$`) admitted by discovery must register as exactly that ssh destination, not a
+    // shell-reinterpreted one. `try_quote` only errors on an interior NUL byte (impossible in an
+    // ssh_config alias); fall back to the raw alias in that case.
+    let quoted = shlex::try_quote(alias).unwrap_or(std::borrow::Cow::Borrowed(alias));
+    format!("ssh {quoted}")
 }
 
 /// #44: format the host context-menu version-readout label and whether the remote's wire protocol
@@ -5683,6 +6126,7 @@ mod tests {
                 error: None,
                 in_progress: false,
                 progress: None,
+                ssh_fetch_generation: None,
             })
         );
     }
@@ -5750,6 +6194,474 @@ mod tests {
                 name: Some("dev".into()),
                 keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             })
+        );
+    }
+
+    fn ssh_host(
+        alias: &str,
+        user: Option<&str>,
+        hostname: Option<&str>,
+    ) -> crate::ssh_config::SshConfigHost {
+        crate::ssh_config::SshConfigHost {
+            alias: alias.into(),
+            hostname: hostname.map(str::to_string),
+            user: user.map(str::to_string),
+        }
+    }
+
+    fn picker_key(code: crossterm::event::KeyCode) -> crate::input::TerminalKey {
+        crate::input::TerminalKey::new(code, crossterm::event::KeyModifiers::empty())
+    }
+
+    #[test]
+    fn open_ssh_host_picker_marks_already_added_by_canonical_key() {
+        let mut model = ClientSupervisorModel::new("local");
+        // An ssh remote whose target alias is `prod` — canonical key `ssh:prod`, the SAME key the
+        // host alias `prod` parses to, so its picker row must come up already-added.
+        let existing = vec![ssh_remote("r1", "prod", "prod")];
+        let hosts = vec![
+            ssh_host("prod", Some("deploy"), Some("10.0.0.5")),
+            ssh_host("staging", None, Some("10.0.0.6")),
+        ];
+
+        model.open_ssh_host_picker(hosts, &existing);
+
+        let overlay = model.ssh_host_picker().expect("picker is open");
+        assert_eq!(overlay.rows.len(), 2);
+        assert!(
+            overlay.rows[0].already_added,
+            "an alias matching an existing remote's canonical key is (added)"
+        );
+        assert!(
+            !overlay.rows[1].already_added,
+            "an unregistered alias is selectable"
+        );
+        assert!(overlay.checked.is_empty());
+        assert_eq!(overlay.selected, 0);
+    }
+
+    #[test]
+    fn fail_ssh_host_fetch_surfaces_only_for_the_launcher_and_not_during_a_manual_add() {
+        // PRRT...3fS + codex (re-run): a user-initiated fetch failure shows on the Add Remote overlay
+        // while it is still the launcher; a late result after it closed is dropped; and a stale error
+        // must NOT clobber a manual add that started after the fetch was launched.
+
+        // No overlay → nothing surfaced, no-op.
+        let mut idle = ClientSupervisorModel::new("local");
+        assert!(!idle.fail_ssh_host_fetch(0, "boom"));
+        assert!(idle.add_remote_form().is_none());
+
+        // Launcher, no manual add → error surfaces and the in-flight flag clears.
+        let mut adding = ClientSupervisorModel::new("local");
+        adding.open_add_remote_form();
+        let gen = adding.begin_ssh_host_fetch().expect("fetch begins");
+        assert!(adding.fail_ssh_host_fetch(gen, "couldn't load ssh hosts: x"));
+        let form = adding.add_remote_form().unwrap();
+        assert_eq!(form.error.as_deref(), Some("couldn't load ssh hosts: x"));
+        assert!(form.ssh_fetch_generation.is_none());
+
+        // A manual add started after launching the fetch → stale error dropped, add progress kept.
+        let mut racing = ClientSupervisorModel::new("local");
+        racing.open_add_remote_form();
+        let gen = racing.begin_ssh_host_fetch().expect("fetch begins");
+        racing.set_add_remote_in_progress();
+        assert!(!racing.fail_ssh_host_fetch(gen, "stale error"));
+        let form = racing.add_remote_form().unwrap();
+        assert!(form.in_progress, "manual add progress preserved");
+        assert!(form.error.is_none(), "stale fetch error dropped");
+    }
+
+    #[test]
+    fn begin_ssh_host_fetch_rejects_duplicates_until_cleared() {
+        // PRRT...Hqu: a fast double-click must not spawn duplicate fetch threads. begin_ssh_host_fetch
+        // marks the fetch in flight and rejects a second start until it is cleared.
+        let mut model = ClientSupervisorModel::new("local");
+        assert!(
+            model.begin_ssh_host_fetch().is_none(),
+            "no overlay → cannot begin"
+        );
+
+        model.open_add_remote_form();
+        let gen = model.begin_ssh_host_fetch().expect("first fetch begins");
+        assert!(model
+            .add_remote_form()
+            .unwrap()
+            .ssh_fetch_generation
+            .is_some());
+        assert!(
+            model.begin_ssh_host_fetch().is_none(),
+            "duplicate fetch rejected"
+        );
+
+        model.clear_ssh_host_fetch_if_current(gen);
+        assert!(model
+            .add_remote_form()
+            .unwrap()
+            .ssh_fetch_generation
+            .is_none());
+        let next = model
+            .begin_ssh_host_fetch()
+            .expect("begins again after clear");
+        assert_ne!(next, gen, "a fresh fetch gets a new generation");
+    }
+
+    #[test]
+    fn fail_ssh_host_submit_reenables_resubmit_after_partial_failure() {
+        use crossterm::event::KeyCode;
+        // codex (re-run): a partial batch-add failure must not leave the picker a dead end. Clearing
+        // submit_generation re-enables Enter so the user can retry the still-checked rows.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_ssh_host_picker(vec![ssh_host("a", None, None)], &[]);
+        model.toggle_ssh_host_picker_row(0);
+        let _gen = model.begin_ssh_host_add();
+        // While the batch is in flight, Enter is gated.
+        assert_eq!(
+            model.handle_ssh_host_picker_key(picker_key(KeyCode::Enter)),
+            SshHostPickerOutcome::Redraw
+        );
+
+        // A partial failure clears the generation and surfaces the error.
+        model.fail_ssh_host_submit("a: boom");
+        assert_eq!(
+            model.ssh_host_picker().and_then(|o| o.error.as_deref()),
+            Some("a: boom")
+        );
+        // Enter now resubmits the still-checked row.
+        assert_eq!(
+            model.handle_ssh_host_picker_key(picker_key(KeyCode::Enter)),
+            SshHostPickerOutcome::Submit(vec!["a".into()])
+        );
+    }
+
+    #[test]
+    fn add_secondary_if_absent_is_idempotent_against_a_prior_sync() {
+        // codex (re-run): a concurrent remote.list refresh can sync a batch-added remote in before
+        // SshHostsAdded is applied. Re-applying it must not duplicate the secondary or its retry.
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = ssh_remote("remote-1", "prod", "prod");
+        model.sync_remote_registry(vec![remote.clone()]);
+
+        // Already present from the sync → no insert, no ServerId to schedule.
+        assert!(model
+            .add_secondary_if_absent(remote, ConnectionState::Connecting)
+            .is_none());
+
+        // A genuinely new remote inserts and returns its id; re-applying it is then a no-op.
+        let fresh = ssh_remote("remote-2", "stage", "stage");
+        assert!(model
+            .add_secondary_if_absent(fresh.clone(), ConnectionState::Connecting)
+            .is_some());
+        assert!(model
+            .add_secondary_if_absent(fresh, ConnectionState::Connecting)
+            .is_none());
+    }
+
+    #[test]
+    fn ssh_host_add_generation_ties_results_to_the_submitting_picker() {
+        use crossterm::event::KeyCode;
+        // codex (re-run): a late SshHostsAdded result must only apply to the picker that submitted it.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_ssh_host_picker(vec![ssh_host("a", None, None)], &[]);
+        let gen_a = model.begin_ssh_host_add();
+        assert!(model.ssh_host_add_is_current(gen_a));
+        // A repeat submit while the batch is in flight is ignored.
+        assert_eq!(
+            model.handle_ssh_host_picker_key(picker_key(KeyCode::Enter)),
+            SshHostPickerOutcome::Redraw
+        );
+
+        // User opens a fresh picker B before A's result returns.
+        model.open_ssh_host_picker(vec![ssh_host("b", None, None)], &[]);
+        assert!(
+            !model.ssh_host_add_is_current(gen_a),
+            "A's late result is no longer current for picker B"
+        );
+        assert!(model.ssh_host_picker().is_some(), "picker B stays open");
+
+        // B's own submission gets a distinct generation that is current.
+        let gen_b = model.begin_ssh_host_add();
+        assert_ne!(gen_a, gen_b);
+        assert!(model.ssh_host_add_is_current(gen_b));
+    }
+
+    #[test]
+    fn close_ssh_host_picker_only_closes_the_picker_overlay() {
+        // codex (re-run): a late SshHostsAdded success must not dismiss whatever overlay the user
+        // opened after submitting + closing the picker. close_ssh_host_picker is scoped to the picker.
+        let mut moved_on = ClientSupervisorModel::new("local");
+        moved_on.open_ssh_host_picker(vec![ssh_host("a", None, None)], &[]);
+        // User cancelled the picker and started a manual add before the batch worker returned.
+        moved_on.open_add_remote_form();
+        moved_on.close_ssh_host_picker();
+        assert!(
+            moved_on.add_remote_form().is_some(),
+            "a late add-success must not close the unrelated Add Remote overlay"
+        );
+
+        // When the picker is still open, it is dismissed on a clean success.
+        let mut still_open = ClientSupervisorModel::new("local");
+        still_open.open_ssh_host_picker(vec![ssh_host("a", None, None)], &[]);
+        still_open.close_ssh_host_picker();
+        assert!(still_open.ssh_host_picker().is_none());
+    }
+
+    #[test]
+    fn finish_add_remote_does_not_close_a_replaced_ssh_picker() {
+        // PRRT...qyR: if the picker opened over the Add Remote overlay (a fast fetch during an
+        // in-flight add), a late AddRemoteFinished -> finish_add_remote must NOT close it and lose
+        // the user's selection. finish_add_remote only dismisses the Add Remote overlay itself.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        model.open_ssh_host_picker(vec![ssh_host("alpha", None, None)], &[]);
+        assert!(model.ssh_host_picker().is_some());
+
+        model.finish_add_remote();
+        assert!(
+            model.ssh_host_picker().is_some(),
+            "finish_add_remote must not close a picker that replaced the Add Remote overlay"
+        );
+
+        // It still closes the Add Remote overlay when that is what's open.
+        let mut adding = ClientSupervisorModel::new("local");
+        adding.open_add_remote_form();
+        adding.finish_add_remote();
+        assert!(adding.add_remote_form().is_none());
+    }
+
+    #[test]
+    fn open_ssh_host_picker_if_adding_only_opens_over_the_add_remote_overlay() {
+        // PRRT...WGY: a late/duplicate fetch result must not pop the picker when the user already
+        // closed the Add Remote overlay (or a picker is already open). Only the fetch launched from
+        // the still-open Add Remote overlay (with that fetch in flight) opens the picker.
+        let hosts = vec![ssh_host("alpha", None, Some("a.example.com"))];
+
+        // No overlay open → the result is dropped.
+        let mut idle = ClientSupervisorModel::new("local");
+        assert!(!idle.open_ssh_host_picker_if_adding(0, hosts.clone(), &[]));
+        assert!(idle.ssh_host_picker().is_none());
+
+        // Add Remote overlay open with the fetch in flight → the picker opens.
+        let mut adding = ClientSupervisorModel::new("local");
+        adding.open_add_remote_form();
+        let gen = adding.begin_ssh_host_fetch().expect("fetch begins");
+        assert!(adding.open_ssh_host_picker_if_adding(gen, hosts.clone(), &[]));
+        assert!(adding.ssh_host_picker().is_some());
+
+        // A second (duplicate) result now finds the picker — not the Add Remote overlay — open, so it
+        // is dropped and does not reset the first picker.
+        assert!(!adding.open_ssh_host_picker_if_adding(gen, hosts, &[]));
+        assert!(adding.ssh_host_picker().is_some());
+    }
+
+    #[test]
+    fn stale_fetch_result_does_not_apply_to_a_reopened_add_remote_overlay() {
+        // codex: tie a fetch result to the overlay session that launched it. Fetch A on the first
+        // overlay, then close+reopen Add Remote and start fetch B; A's late result (its generation no
+        // longer current) must NOT open the picker or clear B's in-flight state, and B's result still
+        // works.
+        let hosts = vec![ssh_host("alpha", None, None)];
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        let gen_a = model.begin_ssh_host_fetch().expect("fetch A begins");
+
+        // User closes Add Remote and reopens it, then launches a second fetch.
+        model.close_client_overlay();
+        model.open_add_remote_form();
+        let gen_b = model.begin_ssh_host_fetch().expect("fetch B begins");
+        assert_ne!(gen_a, gen_b);
+
+        // Fetch A's straggling result arrives: dropped, and B stays in flight.
+        assert!(!model.complete_ssh_host_fetch(gen_a, hosts.clone(), &[]));
+        assert!(
+            model.ssh_host_picker().is_none(),
+            "stale A must not open the picker"
+        );
+        assert!(
+            model
+                .add_remote_form()
+                .is_some_and(|f| f.ssh_fetch_generation == Some(gen_b)),
+            "B's in-flight generation is untouched by A"
+        );
+
+        // Fetch B's result then opens the picker normally.
+        assert!(model.complete_ssh_host_fetch(gen_b, hosts, &[]));
+        assert!(model.ssh_host_picker().is_some());
+    }
+
+    #[test]
+    fn complete_ssh_host_fetch_opens_the_picker_on_success() {
+        // codex (re-run): the SshHostsFetched Ok handler used to clear the in-flight flag BEFORE
+        // opening, but the open gate requires the flag set — so every successful fetch was dropped.
+        // complete_ssh_host_fetch opens first (flag still set), then clears, so success opens the
+        // picker; an intervening manual add still drops the result and clears the flag.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        let gen = model.begin_ssh_host_fetch().expect("fetch begins");
+        assert!(model.complete_ssh_host_fetch(gen, vec![ssh_host("a", None, None)], &[]));
+        assert!(
+            model.ssh_host_picker().is_some(),
+            "a successful fetch must open the picker"
+        );
+
+        let mut racing = ClientSupervisorModel::new("local");
+        racing.open_add_remote_form();
+        let gen = racing.begin_ssh_host_fetch().expect("fetch begins");
+        racing.set_add_remote_in_progress();
+        assert!(!racing.complete_ssh_host_fetch(gen, vec![ssh_host("a", None, None)], &[]));
+        assert!(racing.ssh_host_picker().is_none());
+        assert!(racing
+            .add_remote_form()
+            .is_some_and(|f| f.ssh_fetch_generation.is_none()));
+    }
+
+    #[test]
+    fn open_ssh_host_picker_if_adding_is_dropped_once_a_manual_add_starts() {
+        // codex (re-run): clicking `pick`, then submitting the manual add before the fetch returns,
+        // must NOT let the late fetch replace the in-progress Add Remote overlay (which would hide
+        // the add's progress/error). The fetch result is dropped while an add is in progress.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        let gen = model.begin_ssh_host_fetch().expect("fetch begins");
+        model.set_add_remote_in_progress();
+
+        assert!(!model.open_ssh_host_picker_if_adding(gen, vec![ssh_host("a", None, None)], &[]));
+        assert!(model.ssh_host_picker().is_none());
+        assert!(
+            model.add_remote_form().is_some_and(|f| f.in_progress),
+            "the in-progress add overlay stays put"
+        );
+    }
+
+    #[test]
+    fn ssh_config_alias_target_round_trips_aliases_with_shell_metacharacters() {
+        // codex (re-run): the picker surfaces aliases, then ssh_config_alias_target round-trips them
+        // through RemoteTargetSnapshot::parse (shlex). An alias with shell metacharacters must
+        // register as exactly that ssh destination, not a shell-reinterpreted one.
+        for alias in [
+            "plain",
+            "localhost",
+            "local:prod",
+            r"with\back",
+            "with'quote",
+            "a$b",
+            r#"weird"q"#,
+            "semi;colon",
+        ] {
+            let target = crate::remote_registry::RemoteTargetSnapshot::parse(
+                &ssh_config_alias_target(alias),
+            )
+            .unwrap_or_else(|_| panic!("alias {alias:?} should parse"));
+            assert_eq!(
+                target,
+                crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                    target: alias.to_string(),
+                    args: Vec::new(),
+                },
+                "alias {alias:?} must round-trip to its exact ssh target"
+            );
+        }
+    }
+
+    #[test]
+    fn open_ssh_host_picker_treats_localhost_alias_as_ssh_not_local() {
+        // codex-1-1: a discovered ssh `Host localhost` (or `Host local:prod`) is an ssh destination,
+        // NOT herdr's local session target. It must be deduped/added with forced-ssh semantics, so a
+        // registry that only holds the implicit local session must not mark these ssh aliases (added).
+        let mut model = ClientSupervisorModel::new("local");
+        let existing = vec![local_remote("r-local", "local", None)];
+        let hosts = vec![
+            ssh_host("localhost", Some("me"), Some("127.0.0.1")),
+            ssh_host("local:prod", None, Some("10.0.0.9")),
+        ];
+
+        model.open_ssh_host_picker(hosts, &existing);
+
+        let overlay = model.ssh_host_picker().expect("picker is open");
+        assert!(
+            !overlay.rows[0].already_added,
+            "ssh `Host localhost` (key ssh:localhost) must not dedup against the local session"
+        );
+        assert!(
+            !overlay.rows[1].already_added,
+            "ssh `Host local:prod` (key ssh:local:prod) must not be treated as a local session"
+        );
+
+        // Selecting both must submit forced-ssh targets, not bare aliases the generic parser would
+        // route to Local. The submit list carries aliases; the batch-add maps them through
+        // `ssh_config_alias_target`, which must yield ssh targets.
+        for alias in ["localhost", "local:prod"] {
+            let target = crate::remote_registry::RemoteTargetSnapshot::parse(
+                &ssh_config_alias_target(alias),
+            )
+            .expect("forced-ssh target parses");
+            assert_eq!(
+                target,
+                crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                    target: alias.into(),
+                    args: Vec::new(),
+                },
+                "ssh-config alias `{alias}` must register as an ssh target"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_ssh_host_picker_key_space_toggles_and_enter_submits() {
+        use crossterm::event::KeyCode;
+
+        let mut model = ClientSupervisorModel::new("local");
+        let hosts = vec![
+            ssh_host("alpha", Some("root"), Some("a.example.com")),
+            ssh_host("beta", None, Some("b.example.com")),
+            ssh_host("gamma", None, None),
+        ];
+        // `gamma` is already a remote → its row is (added) and must be skipped by Space + Enter.
+        let existing = vec![ssh_remote("r-gamma", "gamma", "gamma")];
+        model.open_ssh_host_picker(hosts, &existing);
+
+        // Space toggles the highlighted (first) row on.
+        assert_eq!(
+            model.handle_ssh_host_picker_key(picker_key(KeyCode::Char(' '))),
+            SshHostPickerOutcome::Redraw
+        );
+        assert!(model.ssh_host_picker().unwrap().checked.contains(&0));
+
+        // Down moves the highlight, Space toggles the second row on too.
+        model.handle_ssh_host_picker_key(picker_key(KeyCode::Down));
+        model.handle_ssh_host_picker_key(picker_key(KeyCode::Char(' ')));
+        assert!(model.ssh_host_picker().unwrap().checked.contains(&1));
+
+        // Space on the already-added `gamma` row is a no-op (not selectable).
+        model.handle_ssh_host_picker_key(picker_key(KeyCode::Down));
+        model.handle_ssh_host_picker_key(picker_key(KeyCode::Char(' ')));
+        assert!(!model.ssh_host_picker().unwrap().checked.contains(&2));
+
+        // Enter submits the checked, not-already-added aliases in row order.
+        assert_eq!(
+            model.handle_ssh_host_picker_key(picker_key(KeyCode::Enter)),
+            SshHostPickerOutcome::Submit(vec!["alpha".into(), "beta".into()])
+        );
+
+        // Esc closes the overlay.
+        model.handle_ssh_host_picker_key(picker_key(KeyCode::Esc));
+        assert!(model.ssh_host_picker().is_none());
+    }
+
+    #[test]
+    fn handle_ssh_host_picker_key_enter_with_nothing_checked_closes() {
+        use crossterm::event::KeyCode;
+        // PRRT...oTZ: Enter with no rows checked is not a no-op confirm — it closes the overlay,
+        // matching the `SshHostPickerOutcome` doc and the worktree picker's Enter behavior.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_ssh_host_picker(vec![ssh_host("alpha", None, Some("a.example.com"))], &[]);
+
+        assert_eq!(
+            model.handle_ssh_host_picker_key(picker_key(KeyCode::Enter)),
+            SshHostPickerOutcome::Redraw
+        );
+        assert!(
+            model.ssh_host_picker().is_none(),
+            "Enter with nothing checked closes the picker"
         );
     }
 

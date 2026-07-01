@@ -53,6 +53,19 @@ impl ApiClient {
         parse_response_value(value)
     }
 
+    /// Like [`request`], but with an explicit send/recv timeout. Used for a bounded-but-potentially-
+    /// slow call (e.g. `remote.ssh_config_hosts` discovery) whose worker runs off the UI loop, so a
+    /// generous timeout aligned with the server work budget avoids a false failure on a large or
+    /// network-mounted config tree while still bounding a hung server.
+    pub fn request_with_timeout(
+        &self,
+        request: &Request,
+        timeout: Duration,
+    ) -> Result<SuccessResponse, ApiClientError> {
+        let value = self.request_value_with_timeout(request, timeout)?;
+        parse_response_value(value)
+    }
+
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
         let mut stream = self.connect()?;
         write_request(&mut stream, request)?;

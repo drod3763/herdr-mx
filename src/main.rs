@@ -92,6 +92,7 @@ mod server;
 mod session;
 mod signing;
 mod sound;
+mod ssh_config;
 mod terminal;
 mod terminal_notify;
 mod terminal_theme;

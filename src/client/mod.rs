@@ -362,6 +362,14 @@ enum ClientInputDispatch {
         request: Box<crate::api::schema::Request>,
     },
     AddRemote(supervisor::AddRemoteDraft),
+    /// Fetch the local `~/.ssh/config` hosts off the UI loop (the add-remote "pick" affordance); the
+    /// result opens the multi-select ssh-host picker. Carries the fetch generation so a stale worker
+    /// result can be matched back to the overlay session that launched it.
+    FetchSshHosts {
+        generation: u64,
+    },
+    /// Batch-register the checked picker aliases off the UI loop, one `remote.add` per alias.
+    AddSshHosts(Vec<String>),
     // item 3 (Area 5): toggle / delete a remote off the UI loop against ServerId::main().
     SetRemoteEnabled {
         remote_id: String,
@@ -1035,6 +1043,8 @@ fn dispatch_requires_loop_handling(dispatch: &ClientInputDispatch) -> bool {
     matches!(
         dispatch,
         ClientInputDispatch::AddRemote(_)
+            | ClientInputDispatch::FetchSshHosts { .. }
+            | ClientInputDispatch::AddSshHosts(_)
             | ClientInputDispatch::SetRemoteEnabled { .. }
             | ClientInputDispatch::SetRemoteAutoUpdate { .. }
             | ClientInputDispatch::DeleteRemote { .. }
@@ -1125,6 +1135,9 @@ fn dispatch_client_overlay_input(
             }
             crate::raw_input::RawInputEvent::Key(key) if model.worktree_picker().is_some() => {
                 dispatch_for_worktree_picker_outcome(model.handle_worktree_picker_key(key))
+            }
+            crate::raw_input::RawInputEvent::Key(key) if model.ssh_host_picker().is_some() => {
+                dispatch_for_ssh_host_picker_outcome(model.handle_ssh_host_picker_key(key))
             }
             crate::raw_input::RawInputEvent::Mouse(mouse) => {
                 dispatch_composited_mouse_input(data.clone(), compositor, model, host_size, &mouse)
@@ -1678,6 +1691,29 @@ fn dispatch_sidebar_hit_target(
             model.close_client_overlay();
             ClientInputDispatch::Redraw
         }
+        // The add-remote "pick from ~/.ssh/config" affordance fetches the ssh hosts off the UI loop;
+        // the result opens the multi-select picker (`SshHostsFetched`). `begin_ssh_host_fetch` marks
+        // the fetch in flight and rejects a duplicate while one is already running.
+        compositor::SidebarHitTarget::OpenSshHostPicker => {
+            if let Some(generation) = model.begin_ssh_host_fetch() {
+                ClientInputDispatch::FetchSshHosts { generation }
+            } else {
+                ClientInputDispatch::Redraw
+            }
+        }
+        // A click on a picker row toggles its checkmark (already-added rows are ignored); the confirm
+        // button replays Enter through the key handler to collect the checked aliases; cancel closes.
+        compositor::SidebarHitTarget::SshHostPickerRow { index } => {
+            model.toggle_ssh_host_picker_row(index);
+            ClientInputDispatch::Redraw
+        }
+        compositor::SidebarHitTarget::SshHostPickerConfirm => {
+            dispatch_for_ssh_host_picker_outcome(model.handle_ssh_host_picker_key(enter_key()))
+        }
+        compositor::SidebarHitTarget::SshHostPickerCancel => {
+            model.close_client_overlay();
+            ClientInputDispatch::Redraw
+        }
         compositor::SidebarHitTarget::NewWorkspacePickerConfirm => {
             accept_new_workspace_picker_dispatch(model)
         }
@@ -1728,6 +1764,23 @@ fn dispatch_sidebar_hit_target(
 /// same validation/submit path as the Enter KEY in `handle_add_remote_key`.
 fn enter_key() -> crate::input::TerminalKey {
     crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty())
+}
+
+/// Map an `SshHostPickerOutcome` into a dispatch. `Submit` always carries at least one alias (Enter
+/// with nothing checked closes the overlay and yields `Redraw`), so it becomes the off-loop batch
+/// `remote.add`. The empty guard stays as defensive belt-and-suspenders.
+fn dispatch_for_ssh_host_picker_outcome(
+    outcome: supervisor::SshHostPickerOutcome,
+) -> ClientInputDispatch {
+    match outcome {
+        supervisor::SshHostPickerOutcome::Redraw => ClientInputDispatch::Redraw,
+        supervisor::SshHostPickerOutcome::Submit(aliases) if aliases.is_empty() => {
+            ClientInputDispatch::Redraw
+        }
+        supervisor::SshHostPickerOutcome::Submit(aliases) => {
+            ClientInputDispatch::AddSshHosts(aliases)
+        }
+    }
 }
 
 /// #23: map a `RenameWorkspaceOutcome` into a dispatch. `Submit` becomes a `workspace.rename`
@@ -2436,6 +2489,26 @@ enum ClientLoopEvent {
     AddRemoteFinished {
         result: Result<crate::remote_registry::RemoteDefinitionSnapshot, String>,
         elapsed: Duration,
+    },
+    /// The off-loop `remote.ssh_config_hosts` fetch (the add-remote "pick" affordance) finished. On
+    /// Ok the multi-select picker opens with the parsed hosts, deduped against the current registry.
+    /// `generation` ties the result back to the overlay session that launched it, so a stale result
+    /// (the overlay was closed/reopened, or a newer fetch started) is dropped rather than applied.
+    SshHostsFetched {
+        generation: u64,
+        result: Result<Vec<crate::ssh_config::SshConfigHost>, String>,
+    },
+    /// The off-loop batch `remote.add` of the checked picker aliases finished. Each tuple is
+    /// `(alias, per-alias result)`; successful adds insert the host row (`Connecting`) + schedule a
+    /// reconnect, and any failures surface on the picker's error line.
+    SshHostsAdded {
+        results: Vec<(
+            String,
+            Result<crate::remote_registry::RemoteDefinitionSnapshot, String>,
+        )>,
+        /// Generation of the picker submission this batch belongs to, so a late result only
+        /// closes/mutates the picker that submitted it (re-entrancy guard).
+        generation: u64,
     },
     /// #44: a provisioning stage of an in-flight one-click "update" (reinstall the local herdr onto
     /// a remote via the add-remote flow). Server_id-keyed so the banner sub-line targets the right
@@ -3577,6 +3650,87 @@ fn fetch_worktree_picker_items(
             "worktree.list returned unexpected result: {other:?}"
         )),
     }
+}
+
+/// Fetch the local main server's `~/.ssh/config` hosts off the UI loop (the add-remote "pick"
+/// affordance). The round-trip runs on a worker thread and lands as `SshHostsFetched`. Modeled on
+/// `spawn_worktree_list_fetch`, but always against the LOCAL main API.
+fn spawn_client_ssh_hosts_fetch(
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    generation: u64,
+) {
+    let event_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let result = fetch_ssh_config_hosts();
+        let _ = event_tx.blocking_send(ClientLoopEvent::SshHostsFetched { generation, result });
+    });
+}
+
+/// Timeout for the `remote.ssh_config_hosts` round-trip. Larger than the 2s supervisor default
+/// because server-side discovery may read up to 256 files and scan up to 65k directory entries — a
+/// large or network-mounted `~/.ssh` can legitimately exceed 2s. The fetch runs on a worker thread,
+/// so this longer wait doesn't stall the UI loop; it still bounds a hung server.
+const SSH_CONFIG_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The blocking body of [`spawn_client_ssh_hosts_fetch`]: one `remote.ssh_config_hosts` round-trip
+/// against the local main socket.
+fn fetch_ssh_config_hosts() -> Result<Vec<crate::ssh_config::SshConfigHost>, String> {
+    let api = crate::api::client::ApiClient::local();
+    let response = api
+        .request_with_timeout(
+            &crate::api::schema::Request {
+                id: "client:ssh-config-hosts".into(),
+                method: crate::api::schema::Method::RemoteSshConfigHosts(
+                    crate::api::schema::EmptyParams::default(),
+                ),
+            },
+            SSH_CONFIG_DISCOVERY_TIMEOUT,
+        )
+        .map_err(|err| err.to_string())?;
+    match response.result {
+        crate::api::schema::ResponseResult::SshConfigHosts { hosts } => Ok(hosts),
+        other => Err(format!(
+            "remote.ssh_config_hosts returned unexpected result: {other:?}"
+        )),
+    }
+}
+
+/// Batch-register the checked picker aliases off the UI loop, one `remote.add` per alias against the
+/// local main socket (reusing `submit_remote_add_to_main_api`). Per-alias results are collected and
+/// land as `SshHostsAdded`. Adding only writes the registry; the reconnect sweep brings each bridge
+/// up (so the picker never blocks on a slow install). Modeled on `spawn_client_add_remote_submission`.
+fn spawn_client_ssh_hosts_add(
+    aliases: Vec<String>,
+    generation: u64,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    let event_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let mut main_api = crate::api::client::ApiClient::local();
+        let results = aliases
+            .into_iter()
+            .map(|alias| {
+                let result = submit_remote_add_to_main_api(
+                    &mut main_api,
+                    supervisor::AddRemoteDraft {
+                        // codex-1-1: force ssh semantics so an alias like `localhost`/`local:prod`
+                        // registers as an ssh destination, not herdr's local session target.
+                        target: supervisor::ssh_config_alias_target(&alias),
+                        // Name the remote after the exact alias. `name: None` would derive it from
+                        // `default_display_name`, which truncates `local:prod`/`local:stage` to
+                        // `local` — colliding distinct aliases as duplicate names (codex re-run).
+                        name: Some(alias.clone()),
+                        keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+                    },
+                );
+                (alias, result)
+            })
+            .collect();
+        let _ = event_tx.blocking_send(ClientLoopEvent::SshHostsAdded {
+            results,
+            generation,
+        });
+    });
 }
 
 fn spawn_client_add_remote_submission(
@@ -5163,6 +5317,29 @@ async fn run_client_loop(
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
+                            // The add-remote "pick from ~/.ssh/config" affordance: fetch the local ssh
+                            // hosts off the UI loop; the result opens the multi-select picker
+                            // (`SshHostsFetched`).
+                            ClientInputDispatch::FetchSshHosts { generation } => {
+                                spawn_client_ssh_hosts_fetch(&event_tx, generation);
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
+                            // Batch-register the checked picker aliases off the UI loop; results land
+                            // as `SshHostsAdded`. A generation stamped on the picker ties the result
+                            // back to this submission so a late result can't dismiss a newer picker.
+                            ClientInputDispatch::AddSshHosts(aliases) => {
+                                let generation = state
+                                    .supervisor_model
+                                    .as_mut()
+                                    .map(|model| model.begin_ssh_host_add())
+                                    .unwrap_or(0);
+                                spawn_client_ssh_hosts_add(aliases, generation, &event_tx);
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
                             // item 3 (Area 5): the model already set `overlay.pending` for this
                             // remote when it emitted the outcome (blocking re-issue while in
                             // flight). Spawn the registry mutation off the UI loop against the
@@ -6029,6 +6206,94 @@ async fn run_client_loop(
                             model.set_add_remote_error(err);
                         }
                     }
+                }
+                state.request_full_redraw();
+                render_cached_composited_frame(&mut state);
+            }
+            // The add-remote "pick" affordance's ssh-config fetch finished: on Ok open the
+            // multi-select picker, deduped against the current registry snapshot; on Err log a
+            // warning and surface the failure on the Add Remote overlay if it is still open.
+            ClientLoopEvent::SshHostsFetched { generation, result } => {
+                match result {
+                    Ok(hosts) => {
+                        if let Some(model) = &mut state.supervisor_model {
+                            let existing = model.synced_remotes().to_vec();
+                            // Atomic open-then-clear, gated on the launching fetch generation: only
+                            // opens if the Add Remote overlay THIS fetch was launched from is still
+                            // active and uninterrupted; otherwise drops the late/stale result (a
+                            // close/reopen or newer fetch) and clears only this generation's flag.
+                            model.complete_ssh_host_fetch(generation, hosts, &existing);
+                        }
+                    }
+                    Err(err) => {
+                        warn!(err = %err, "failed to fetch ssh-config hosts");
+                        // Surface the failure on the Add Remote overlay only if it's still the
+                        // launcher of THIS fetch (generation matches) and no manual add has since
+                        // started; otherwise clear this generation's flag and drop the stale error.
+                        // The fetch can fail for reasons other than a local file read (unsupported
+                        // method on an older server, socket failure).
+                        if let Some(model) = &mut state.supervisor_model {
+                            model.fail_ssh_host_fetch(
+                                generation,
+                                format!("couldn't load ssh hosts: {err}"),
+                            );
+                        }
+                    }
+                }
+                state.request_full_redraw();
+                render_cached_composited_frame(&mut state);
+            }
+            // The batch `remote.add` of the checked picker aliases finished: insert each successfully
+            // registered host (`Connecting`) and schedule its reconnect, mark it added in the still-
+            // open picker, and surface any per-host failures on the picker's error line. Close on a
+            // clean full success.
+            ClientLoopEvent::SshHostsAdded {
+                results,
+                generation,
+            } => {
+                let mut added_server_ids = Vec::new();
+                if let Some(model) = &mut state.supervisor_model {
+                    // Registry adds + reconnects always apply (the hosts are registered regardless),
+                    // but overlay mutations apply ONLY to the picker that submitted this batch — a
+                    // late result must not close or write errors into a newer picker session.
+                    let current = model.ssh_host_add_is_current(generation);
+                    let mut errors = Vec::new();
+                    for (alias, result) in results {
+                        match result {
+                            Ok(remote) => {
+                                // Idempotent: a concurrent remote.list refresh may already have
+                                // synced this remote into the model. Only insert + schedule a connect
+                                // when it's genuinely new, so a batch add can't duplicate the sidebar
+                                // host or its retry.
+                                if let Some(server_id) = model.add_secondary_if_absent(
+                                    remote,
+                                    supervisor::ConnectionState::Connecting,
+                                ) {
+                                    model.set_update_progress(
+                                        &server_id,
+                                        Some("waiting to connect…".to_string()),
+                                    );
+                                    added_server_ids.push(server_id);
+                                }
+                                if current {
+                                    model.mark_ssh_host_added(&alias);
+                                }
+                            }
+                            Err(err) => errors.push(format!("{alias}: {err}")),
+                        }
+                    }
+                    if current {
+                        if errors.is_empty() {
+                            model.close_ssh_host_picker();
+                        } else {
+                            // Clear the in-flight generation so Enter re-enables and the user can
+                            // retry the still-checked failed rows (not a dead-end picker).
+                            model.fail_ssh_host_submit(errors.join("; "));
+                        }
+                    }
+                }
+                for server_id in added_server_ids {
+                    schedule_secondary_retry(&mut state, server_id, 0, Instant::now());
                 }
                 state.request_full_redraw();
                 render_cached_composited_frame(&mut state);

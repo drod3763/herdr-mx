@@ -69,6 +69,8 @@ pub enum Method {
     RemoteSetEnabled(RemoteSetEnabledParams),
     #[serde(rename = "remote.set_auto_update")]
     RemoteSetAutoUpdate(RemoteSetAutoUpdateParams),
+    #[serde(rename = "remote.ssh_config_hosts")]
+    RemoteSshConfigHosts(EmptyParams),
     #[serde(rename = "notification.show")]
     NotificationShow(NotificationShowParams),
     #[serde(rename = "client.window_title.set")]
@@ -209,6 +211,17 @@ pub enum Method {
     PluginPaneFocus(PluginPaneFocusParams),
     #[serde(rename = "plugin.pane.close")]
     PluginPaneClose(PluginPaneCloseParams),
+}
+
+impl Method {
+    /// ssh_config host discovery does bounded but blocking filesystem IO and touches no app state,
+    /// so it must run on a worker thread via [`crate::app::App::handle_deferred_remote_ssh_config_hosts`]
+    /// rather than on the synchronous server loop. Both the TUI runtime dispatcher and the headless
+    /// server dispatcher gate on this predicate; keeping the routing decision in one place prevents a
+    /// future fork of either dispatcher from silently regressing back to the synchronous path. #11.
+    pub(crate) fn runs_ssh_config_discovery_off_loop(&self) -> bool {
+        matches!(self, Method::RemoteSshConfigHosts(_))
+    }
 }
 
 #[cfg(test)]

@@ -811,6 +811,9 @@ impl App {
             Method::RemoteSetAutoUpdate(params) => {
                 return self.handle_remote_set_auto_update(request.id, params)
             }
+            Method::RemoteSshConfigHosts(_) => {
+                return self.handle_remote_ssh_config_hosts(request.id)
+            }
             Method::NotificationShow(params) => {
                 return self.handle_notification_show(request.id, params);
             }

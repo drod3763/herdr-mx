@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 // Protocol constants
 // ---------------------------------------------------------------------------
 
-/// Current protocol version. Bumped when wire format changes incompatibly.
+/// Current protocol version. Bumped ONLY when the binary `ClientMessage`/`ServerMessage` wire format
+/// changes incompatibly — not for additive JSON API methods. A new method like mx's read-only
+/// `remote.ssh_config_hosts` (#11) is backward-compatible: old clients never send it, and a server
+/// that does not know it returns a normal method error the caller degrades on, so it needs no bump.
 /// v14: `FrameDelta` carries `base_checksum` and clients may send `RequestFullFrame` (delta-desync
 /// recovery); upstream v14 also adds `pane.move` (relocate a running pane across tabs/workspaces).
 pub const PROTOCOL_VERSION: u32 = 14;

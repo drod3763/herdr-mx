@@ -74,6 +74,9 @@ pub enum ResponseResult {
     RemoteEnabledChanged {
         remote: crate::remote_registry::RemoteDefinitionSnapshot,
     },
+    SshConfigHosts {
+        hosts: Vec<crate::ssh_config::SshConfigHost>,
+    },
     UiSettings {
         settings: UiSettingsInfo,
     },

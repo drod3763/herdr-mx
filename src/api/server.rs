@@ -285,6 +285,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::RemoteRename(_) => "remote.rename",
         Method::RemoteSetEnabled(_) => "remote.set_enabled",
         Method::RemoteSetAutoUpdate(_) => "remote.set_auto_update",
+        Method::RemoteSshConfigHosts(_) => "remote.ssh_config_hosts",
         Method::NotificationShow(_) => "notification.show",
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",

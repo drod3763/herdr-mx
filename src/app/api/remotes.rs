@@ -81,6 +81,82 @@ impl App {
         }
     }
 
+    /// #11: read-only enumeration of connectable `Host` aliases from the user's `~/.ssh/config`
+    /// (following `Include`s, skipping wildcard/pattern hosts), with resolved `HostName`/`User` for
+    /// display. Discovery only — never writes the ssh config and does not touch session state, so it
+    /// does NOT `mark_session_dirty`. The client turns chosen aliases into `remote.add` calls.
+    pub(super) fn handle_remote_ssh_config_hosts(&mut self, id: String) -> String {
+        encode_success(
+            id,
+            ResponseResult::SshConfigHosts {
+                hosts: crate::ssh_config::discover_hosts(),
+            },
+        )
+    }
+
+    /// #11: deferred variant of `remote.ssh_config_hosts`. `discover_hosts()` is bounded but does
+    /// blocking filesystem IO (up to 256 files / 65k dir-entry scans), so the real socket path runs
+    /// it on a worker thread and answers the request channel directly — keeping the synchronous app
+    /// loop free for input, rendering, and other API/remote-lifecycle work. Mirrors the deferred
+    /// worktree APIs, but needs no completion event since the discovery produces no app-loop state to
+    /// fold back (only the thread-safe single-flight flag below). Returns `true` (always handled).
+    pub(crate) fn handle_deferred_remote_ssh_config_hosts(
+        &mut self,
+        request: crate::api::schema::Request,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) -> bool {
+        let id = request.id;
+        // Single-flight with a recovery lease: cap discovery to one worker so a flood of local API
+        // calls can't pile up filesystem scans, but if the prior worker has been running longer than
+        // the lease (it hung on a bad/network-mounted `~/.ssh`), take over instead of returning
+        // `discovery_busy` forever until server restart. The `started` timestamp is the ownership
+        // token so a late-exiting hung worker can't clear a newer discovery's claim.
+        const SSH_DISCOVERY_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
+        let started = std::time::Instant::now();
+        {
+            let mut in_flight = self
+                .ssh_discovery_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(prior) = *in_flight {
+                if prior.elapsed() < SSH_DISCOVERY_LEASE {
+                    drop(in_flight);
+                    let _ = respond_to.send(encode_error(
+                        id,
+                        "discovery_busy",
+                        "ssh config discovery already in progress",
+                    ));
+                    return true;
+                }
+            }
+            *in_flight = Some(started);
+        }
+        // Reset the flag via an RAII guard when the worker's scope exits — AFTER the response is sent
+        // (a second request can't start mid-serialization) and even on panic (unwind runs Drop). It
+        // only clears when it still owns the claim (`started` matches), so a hung worker that finally
+        // exits after a lease takeover doesn't clobber the newer discovery.
+        struct InFlightGuard(
+            std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+            std::time::Instant,
+        );
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                let mut in_flight = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                if *in_flight == Some(self.1) {
+                    *in_flight = None;
+                }
+            }
+        }
+        let guard = InFlightGuard(self.ssh_discovery_in_flight.clone(), started);
+        std::thread::spawn(move || {
+            let _guard = guard;
+            let hosts = crate::ssh_config::discover_hosts();
+            let response = encode_success(id, ResponseResult::SshConfigHosts { hosts });
+            let _ = respond_to.send(response);
+        });
+        true
+    }
+
     /// #61: persist a remote's per-remote auto-update flag. Mirrors `handle_remote_set_enabled`;
     /// reuses the `RemoteEnabledChanged` success body (it just carries the updated definition — the
     /// client re-syncs the flag off the periodic `remote.list`, not this response).
@@ -176,6 +252,29 @@ mod tests {
     }
 
     impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    struct SetEnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl SetEnvGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for SetEnvGuard {
         fn drop(&mut self) {
             if let Some(value) = self.previous.take() {
                 std::env::set_var(self.key, value);
@@ -382,6 +481,180 @@ mod tests {
             ),
             "remote_not_found"
         );
+    }
+
+    #[test]
+    fn ssh_config_hosts_enumerates_aliases_without_marking_dirty() {
+        // #11: the read-only discovery method returns the config's concrete aliases (with display
+        // fields) and must not dirty the session. Point it at a temp config via the env override.
+        // Share the ssh_config tests' lock so the process-global `HERDR_SSH_CONFIG_PATH`/`HOME`
+        // mutations can't race those tests under plain `cargo test`.
+        let _env_lock = crate::ssh_config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("herdr-api-ssh-cfg");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config");
+        std::fs::write(
+            &config_path,
+            "Host prod\n  HostName 10.0.0.5\n  User deploy\n\nHost *\n  User everyone\n",
+        )
+        .unwrap();
+        let _guard = SetEnvGuard::set(crate::ssh_config::SSH_CONFIG_PATH_ENV_VAR, &config_path);
+
+        let mut app = test_app();
+        app.state.session_dirty = false;
+
+        let response = call(
+            &mut app,
+            r#"{"id":"hosts","method":"remote.ssh_config_hosts","params":{}}"#,
+        );
+
+        assert_eq!(response["result"]["type"], "ssh_config_hosts");
+        let hosts = response["result"]["hosts"].as_array().unwrap();
+        assert_eq!(hosts.len(), 1, "wildcard host must be excluded: {hosts:?}");
+        assert_eq!(hosts[0]["alias"], "prod");
+        assert_eq!(hosts[0]["hostname"], "10.0.0.5");
+        assert_eq!(hosts[0]["user"], "deploy");
+        assert!(!app.state.session_dirty, "discovery must not dirty session");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_config_hosts_single_flight_returns_busy_when_already_running() {
+        // codex (re-run): a flood of remote.ssh_config_hosts must not spawn unbounded discovery
+        // threads. While a RECENT discovery is in flight, further requests get a `discovery_busy`
+        // error; a STALE in-flight (past the lease) is taken over instead of poisoning discovery.
+        let mut app = test_app();
+        *app.ssh_discovery_in_flight.lock().unwrap() = Some(std::time::Instant::now());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request: Request = serde_json::from_str(
+            r#"{"id":"hosts","method":"remote.ssh_config_hosts","params":{}}"#,
+        )
+        .unwrap();
+        assert!(app.handle_deferred_remote_ssh_config_hosts(request, tx));
+
+        let raw = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("busy response should answer immediately");
+        let error: ErrorResponse = serde_json::from_str(&raw).unwrap();
+        assert_eq!(error.error.code, "discovery_busy");
+    }
+
+    #[test]
+    fn ssh_config_hosts_recovers_from_a_stale_in_flight_lease() {
+        // codex (re-run): a hung prior worker must not poison discovery forever. A stale in-flight
+        // (older than the lease) is taken over — the request proceeds instead of returning busy.
+        let _env_lock = crate::ssh_config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("herdr-api-ssh-cfg-lease");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config");
+        std::fs::write(&config_path, "Host prod\n").unwrap();
+        let _guard = SetEnvGuard::set(crate::ssh_config::SSH_CONFIG_PATH_ENV_VAR, &config_path);
+
+        let mut app = test_app();
+        // Simulate a worker that claimed the flag long ago and hung.
+        let stale = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(120))
+            .unwrap();
+        *app.ssh_discovery_in_flight.lock().unwrap() = Some(stale);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request: Request = serde_json::from_str(
+            r#"{"id":"hosts","method":"remote.ssh_config_hosts","params":{}}"#,
+        )
+        .unwrap();
+        assert!(app.handle_deferred_remote_ssh_config_hosts(request, tx));
+
+        // The stale lease is taken over → a real result, not a discovery_busy error.
+        let raw = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stale lease should be taken over and answered");
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["type"], "ssh_config_hosts");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_ssh_config_hosts_answers_off_loop_via_channel() {
+        // #11 (codex iter 4): the real socket path defers discovery to a worker thread and answers
+        // the request channel directly, so it never blocks the synchronous app loop. The handler
+        // returns true (handled) and a full response lands on the channel.
+        let _env_lock = crate::ssh_config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("herdr-api-ssh-cfg-deferred");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config");
+        std::fs::write(&config_path, "Host prod\n  HostName 10.0.0.5\n").unwrap();
+        let _guard = SetEnvGuard::set(crate::ssh_config::SSH_CONFIG_PATH_ENV_VAR, &config_path);
+
+        let mut app = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request: Request = serde_json::from_str(
+            r#"{"id":"hosts","method":"remote.ssh_config_hosts","params":{}}"#,
+        )
+        .unwrap();
+        assert!(app.handle_deferred_remote_ssh_config_hosts(request, tx));
+
+        let raw = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deferred discovery should answer the channel");
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["type"], "ssh_config_hosts");
+        assert_eq!(response["result"]["hosts"][0]["alias"], "prod");
+        assert!(!app.state.session_dirty, "discovery must not dirty session");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_ssh_config_hosts_clears_single_flight_after_completion() {
+        // codex-copilot (re-run): the single-flight flag must reset once the worker finishes (via an
+        // RAII guard, AFTER the response is sent), so a later request is not permanently `busy`.
+        let _env_lock = crate::ssh_config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("herdr-api-ssh-cfg-singleflight");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config");
+        std::fs::write(&config_path, "Host prod\n").unwrap();
+        let _guard = SetEnvGuard::set(crate::ssh_config::SSH_CONFIG_PATH_ENV_VAR, &config_path);
+
+        let mut app = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request: Request = serde_json::from_str(
+            r#"{"id":"hosts","method":"remote.ssh_config_hosts","params":{}}"#,
+        )
+        .unwrap();
+        assert!(app.handle_deferred_remote_ssh_config_hosts(request, tx));
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deferred discovery should answer the channel");
+
+        // The guard clears the flag right after the send; wait briefly for that drop to run.
+        let mut cleared = false;
+        for _ in 0..200 {
+            if app.ssh_discovery_in_flight.lock().unwrap().is_none() {
+                cleared = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            cleared,
+            "single-flight flag must clear after the worker completes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
