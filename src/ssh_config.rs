@@ -396,8 +396,11 @@ fn is_connectable_alias(token: &str) -> bool {
 #[derive(Clone)]
 enum IncludeGate {
     /// A `Host` line's pattern list. An alias is admitted when it matches at least one positive
-    /// pattern and no negated (`!`) pattern — ssh's Host-pattern matching. `Host *` admits every
-    /// alias; `Host *.corp` admits only `*.corp` names; a concrete `Host prod` admits only `prod`.
+    /// pattern and no negated (`!`) pattern — ssh's Host-pattern matching for the `*`/`?` wildcards.
+    /// `Host *` admits every alias; `Host *.corp` admits only `*.corp` names; a concrete `Host prod`
+    /// admits only `prod`. Bracket character classes (`Host db-[0-9]`) are matched literally, not
+    /// expanded, so a gate using one admits nothing — a conservative under-report (a rare pattern in a
+    /// gating position), never a false offer of an unreachable alias.
     HostPatterns {
         positive: Vec<String>,
         negated: Vec<String>,
@@ -843,6 +846,32 @@ mod tests {
             !aliases.contains(&"matchhost".to_string()),
             "a Host inside an Include under a Match block is not discoverable"
         );
+    }
+
+    #[test]
+    fn sequential_top_level_includes_each_surface_their_hosts() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // Characterization guard: two top-level `Include`s in the root file are both unconditional. A
+        // `Host` line in the first included file opens a block, but the second file's own `Host` line
+        // re-opens a fresh block, so `ssh other` resolves it — both aliases are connectable and must be
+        // surfaced. (A tempting "fix" that leaks the first include's Host scope onto the second include
+        // and gates its Host lines would WRONGLY drop `other`; this test locks the correct behavior.)
+        let fixture = ConfigFixture::new(
+            "sequential-includes",
+            "Include config.d/a\nInclude config.d/b\n",
+        );
+        fixture.write_extra("config.d/a", "Host prod\n  HostName p.host\n");
+        fixture.write_extra("config.d/b", "Host other\n  HostName o.host\n");
+        let hosts = discover_hosts();
+        let aliases: Vec<_> = hosts.iter().map(|h| h.alias.clone()).collect();
+
+        assert!(aliases.contains(&"prod".to_string()));
+        assert!(
+            aliases.contains(&"other".to_string()),
+            "a Host in a second top-level include is its own block and stays connectable"
+        );
+        let other = hosts.iter().find(|h| h.alias == "other").unwrap();
+        assert_eq!(other.hostname.as_deref(), Some("o.host"));
     }
 
     #[test]
