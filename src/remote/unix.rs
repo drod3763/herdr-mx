@@ -480,11 +480,20 @@ impl TransportSpec {
 fn resolve_transport() -> io::Result<TransportSpec> {
     static LAST_VALID: OnceLock<Mutex<Option<TransportSpec>>> = OnceLock::new();
     let last_valid = LAST_VALID.get_or_init(|| Mutex::new(None));
-    let previous = || last_valid.lock().ok().and_then(|guard| guard.clone());
+    // Recover the guard on poison (`into_inner`) rather than dropping the cached value: a panic
+    // elsewhere must not silently discard the last valid transport and revert the keep-last-valid /
+    // fail-closed guarantee. The stored value is intact — a poison only means some thread panicked
+    // while holding the lock, not that the `Option<TransportSpec>` is corrupt.
+    let previous = || {
+        last_valid
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    };
     let remember = |spec: &TransportSpec| {
-        if let Ok(mut guard) = last_valid.lock() {
-            *guard = Some(spec.clone());
-        }
+        *last_valid
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(spec.clone());
     };
     // The transport-section state is indeterminate (config won't parse, or its `[remote]` section is
     // invalid). Decide from what the *current* config declares. `structural_trustworthy` says whether
@@ -2993,28 +3002,29 @@ fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Ou
     // `timed_out` signal below still bounds a genuinely bad run.
     let (stdout, stdout_timed_out) = stdout_reader.join().unwrap_or_default();
     let (stderr, stderr_timed_out) = stderr_reader.join().unwrap_or_default();
-    // Stop the watchdog first (any kill it already sent was while the leader was unreaped), then reap
-    // the group ourselves. If the direct child exited fast but left an in-group descendant holding a
-    // pipe, the watchdog may have lost the deadline race; killing here guarantees that descendant is
-    // gone instead of leaking across retrying probes. The leader is still unreaped, so `-pid` is
-    // unambiguously our group; on the clean path this is a harmless ESRCH no-op.
+    let reader_timed_out = stdout_timed_out || stderr_timed_out;
+    // Decide whether the command *cleanly succeeded* — but keep the watchdog ARMED while doing so.
+    // On a clean completion the readers hit EOF; however a transport that closes its stdout/stderr
+    // yet keeps running also yields clean EOF here, and then the leader is still alive. Only the
+    // still-armed watchdog's deadline kill bounds the non-reaping success peek below — disarming the
+    // watchdog first (as an earlier version did) let the peek park forever on such a live child. On a
+    // reader timeout we already know a kill is needed and must not block peeking a child that may not
+    // have exited.
+    let exited_success = if reader_timed_out {
+        false
+    } else {
+        wait_exit_success_without_reaping(pid).unwrap_or(false)
+    };
+    // The child has now exited (cleanly, or because the watchdog killed it): stop the watchdog and
+    // reap the group. If the direct child exited fast but left an in-group descendant holding a pipe,
+    // the watchdog may have lost the deadline race; killing here guarantees that descendant is gone
+    // instead of leaking across retrying probes. The leader is still unreaped, so `-pid` is
+    // unambiguously our group; on a clean success this kill is skipped so a legitimately backgrounded
+    // in-group helper (e.g. a ControlPersist-style master) survives.
     done.store(true, Ordering::SeqCst);
     let watchdog_killed = watchdog.join().unwrap_or(false);
-    let timed_out = watchdog_killed || stdout_timed_out || stderr_timed_out;
-    // Decide the group kill while the leader is still unreaped (so `-pid` is unambiguously our group).
-    // Reap the group unless the command *cleanly succeeded*, so a timeout or a non-success exit can't
-    // leave an in-group helper accumulating across retrying probes; only a confirmed clean success
-    // preserves a legitimately backgrounded in-group helper (e.g. a ControlPersist-style master that
-    // closes its stdio). On a timeout we must NOT block peeking status first: a timed-out child may
-    // not have exited yet (the watchdog kill races the `done` flag), so peeking would park until the
-    // child's natural end. On a clean completion the readers hit EOF, so the leader is already exiting
-    // and the non-reaping success peek returns promptly.
-    let kill_group = if timed_out {
-        true
-    } else {
-        !wait_exit_success_without_reaping(pid).unwrap_or(false)
-    };
-    if kill_group {
+    let timed_out = watchdog_killed || reader_timed_out;
+    if timed_out || !exited_success {
         // Safety: `pid` leads its own group (set above) and is not yet reaped; `kill` has no other effect.
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
@@ -4967,6 +4977,27 @@ mod tests {
         assert!(
             alive,
             "a backgrounded in-group helper must survive a clean successful probe"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_bounds_a_transport_that_closes_stdio_but_keeps_running() {
+        // A transport that closes its stdout/stderr but keeps running yields clean EOF on both
+        // readers (not a reader timeout). The still-armed watchdog must enforce the deadline so the
+        // non-reaping success peek can't park forever on the live child (copilot-12). Without the fix
+        // this call hangs.
+        let mut command = Command::new("sh");
+        // Close fd 1 and 2, then sleep: the readers see EOF immediately but the leader stays alive.
+        command.arg("-c").arg("exec 1>&- 2>&-; sleep 600");
+        let start = Instant::now();
+        let result = run_bounded_output(command, Duration::from_millis(300));
+        assert_eq!(
+            result.expect_err("must time out, not hang").kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must return near the deadline, not hang on the live child"
         );
     }
 
