@@ -4200,7 +4200,10 @@ mod tests {
             std::fs::read_to_string(&cfg).is_err(),
             "reading through a file must error"
         );
-        assert!(!cfg.exists(), "Path::exists() is false for this non-NotFound error");
+        assert!(
+            !cfg.exists(),
+            "Path::exists() is false for this non-NotFound error"
+        );
 
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
         assert_eq!(
