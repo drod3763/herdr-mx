@@ -2547,6 +2547,12 @@ fn install_remote_herdr(
     let mut child_stdin = child.stdin.take().ok_or_else(|| {
         io::Error::new(io::ErrorKind::BrokenPipe, "install transport stdin missing")
     })?;
+    // Non-blocking stdin so a single backpressured `write` can't park longer than the client's idle
+    // window: the copy loop below beats progress while waiting for the pipe to drain (see the loop),
+    // so a slow-but-progressing transport isn't false-failed. The absolute bound stays the install
+    // watchdog.
+    let install_stdin_fd = child_stdin.as_raw_fd();
+    set_nonblocking(install_stdin_fd)?;
     // Drain stderr on its own thread while we stream the ~11 MB binary to stdin. A custom
     // `[remote.transport]` may be a verbose wrapper/autossh, and the old "stderr stays tiny"
     // assumption no longer holds: if the child filled its stderr pipe buffer it would stop reading
@@ -2594,13 +2600,22 @@ fn install_remote_herdr(
     });
 
     // Stream the binary, beating `progress(Installing)` periodically so the client's idle watchdog
-    // (which resets on each progress stage) does not abandon a slow-but-progressing upload. A genuine
-    // stall stops producing beats, so the idle timeout still fires; the install watchdog above bounds
-    // the absolute time regardless.
+    // (which resets on each progress stage) does not abandon a slow-but-progressing upload. Because
+    // stdin is non-blocking, a single write that backpressures no longer parks silently past the
+    // client's idle window: the inner loop below beats while polling `POLLOUT`, so the client waits
+    // for the worker instead of false-failing and retrying a still-running install. A completely
+    // wedged transport is still bounded by the install watchdog, which SIGKILLs the group and makes
+    // the write fail.
     let mut copy_result = Ok(());
     let mut buffer = [0_u8; 64 * 1024];
     let mut last_beat = Instant::now();
-    loop {
+    let maybe_beat = |last_beat: &mut Instant| {
+        if last_beat.elapsed() >= INSTALL_PROGRESS_HEARTBEAT {
+            progress(RemoteProvisionStage::Installing);
+            *last_beat = Instant::now();
+        }
+    };
+    'copy: loop {
         let read = match source.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
@@ -2610,14 +2625,36 @@ fn install_remote_herdr(
                 break;
             }
         };
-        if let Err(err) = child_stdin.write_all(&buffer[..read]) {
-            copy_result = Err(err);
-            break;
+        let mut written = 0;
+        while written < read {
+            match child_stdin.write(&buffer[written..read]) {
+                Ok(0) => {
+                    copy_result = Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "install transport closed stdin early",
+                    ));
+                    break 'copy;
+                }
+                Ok(bytes_written) => written += bytes_written,
+                Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    // Wait for the pipe to drain, but keep beating so a slow transport isn't
+                    // false-failed while it is still making progress.
+                    let mut poll_fd = libc::pollfd {
+                        fd: install_stdin_fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    unsafe { libc::poll(&mut poll_fd, 1, 250) };
+                }
+                Err(err) => {
+                    copy_result = Err(err);
+                    break 'copy;
+                }
+            }
+            maybe_beat(&mut last_beat);
         }
-        if last_beat.elapsed() >= INSTALL_PROGRESS_HEARTBEAT {
-            progress(RemoteProvisionStage::Installing);
-            last_beat = Instant::now();
-        }
+        maybe_beat(&mut last_beat);
     }
     // Close stdin so the remote `cat` sees EOF and the child can exit.
     drop(child_stdin);
@@ -2946,6 +2983,12 @@ fn bridge_connection(
     let mut child_stdin = child.stdin.take().ok_or_else(|| {
         io::Error::new(io::ErrorKind::BrokenPipe, "transport bridge stdin missing")
     })?;
+    // Make the upload writer non-blocking so a transport (or an escaped descendant holding the read
+    // end) that stops draining stdin can't park the upload thread in `write` past teardown — see
+    // `write_all_until_stop`. This fd is the transport's stdin pipe, distinct from the local socket,
+    // so it does not affect the socket clones below.
+    let child_stdin_fd = child_stdin.as_raw_fd();
+    set_nonblocking(child_stdin_fd)?;
     let mut child_stdout = child.stdout.take().ok_or_else(|| {
         io::Error::new(io::ErrorKind::BrokenPipe, "transport bridge stdout missing")
     })?;
@@ -2958,6 +3001,7 @@ fn bridge_connection(
     let mut child_to_stream = stream;
     let upload_fd = stream_to_child.as_raw_fd();
     let download_fd = child_stdout.as_raw_fd();
+    let download_write_fd = child_to_stream.as_raw_fd();
     let watchdog_fd = watchdog_stream.as_raw_fd();
 
     // Teardown flag shared with both copy threads. After the child exits and its group is cleared
@@ -2977,6 +3021,7 @@ fn bridge_connection(
             &mut stream_to_child,
             upload_fd,
             &mut child_stdin,
+            child_stdin_fd,
             &upload_stop,
         );
         // Drop child_stdin (closing it → remote EOF) and flag the disconnect.
@@ -2985,10 +3030,14 @@ fn bridge_connection(
     });
     let download_stop = Arc::clone(&teardown);
     let download = thread::spawn(move || {
+        // The download writer is the local socket (blocking): a stuck local reader is bounded by the
+        // hangup watchdog (a disconnect yields `EPIPE`/`POLLHUP`), and it shares its file description
+        // with the upload reader, so it must stay blocking.
         let _ = copy_flush_until_stop(
             &mut child_stdout,
             download_fd,
             &mut child_to_stream,
+            download_write_fd,
             &download_stop,
         );
         let _ = child_to_stream.shutdown(std::net::Shutdown::Write);
@@ -3092,21 +3141,69 @@ fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::
     }
 }
 
-/// Like [`copy_flush`], but cancellable: the copy loop observes `stop` even when the read end stays
-/// open. A blocking `copy_flush` parks in `read()` until EOF; if a custom transport daemonizes and a
-/// descendant that escaped the process group keeps the pipe's write end open after the leader is
-/// SIGKILLed, that EOF never arrives and the copy thread — plus its fds — would leak per bridge
-/// connection, accumulating across reconnects. `poll()` here wakes immediately on data (so the
-/// interactive stream sees no added latency) and otherwise wakes every `STOP` interval to re-check
-/// `stop`, so a bounded teardown can join this thread instead of parking on the reader forever.
-/// `reader_fd` must be the raw fd backing `reader`.
+/// Interval between `stop`/writability re-checks in the cancellable copy helpers.
+const STOP_POLL_INTERVAL_MS: libc::c_int = 250;
+
+/// Write all of `buf`, observing `stop`. When `writer_fd` is **non-blocking**, a reader that stops
+/// draining (e.g. a descendant that escaped the process group holds the pipe's read end open but
+/// never reads) fills the pipe and `write` returns `WouldBlock`; we then poll `POLLOUT` bounded by
+/// `STOP_POLL_INTERVAL_MS` and re-check `stop`, so teardown can't be parked mid-write. When
+/// `writer_fd` is blocking, `write` never yields `WouldBlock`, so this behaves like `write_all`.
+/// Returns `Ok(true)` if it returned early because `stop` was set, `Ok(false)` once `buf` is fully
+/// written.
+fn write_all_until_stop<W: io::Write>(
+    writer: &mut W,
+    writer_fd: std::os::unix::io::RawFd,
+    buf: &[u8],
+    stop: &AtomicBool,
+) -> io::Result<bool> {
+    let mut written = 0;
+    while written < buf.len() {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(true);
+        }
+        match writer.write(&buf[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "write returned 0 bytes",
+                ))
+            }
+            Ok(bytes_written) => written += bytes_written,
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let mut poll_fd = libc::pollfd {
+                    fd: writer_fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // Wake on writable or after the interval to re-check `stop`. Ignore the result: a
+                // spurious wake just retries the write, and a real error surfaces on the next write.
+                unsafe { libc::poll(&mut poll_fd, 1, STOP_POLL_INTERVAL_MS) };
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(false)
+}
+
+/// Like [`copy_flush`], but cancellable on both ends: the copy loop observes `stop` even when the
+/// read end stays open or the write end stops draining. A blocking `copy_flush` parks in `read()`
+/// until EOF (or in `write()` until the reader drains); if a custom transport daemonizes and a
+/// descendant that escaped the process group keeps a pipe open after the leader is SIGKILLed, that
+/// EOF/drain never arrives and the copy thread — plus its fds — would leak per bridge connection,
+/// accumulating across reconnects. `poll()` on the reader wakes immediately on data (so the
+/// interactive stream sees no added latency) and otherwise wakes every `STOP_POLL_INTERVAL_MS` to
+/// re-check `stop`; the write side is bounded the same way (see [`write_all_until_stop`]) when
+/// `writer_fd` is non-blocking. So a bounded teardown can join this thread instead of parking on a
+/// wedged pipe forever. `reader_fd`/`writer_fd` must be the raw fds backing `reader`/`writer`.
 fn copy_flush_until_stop<R: io::Read, W: io::Write>(
     reader: &mut R,
     reader_fd: std::os::unix::io::RawFd,
     writer: &mut W,
+    writer_fd: std::os::unix::io::RawFd,
     stop: &AtomicBool,
 ) -> io::Result<u64> {
-    const STOP_POLL_INTERVAL_MS: libc::c_int = 250;
     let mut buffer = [0_u8; 16 * 1024];
     let mut total = 0;
 
@@ -3137,10 +3234,14 @@ fn copy_flush_until_stop<R: io::Read, W: io::Write>(
             Ok(0) => return Ok(total),
             Ok(bytes_read) => bytes_read,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            // A non-blocking reader can report readable then yield `WouldBlock` on a race; retry.
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
             Err(err) => return Err(err),
         };
 
-        writer.write_all(&buffer[..bytes_read])?;
+        if write_all_until_stop(writer, writer_fd, &buffer[..bytes_read], stop)? {
+            return Ok(total);
+        }
         writer.flush()?;
         total += bytes_read as u64;
     }
@@ -4036,7 +4137,8 @@ mod tests {
         let thread_stop = Arc::clone(&stop);
         let worker = thread::spawn(move || {
             let mut sink = Vec::new();
-            copy_flush_until_stop(&mut reader, reader_fd, &mut sink, &thread_stop)
+            // Vec sink never blocks, so the writer fd is unused (-1).
+            copy_flush_until_stop(&mut reader, reader_fd, &mut sink, -1, &thread_stop)
         });
         // Let the copy loop settle into its poll wait, then request teardown.
         thread::sleep(Duration::from_millis(100));
@@ -4063,10 +4165,54 @@ mod tests {
         let reader_fd = reader.as_raw_fd();
         let stop = Arc::new(AtomicBool::new(false));
         let mut sink = Vec::new();
-        let copied =
-            copy_flush_until_stop(&mut reader, reader_fd, &mut sink, &stop).expect("copy succeeds");
+        // Vec sink never blocks, so the writer fd is unused (-1).
+        let copied = copy_flush_until_stop(&mut reader, reader_fd, &mut sink, -1, &stop)
+            .expect("copy succeeds");
         assert_eq!(copied, 7);
         assert_eq!(sink, b"payload");
+    }
+
+    #[test]
+    fn write_all_until_stop_returns_when_stopped_with_wedged_writer() {
+        // Model a transport (or escaped descendant) that stops draining stdin: fill a non-blocking
+        // writer's buffer so further writes `WouldBlock`, hold the read end open without reading, then
+        // set the stop flag. The write must return `Ok(true)` (stopped) within a poll interval instead
+        // of parking forever — the write-side half of the bridge teardown bound (codex-7-1).
+        use std::io::Write as _;
+        use std::os::unix::io::AsRawFd as _;
+        let (reader_never_drains, mut writer) =
+            std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        let writer_fd = writer.as_raw_fd();
+        set_nonblocking(writer_fd).expect("set non-blocking");
+        // Fill the socket send buffer so the next write backpressures.
+        let filler = [0_u8; 65536];
+        loop {
+            match writer.write(&filler) {
+                Ok(_) => continue,
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => panic!("unexpected fill error: {err}"),
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            let payload = [1_u8; 4096];
+            write_all_until_stop(&mut writer, writer_fd, &payload, &thread_stop)
+        });
+        thread::sleep(Duration::from_millis(100)); // let it park in the POLLOUT wait
+        let start = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        let result = worker.join().expect("worker joins");
+        assert!(
+            matches!(result, Ok(true)),
+            "a stopped wedged write must report early stop, got {result:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return shortly after stop, not park on the wedged writer"
+        );
+        drop(reader_never_drains);
     }
 
     #[test]
