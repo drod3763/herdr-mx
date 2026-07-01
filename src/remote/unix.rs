@@ -2921,6 +2921,7 @@ fn bridge_connection(
     session_name: &str,
     kind: RemoteBridgeKind,
 ) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
     let mut command = target.command(&remote_bridge_command(remote_herdr, session_name, kind));
     command
@@ -2950,20 +2951,40 @@ fn bridge_connection(
     })?;
     let mut stream_to_child = stream.try_clone()?;
     let mut child_to_stream = stream;
+    let upload_fd = stream_to_child.as_raw_fd();
+    let download_fd = child_stdout.as_raw_fd();
+
+    // Teardown flag shared with both copy threads. After the child exits and its group is cleared
+    // (below), we set this so the copy loops stop even if a descendant that escaped the process
+    // group (e.g. via `setsid`) keeps a pipe's write end open and EOF never arrives — otherwise the
+    // blocking join would park forever, leaking the worker thread + its fds per bridge connection.
+    let teardown = Arc::new(AtomicBool::new(false));
 
     // The upload thread reads from the local stream; when it returns, the local side hit EOF/error
     // (the client disconnected). Signal that so the watchdog can stop a transport that keeps its
     // child alive past the disconnect.
     let local_closed = Arc::new(AtomicBool::new(false));
     let upload_closed = Arc::clone(&local_closed);
+    let upload_stop = Arc::clone(&teardown);
     let upload = thread::spawn(move || {
-        let _ = copy_flush(&mut stream_to_child, &mut child_stdin);
+        let _ = copy_flush_until_stop(
+            &mut stream_to_child,
+            upload_fd,
+            &mut child_stdin,
+            &upload_stop,
+        );
         // Drop child_stdin (closing it → remote EOF) and flag the disconnect.
         drop(child_stdin);
         upload_closed.store(true, Ordering::SeqCst);
     });
+    let download_stop = Arc::clone(&teardown);
     let download = thread::spawn(move || {
-        let _ = copy_flush(&mut child_stdout, &mut child_to_stream);
+        let _ = copy_flush_until_stop(
+            &mut child_stdout,
+            download_fd,
+            &mut child_to_stream,
+            &download_stop,
+        );
         let _ = child_to_stream.shutdown(std::net::Shutdown::Write);
     });
 
@@ -2998,6 +3019,11 @@ fn bridge_connection(
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
+    // Signal the copy threads to stop. `kill(-pid)` closes the pipes held by the group, which
+    // normally unblocks the copies via EOF; the flag additionally bounds the case where an
+    // escaped descendant keeps a pipe open past the leader's death (see `copy_flush_until_stop`),
+    // so these joins return within one poll interval instead of parking forever.
+    teardown.store(true, Ordering::SeqCst);
     watchdog_done.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
     let _ = upload.join();
@@ -3019,6 +3045,60 @@ fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::
     let mut total = 0;
 
     loop {
+        let bytes_read = match reader.read(&mut buffer) {
+            Ok(0) => return Ok(total),
+            Ok(bytes_read) => bytes_read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+
+        writer.write_all(&buffer[..bytes_read])?;
+        writer.flush()?;
+        total += bytes_read as u64;
+    }
+}
+
+/// Like [`copy_flush`], but cancellable: the copy loop observes `stop` even when the read end stays
+/// open. A blocking `copy_flush` parks in `read()` until EOF; if a custom transport daemonizes and a
+/// descendant that escaped the process group keeps the pipe's write end open after the leader is
+/// SIGKILLed, that EOF never arrives and the copy thread — plus its fds — would leak per bridge
+/// connection, accumulating across reconnects. `poll()` here wakes immediately on data (so the
+/// interactive stream sees no added latency) and otherwise wakes every `STOP` interval to re-check
+/// `stop`, so a bounded teardown can join this thread instead of parking on the reader forever.
+/// `reader_fd` must be the raw fd backing `reader`.
+fn copy_flush_until_stop<R: io::Read, W: io::Write>(
+    reader: &mut R,
+    reader_fd: std::os::unix::io::RawFd,
+    writer: &mut W,
+    stop: &AtomicBool,
+) -> io::Result<u64> {
+    const STOP_POLL_INTERVAL_MS: libc::c_int = 250;
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut total = 0;
+
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(total);
+        }
+
+        let mut poll_fd = libc::pollfd {
+            fd: reader_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, STOP_POLL_INTERVAL_MS) };
+        if ready < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if ready == 0 {
+            // Timed out with no readable data: loop back to re-check `stop`.
+            continue;
+        }
+
         let bytes_read = match reader.read(&mut buffer) {
             Ok(0) => return Ok(total),
             Ok(bytes_read) => bytes_read,
@@ -3907,6 +3987,52 @@ mod tests {
             "EOF before the deadline must not report a timeout"
         );
         assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn copy_flush_until_stop_returns_when_stopped_with_pipe_open() {
+        // Model an escaped descendant holding the bridge pipe: the write end stays open so the read
+        // end never sees EOF and no data ever arrives. Setting the stop flag must unblock the copy
+        // within one poll interval instead of parking on the open pipe forever (codex-5-1).
+        use std::os::unix::io::AsRawFd as _;
+        let (mut reader, _writer) =
+            std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        let reader_fd = reader.as_raw_fd();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            let mut sink = Vec::new();
+            copy_flush_until_stop(&mut reader, reader_fd, &mut sink, &thread_stop)
+        });
+        // Let the copy loop settle into its poll wait, then request teardown.
+        thread::sleep(Duration::from_millis(100));
+        let start = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        let result = worker.join().expect("worker joins");
+        assert!(result.is_ok(), "stopped copy returns Ok, not an error");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return shortly after stop, not park on the open pipe"
+        );
+        // (_writer dropped here closes the write end.)
+    }
+
+    #[test]
+    fn copy_flush_until_stop_copies_until_eof() {
+        // Without the stop flag set, it behaves like `copy_flush`: drains all data, stops at EOF.
+        use std::io::Write as _;
+        use std::os::unix::io::AsRawFd as _;
+        let (mut reader, mut writer) =
+            std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        writer.write_all(b"payload").expect("write");
+        drop(writer); // close write end → reader sees EOF after "payload"
+        let reader_fd = reader.as_raw_fd();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut sink = Vec::new();
+        let copied =
+            copy_flush_until_stop(&mut reader, reader_fd, &mut sink, &stop).expect("copy succeeds");
+        assert_eq!(copied, 7);
+        assert_eq!(sink, b"payload");
     }
 
     #[test]
