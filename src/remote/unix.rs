@@ -2572,13 +2572,18 @@ fn read_to_capped_tail_until<R: io::Read>(
                 }
             }
             Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+            // Treat WouldBlock AND any other unexpected read error the same: keep trying until the
+            // deadline, then report a timeout. An unexpected error must not masquerade as a clean EOF
+            // (`hit_deadline = false`) — in `run_bounded_output` that would end the reader early, set
+            // `done`, and stop the watchdog before the child exits, letting the subsequent unbounded
+            // `wait_exit_success_without_reaping` hang on a stuck child. Reporting the deadline keeps
+            // the probe bounded so the cleanup path reliably kills the process group.
+            Err(_) => {
                 if Instant::now() >= deadline {
                     return (tail, true);
                 }
                 thread::sleep(Duration::from_millis(20));
             }
-            Err(_) => return (tail, false),
         }
     }
 }
@@ -2614,13 +2619,20 @@ fn read_to_capped_tail_until_stop<R: io::Read>(
                 }
             }
             Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            // WouldBlock and any other unexpected error are handled the same: keep trying until the
+            // deadline (or until `stop`), rather than ending early on a transient read error.
             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     return tail;
                 }
                 thread::sleep(Duration::from_millis(20));
             }
-            Err(_) => return tail,
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    return tail;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
         }
     }
 }
@@ -4459,6 +4471,34 @@ mod tests {
             "EOF before the deadline must not report a timeout"
         );
         assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn read_to_capped_tail_until_treats_an_unexpected_error_as_timeout_not_eof() {
+        // A hard read error must not masquerade as a clean EOF: in run_bounded_output that would end
+        // the reader early, stop the watchdog, and let the unbounded post-reader wait hang on a stuck
+        // child. It must keep trying until the deadline, then report hit_deadline = true (copilot-11).
+        struct ErroringReader;
+        impl io::Read for ErroringReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("boom"))
+            }
+        }
+        let start = Instant::now();
+        let (data, hit_deadline) = read_to_capped_tail_until(
+            &mut ErroringReader,
+            4096,
+            start + Duration::from_millis(150),
+        );
+        assert!(
+            hit_deadline,
+            "an unexpected read error must be bounded by the deadline, not reported as clean EOF"
+        );
+        assert!(data.is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return near the deadline, not spin"
+        );
     }
 
     #[test]
