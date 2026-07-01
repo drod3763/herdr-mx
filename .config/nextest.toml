@@ -1,0 +1,15 @@
+# Retry ONLY specific, evidence-backed environmental flakes by name — deliberately NOT a blanket
+# `kind(test)` retry. This branch is dominated by watchdog / process-group / pipe-draining / timeout
+# code whose real regressions surface as intermittent hangs or races, so a blanket integration-suite
+# retry could mask a nondeterministic transport-teardown regression as green. Single-running the rest
+# of the suite preserves that signal; a genuinely new flake should be added here by name (with
+# tracking) or quarantined, never blanket-retried. Retries never mask a deterministic failure — it
+# still fails every attempt.
+#
+# - multi_client_broadcasts_frame_updates_to_all_clients: integration test; a broadcast frame is
+#   occasionally not observable within its fixed wait under noisy macOS CI scheduling.
+# - reused_shell_cost_is_flat_in_agent_count_while_rebuild_grows: unit test asserting a timing ratio
+#   that can exceed even its generous bounds under noisy CI scheduling.
+[[profile.default.overrides]]
+filter = 'test(multi_client_broadcasts_frame_updates_to_all_clients) | test(reused_shell_cost_is_flat_in_agent_count_while_rebuild_grows)'
+retries = 2

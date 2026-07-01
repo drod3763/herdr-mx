@@ -2975,7 +2975,8 @@ fn connect_secondary_client_stream_for_plan_detached(
                 path
             } else {
                 let ssh_target =
-                    crate::remote::SshTarget::new(destination.clone(), options.clone());
+                    crate::remote::SshTarget::resolved(destination.clone(), options.clone())
+                        .map_err(ClientError::ConnectionFailed)?;
                 // Provisioning rides the retry sweep (the non-modal add-remote flow): stages are
                 // forwarded to the host's banner sub-lines, and the whole bring-up is bounded by
                 // the per-stage idle window so a stuck host fails instead of hanging the retry.
@@ -3462,34 +3463,49 @@ fn spawn_remote_update_for(
     server_id: &supervisor::ServerId,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
-    let ssh_target = state.supervisor_model.as_ref().and_then(|model| {
-        model
-            .server_ssh_target(server_id)
-            .map(|(destination, options)| crate::remote::SshTarget::new(destination, options))
-    });
-    match ssh_target {
-        Some(ssh_target) => {
-            if let Some(model) = &mut state.supervisor_model {
-                model.clear_update_outcome(server_id);
-                model.set_update_progress(server_id, Some("starting update…".to_string()));
-            }
-            state.update_outcome_expiry.remove(server_id);
-            spawn_client_update_remote(
-                server_id.clone(),
-                ssh_target,
-                event_tx,
-                &mut state.pending_update_remote,
+    // Three-way: a non-ssh (local) remote has nothing to reinstall over ssh; an ssh remote whose
+    // custom transport config is invalid is a genuine update failure (don't misreport it as
+    // "non-ssh"); otherwise resolve the transport and run the update.
+    let ssh_endpoint = state
+        .supervisor_model
+        .as_ref()
+        .and_then(|model| model.server_ssh_target(server_id));
+    let Some((destination, options)) = ssh_endpoint else {
+        if let Some(model) = &mut state.supervisor_model {
+            model.set_update_progress(
+                server_id,
+                Some("update is only available for ssh remotes".to_string()),
             );
         }
-        None => {
-            if let Some(model) = &mut state.supervisor_model {
-                model.set_update_progress(
-                    server_id,
-                    Some("update is only available for ssh remotes".to_string()),
-                );
-            }
+        return;
+    };
+    let ssh_target = match crate::remote::SshTarget::resolved(destination, options) {
+        Ok(ssh_target) => ssh_target,
+        Err(err) => {
+            // Surface an invalid custom transport as a terminal update failure (✗ outcome, failure
+            // TTL, and auto-update suppression) instead of the wrong "non-ssh" message, which would
+            // also let the auto-update sweep retry every tick. Mutate state directly rather than via
+            // a best-effort `try_send` so a full event channel can never drop this terminal state.
+            mark_remote_update_failed(
+                state,
+                server_id,
+                &format!("transport config error: {err}"),
+                Instant::now(),
+            );
+            return;
         }
+    };
+    if let Some(model) = &mut state.supervisor_model {
+        model.clear_update_outcome(server_id);
+        model.set_update_progress(server_id, Some("starting update…".to_string()));
     }
+    state.update_outcome_expiry.remove(server_id);
+    spawn_client_update_remote(
+        server_id.clone(),
+        ssh_target,
+        event_tx,
+        &mut state.pending_update_remote,
+    );
 }
 
 /// #61: with per-remote auto-update enabled, push THIS client's build onto every connected secondary
@@ -3807,6 +3823,9 @@ fn classify_provision_failure(err: &ClientError) -> ProvisionFailureDisposition 
         "does not support the remote-bridge subcommands",
         "did not respond to --version",
         "installation cancelled",
+        // An invalid/undeterminable custom [remote.transport]: deterministic, retrying can't fix it
+        // until the config changes. All such resolver errors share this phrase.
+        "refusing to fall back to built-in ssh",
     ];
     if TERMINAL_MARKERS.iter().any(|marker| text.contains(marker)) {
         ProvisionFailureDisposition::Stop
@@ -4360,28 +4379,41 @@ fn apply_update_remote_finished(
             schedule_secondary_retry(state, server_id.clone(), 0, now);
         }
         Err(message) => {
-            if let Some(model) = &mut state.supervisor_model {
-                // #61: clear the spinner and surface a clear, lingering failure instead of leaving a
-                // stale "installing…"-looking progress line frozen on the banner (the old behaviour).
-                model.set_update_progress(server_id, None);
-                model.set_update_outcome(
-                    server_id,
-                    crate::app::state::HostUpdateOutcome {
-                        message: format!("✗ update failed: {message}"),
-                        success: false,
-                    },
-                );
-            }
-            state
-                .update_outcome_expiry
-                .insert(server_id.clone(), now + HOST_UPDATE_FAILURE_TTL);
-            // #61: suppress AUTO-update retries for this host — a failed update (e.g. the local build
-            // can't seed its platform) would otherwise re-fire every cadence once the outcome line
-            // expires. The manual menu `update` still works; a deliberate auto-update re-toggle (or a
-            // later success) clears this.
-            state.auto_update_suppressed.insert(server_id.clone());
+            mark_remote_update_failed(state, server_id, &message, now);
         }
     }
+}
+
+/// Apply the terminal "remote update failed" state transition: clear the spinner, leave a lingering
+/// ✗ outcome, set the failure TTL, and suppress auto-update retries for this host. Shared by the
+/// `UpdateRemoteFinished(Err)` handler and the synchronous transport-resolution failure path so the
+/// failure is recorded directly on state and never depends on a best-effort event send.
+fn mark_remote_update_failed(
+    state: &mut ClientState,
+    server_id: &supervisor::ServerId,
+    message: &str,
+    now: Instant,
+) {
+    if let Some(model) = &mut state.supervisor_model {
+        // #61: clear the spinner and surface a clear, lingering failure instead of leaving a stale
+        // "installing…"-looking progress line frozen on the banner.
+        model.set_update_progress(server_id, None);
+        model.set_update_outcome(
+            server_id,
+            crate::app::state::HostUpdateOutcome {
+                message: format!("✗ update failed: {message}"),
+                success: false,
+            },
+        );
+    }
+    state
+        .update_outcome_expiry
+        .insert(server_id.clone(), now + HOST_UPDATE_FAILURE_TTL);
+    // #61: suppress AUTO-update retries for this host — a failed update (e.g. the local build can't
+    // seed its platform) would otherwise re-fire every cadence once the outcome line expires. The
+    // manual menu `update` still works; a deliberate auto-update re-toggle (or a later success)
+    // clears this.
+    state.auto_update_suppressed.insert(server_id.clone());
 }
 
 /// #61: clear any host update-outcome banner line whose display window has elapsed at `now`. The
@@ -4420,12 +4452,24 @@ fn refetch_secondary_runtime_status(
     server_id: &supervisor::ServerId,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
-    let Some(ssh_target) = state.supervisor_model.as_ref().and_then(|model| {
-        model
-            .server_ssh_target(server_id)
-            .map(|(destination, options)| crate::remote::SshTarget::new(destination, options))
-    }) else {
+    // Only ssh hosts have a refetch path; a non-ssh host (or a gone host) is a silent no-op. But an
+    // ssh host whose `[remote.transport]` fails to resolve is NOT the same as "not an ssh host":
+    // swallowing that with `.ok()` would drop the diagnostic while every other failure below logs a
+    // warning. Distinguish the two so an invalid transport is surfaced instead of silently leaving a
+    // stale mismatch readout.
+    let Some((destination, options)) = state
+        .supervisor_model
+        .as_ref()
+        .and_then(|model| model.server_ssh_target(server_id))
+    else {
         return;
+    };
+    let ssh_target = match crate::remote::SshTarget::resolved(destination, options) {
+        Ok(target) => target,
+        Err(err) => {
+            warn!(err = %err, "post-update runtime status refetch skipped: invalid remote transport");
+            return;
+        }
     };
     let server_id = server_id.clone();
     let event_tx = event_tx.clone();
@@ -7264,6 +7308,9 @@ mod tests {
             "installed remote herdr at \"$HOME/.local/bin/herdr\", but it reports `herdr 0.6.9`, not version 0.6.10-mx.1",
             "this mx-channel build (0.6.10-mx.1) cannot seed remotes from the herdr.dev release manifest",
             "remote herdr is incompatible and can't be upgraded in place — update it and retry",
+            // Invalid custom transport config is deterministic: stop instead of reconnect-churning.
+            "[remote.transport] is configured but invalid (args must include a {remote_command} placeholder); refusing to fall back to built-in ssh",
+            "config.toml is degraded and a custom [remote.transport] cannot be ruled out; refusing to fall back to built-in ssh",
         ] {
             let err = ClientError::ConnectionFailed(io::Error::other(terminal));
             assert_eq!(
@@ -9049,6 +9096,61 @@ mod tests {
         assert!(
             state.pending_update_remote.is_empty(),
             "a failure-suppressed host is not auto-retried"
+        );
+    }
+
+    #[test]
+    fn spawn_remote_update_surfaces_invalid_transport_as_failure() {
+        // An ssh remote whose custom transport config is invalid must produce a terminal update
+        // failure (UpdateRemoteFinished(Err)), not the "non-ssh remote" message — otherwise the
+        // auto-update sweep retries it every tick with the wrong diagnosis.
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-it".into(),
+            name: "it".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                target: "it-host".into(),
+                args: Vec::new(),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+            auto_update: true,
+        });
+        let mut state = test_client_state_with_model(model);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir =
+            std::env::temp_dir().join(format!("herdr-update-transport-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"ssh\"\nargs = [\"{host}\"]\n",
+        )
+        .expect("write invalid-template config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+
+        spawn_remote_update_for(&mut state, &remote, &event_tx);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The failure must be recorded directly on state (terminal outcome + auto-update
+        // suppression), not via a best-effort event that a full channel could drop, and must NOT
+        // start a worker.
+        assert!(
+            state.auto_update_suppressed.contains(&remote),
+            "invalid transport must suppress auto-update retries"
+        );
+        assert!(
+            state.update_outcome_expiry.contains_key(&remote),
+            "invalid transport must record a terminal update outcome"
+        );
+        assert!(
+            !state.pending_update_remote.contains(&remote),
+            "no update worker should be spawned for an invalid transport"
         );
     }
 

@@ -119,6 +119,16 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your `~/.ssh/config` and `/etc/ssh/ssh_config` first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own SSH keepalive settings win. Set `manage_ssh_config = false` to run the bridge through plain `ssh` without Herdr's generated config.
 
+To reach remotes with a program other than `ssh` (for example `autossh` or a wrapper script), set `[remote.transport]`:
+
+```toml
+[remote.transport]
+program = "autossh"
+args = ["-M", "0", "{options}", "-T", "{host}", "{remote_command}"]
+```
+
+Herdr spawns `program` with `args`, expanding `{host}` and `{remote_command}` within a token and the standalone token `{options}` to each resolved SSH option as its own argument. A custom transport owns its full argv (no `-T`/`ConnectTimeout` is injected) and must provide a raw bidirectional binary stdio channel; terminal transports like mosh and Eternal Terminal cannot. See [Remote attach over SSH](/docs/persistence-remote/#custom-transport) for the full contract and roaming guidance.
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).

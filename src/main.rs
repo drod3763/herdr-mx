@@ -368,6 +368,19 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # your ssh config unchanged — this does not force keepalive off, it only stops
 # herdr from adding its own.
 # manage_ssh_config = true
+# Override the program herdr spawns to reach a remote. Unset (default) uses the
+# built-in `ssh -T` invocation. When set, the bridge spawns `program` with `args`,
+# expanding placeholders: the standalone token "{options}" becomes each resolved
+# ssh option as its own argument, while "{host}" and "{remote_command}" are
+# substituted within a token. "{remote_command}" is required; an invalid template
+# keeps the last valid transport this session, or fails the remote operation if none
+# was ever valid (it does not fall back to ssh). The replacement must give a raw bidirectional binary
+# stdio channel — terminal transports like mosh/Eternal Terminal cannot. A custom
+# template owns its full argv (no -T/ConnectTimeout is injected). Example: autossh
+# for auto-reconnect roaming —
+# [remote.transport]
+# program = "autossh"
+# args = ["-M", "0", "{options}", "-T", "{host}", "{remote_command}"]
 
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.

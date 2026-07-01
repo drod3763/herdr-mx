@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, IsTerminal, Write as _};
+use std::io::{self, IsTerminal, Read as _, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -10,12 +10,15 @@ use std::process::{Command, Output, Stdio};
 use serde::Deserialize;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
+/// Grace period after the local stream closes before a bridge transport that ignores stdin EOF is
+/// killed as a process group, so a disconnect can't leave the transport (e.g. autossh) running.
+const BRIDGE_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
 const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -226,7 +229,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     );
     // The CLI `--remote <host>` path is always a bare destination (leading-`-` is rejected by
     // `validate_remote_target`), so there are no extra ssh options to carry.
-    let ssh_target = SshTarget::bare(&remote.target);
+    let ssh_target = SshTarget::resolved(&remote.target, Vec::new())?;
     // CLI path: echo each provisioning stage to stderr so a slow seed reads as progress.
     let progress = |stage: RemoteProvisionStage| eprintln!("herdr: {}", stage.label());
     let prepared_remote = prepare_remote_herdr(
@@ -265,10 +268,16 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
 /// precede it (e.g. `-L`, `-J`, `-p`, `-o`). The destination alone is the dedup / socket-path /
 /// display key; the options are emitted on every ssh invocation so port-forwards and jump hosts
 /// from a full ssh add-remote spec actually take effect.
+///
+/// `transport` is the program used to reach the host, snapshotted at construction. A logical remote
+/// operation (detect → check → install → start → bridge) reuses one `SshTarget`, so every step runs
+/// the same transport even if `[remote.transport]` is edited mid-flow; a live config change applies
+/// to the next operation / reconnect, which builds a fresh `SshTarget`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SshTarget {
     destination: String,
     options: Vec<String>,
+    transport: TransportSpec,
 }
 
 impl SshTarget {
@@ -276,10 +285,28 @@ impl SshTarget {
         Self {
             destination: destination.into(),
             options,
+            transport: TransportSpec::Ssh,
         }
     }
 
-    /// A bare destination with no extra ssh options (the `herdr --remote <host>` CLI path).
+    /// Construct with the transport snapshotted from current config. Used at the start of a logical
+    /// remote operation / reconnect so every command the operation builds shares one transport.
+    /// Returns an error when `[remote.transport]` is configured but invalid and no valid transport
+    /// has ever been resolved, so a misconfigured custom transport fails closed instead of silently
+    /// connecting over built-in ssh.
+    pub(crate) fn resolved(
+        destination: impl Into<String>,
+        options: Vec<String>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            transport: resolve_transport()?,
+            ..Self::new(destination, options)
+        })
+    }
+
+    /// A bare destination with no extra ssh options and the built-in ssh transport. Test-only;
+    /// production attach paths use [`SshTarget::resolved`] to snapshot the configured transport.
+    #[cfg(test)]
     pub(crate) fn bare(destination: impl Into<String>) -> Self {
         Self::new(destination, Vec::new())
     }
@@ -288,11 +315,30 @@ impl SshTarget {
         &self.destination
     }
 
+    /// Build the transport command for `remote_command` using this target's snapshotted transport
+    /// (the built-in `ssh` behavior by default, or a `[remote.transport]` custom program).
+    fn command(&self, remote_command: &str) -> Command {
+        self.build_command(remote_command, &self.transport)
+    }
+
+    /// Dispatch to the program selected by `transport`: the built-in `Ssh` behavior (the default)
+    /// or a user-defined `Custom` template. The exhaustive match means a future `TransportSpec`
+    /// variant is a compile error here rather than a silent fallback. Split out from `command` so
+    /// tests can pass an explicit spec without depending on the caller's real config file.
+    fn build_command(&self, remote_command: &str, transport: &TransportSpec) -> Command {
+        match transport {
+            TransportSpec::Ssh => self.build_ssh_command(remote_command),
+            TransportSpec::Custom { program, args } => {
+                self.build_custom_command(remote_command, program, args)
+            }
+        }
+    }
+
     /// Build `ssh <options...> -T <destination> <remote_command>`. `-T` (disable pseudo-tty) is
     /// inserted before the destination unless the user already supplied it; the herdr payload is
     /// always the trailing positional so it runs on the remote rather than being parsed as an
     /// ssh option.
-    fn command(&self, remote_command: &str) -> Command {
+    fn build_ssh_command(&self, remote_command: &str) -> Command {
         let mut command = Command::new("ssh");
         // Bound the connect phase so an unreachable host fails fast instead of stalling for the OS
         // TCP timeout. Skip if the user already pinned a ConnectTimeout in their own options.
@@ -326,6 +372,307 @@ impl SshTarget {
         command.arg(&self.destination);
         command.arg(remote_command);
         command
+    }
+
+    /// Build a user-defined transport command. Unlike the `Ssh` path, no `-T`/timeout/forwarding
+    /// options are injected — the template owns the full argv. The standalone token `{options}`
+    /// expands to each resolved ssh option as its own argument; `{host}` and `{remote_command}`
+    /// are substring-substituted within a token.
+    fn build_custom_command(
+        &self,
+        remote_command: &str,
+        program: &str,
+        args: &[String],
+    ) -> Command {
+        let mut command = Command::new(program);
+        for token in args {
+            if token == "{options}" {
+                command.args(&self.options);
+            } else {
+                command.arg(
+                    token
+                        .replace("{host}", &self.destination)
+                        .replace("{remote_command}", remote_command),
+                );
+            }
+        }
+        command
+    }
+}
+
+/// How the `--remote` bridge reaches a host: the built-in `ssh` invocation, or a user-defined
+/// program + arg template from `[remote.transport]`. Resolved per command build by
+/// [`resolve_transport`] so live config reloads apply; the replacement program must still provide
+/// a raw bidirectional binary stdio channel (the bridge pipes herdr's frame protocol over it
+/// unchanged).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransportSpec {
+    Ssh,
+    Custom { program: String, args: Vec<String> },
+}
+
+/// Outcome of resolving `[remote.transport]`: a usable spec, or a configured-but-invalid template.
+/// `Invalid` is kept distinct from `Spec(Ssh)` so the resolver can fail closed (keep the last valid
+/// transport) instead of silently routing remote operations over built-in ssh when the user clearly
+/// intended a custom transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransportResolution {
+    Spec(TransportSpec),
+    Invalid,
+}
+
+impl TransportSpec {
+    fn from_config(remote: &crate::config::model::RemoteConfig) -> TransportResolution {
+        let Some(transport) = &remote.transport else {
+            // No `[remote.transport]` override configured: use built-in ssh.
+            return TransportResolution::Spec(TransportSpec::Ssh);
+        };
+        // A present `[remote.transport]` with a blank/omitted `program` is a malformed custom
+        // transport, not "no transport": report it invalid so the resolver keeps a prior valid
+        // custom transport or fails closed, instead of spawning a nameless command or silently
+        // downgrading to ssh and bypassing the configured transport. `Spec(Ssh)` is reserved for an
+        // entirely absent transport table (handled above).
+        if transport.program.trim().is_empty() {
+            tracing::warn!(
+                "[remote.transport] is present but `program` is blank; keeping the last valid transport"
+            );
+            return TransportResolution::Invalid;
+        }
+        // The bridge/install path runs an arbitrary remote command (the herdr payload) over the
+        // transport. A template that omits `{remote_command}` would spawn the transport and stream
+        // that payload (including the ~11 MB binary on install) into the remote login shell or
+        // wrapper stdin instead of a command runner. Report it invalid so the resolver keeps the
+        // last valid transport rather than failing open to ssh. `{host}` is intentionally not
+        // required: a wrapper may embed its destination.
+        if !transport
+            .args
+            .iter()
+            .any(|arg| arg.contains("{remote_command}"))
+        {
+            tracing::warn!(
+                program = %transport.program,
+                "[remote.transport] args must include a {{remote_command}} placeholder; keeping the last valid transport"
+            );
+            return TransportResolution::Invalid;
+        }
+        TransportResolution::Spec(TransportSpec::Custom {
+            program: transport.program.trim().to_string(),
+            args: transport.args.clone(),
+        })
+    }
+}
+
+/// Resolve the transport from the live config, snapshotted once per remote operation (see
+/// [`SshTarget::resolved`]) so a config reload (`herdr server reload-config`) applies at the next
+/// operation / reconnect boundary.
+///
+/// Uses `load_live_config` (not `Config::load`) on purpose: `Config::load` silently substitutes
+/// `Config::default()` on a parse/read error, which would drop a configured `[remote.transport]`
+/// and downgrade an active custom transport to plain ssh after a transient bad edit. Instead we
+/// remember the last *successfully resolved* spec (`LAST_VALID`, `None` until one exists) and keep
+/// it when the config currently fails to parse, the `[remote]` section is invalid, or
+/// `[remote.transport]` is configured but invalid (e.g. missing `{remote_command}`).
+///
+/// When `[remote.transport]` is configured-but-invalid and no valid transport was ever resolved,
+/// return an error so the remote operation fails closed rather than silently routing over built-in
+/// ssh — a custom transport may be the user's trust/routing boundary. The process-default ssh is
+/// never treated as a "last valid" value for an invalid custom config.
+fn resolve_transport() -> io::Result<TransportSpec> {
+    static LAST_VALID: OnceLock<Mutex<Option<TransportSpec>>> = OnceLock::new();
+    let last_valid = LAST_VALID.get_or_init(|| Mutex::new(None));
+    // Recover the guard on poison (`into_inner`) rather than dropping the cached value: a panic
+    // elsewhere must not silently discard the last valid transport and revert the keep-last-valid /
+    // fail-closed guarantee. The stored value is intact — a poison only means some thread panicked
+    // while holding the lock, not that the `Option<TransportSpec>` is corrupt.
+    let previous = || {
+        last_valid
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    };
+    let remember = |spec: &TransportSpec| {
+        *last_valid
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(spec.clone());
+    };
+    // Reached only on a DEGRADED config — the file won't parse/read, or its `[remote]` section is
+    // typed-invalid. A clean, legible removal (a fully valid config with no `[remote.transport]`) is
+    // *not* handled here; it flows through the success path below and authoritatively resolves ssh.
+    // So a "No transport" reading in this degraded state is never authoritative: a previously valid
+    // *custom* transport is preserved (fail closed), because a bad edit / partial write / broken
+    // `[remote]` section must not silently redirect remote operations over built-in ssh and bypass a
+    // wrapper/proxy the user relies on for routing or trust separation. Only when no custom transport
+    // was ever resolved do we decide from the current declaration: `No` → ssh (a typo elsewhere must
+    // not break the default path), `Yes`/`Unknown` → fail closed rather than guess.
+    let keep_or_default = || -> io::Result<TransportSpec> {
+        if let Some(spec @ TransportSpec::Custom { .. }) = previous() {
+            return Ok(spec);
+        }
+        match config_declares_transport() {
+            TransportDeclared::No => {
+                // No prior custom transport and none declared now: use built-in ssh. Record it so a
+                // later invalid-custom config (whose fallback consults `previous`) still fails closed
+                // instead of resurrecting a spec that was never validly resolved.
+                remember(&TransportSpec::Ssh);
+                Ok(TransportSpec::Ssh)
+            }
+            TransportDeclared::Yes | TransportDeclared::Unknown => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "config.toml is degraded and a custom [remote.transport] cannot be ruled out; \
+                 refusing to fall back to built-in ssh",
+            )),
+        }
+    };
+
+    // Config currently fails to parse/read (`load_live_config` returns `Ok(default)` when the file
+    // is absent, `Err` only when a present file fails to read/parse).
+    let Ok(loaded) = crate::config::load_live_config() else {
+        return keep_or_default();
+    };
+    // `load_live_config` returns Ok even when the `[remote]` section fails to deserialize: it records
+    // the section in `invalid_sections` and leaves `config.remote` at its default. Deriving a
+    // transport from that default would silently drop a configured custom transport, so treat an
+    // invalid `[remote]` section as degraded too — a typed-invalid `[remote]` is not a legible
+    // transport removal, so it must not authoritatively fall open to ssh.
+    if loaded
+        .invalid_sections
+        .iter()
+        .any(|section| section == "remote")
+    {
+        return keep_or_default();
+    }
+    match TransportSpec::from_config(&loaded.config.remote) {
+        TransportResolution::Spec(spec) => {
+            remember(&spec);
+            Ok(spec)
+        }
+        // A custom transport is configured but invalid (e.g. template missing `{remote_command}`):
+        // keep a previously valid *custom* transport, but fail closed otherwise rather than routing
+        // remote operations over built-in ssh and bypassing the intended custom transport. A cached
+        // default ssh (from an earlier no-transport config) must NOT satisfy this fallback — that
+        // would silently route over ssh exactly when the user has now configured a custom transport.
+        TransportResolution::Invalid => match previous() {
+            Some(spec @ TransportSpec::Custom { .. }) => Ok(spec),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "[remote.transport] is configured but invalid (args must include a \
+                 {remote_command} placeholder); refusing to fall back to built-in ssh",
+            )),
+        },
+    }
+}
+
+/// Whether the config declares a custom transport (`remote.transport`), as a tri-state. `Unknown`
+/// means a present config could not be inspected (read error), which must fail closed rather than be
+/// treated as "no transport declared".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportDeclared {
+    Yes,
+    No,
+    Unknown,
+}
+
+/// Return `line` with any trailing TOML inline comment (`# …`) removed. Quote-aware: a `#` inside a
+/// basic (`"`) or literal (`'`) string is not a comment, so a genuine transport line with a `#` in a
+/// value (e.g. a `ProxyCommand`) keeps its keywords. Best-effort — used only by the unparseable-config
+/// text scan in [`config_declares_transport`].
+fn strip_toml_inline_comment(line: &str) -> &str {
+    let mut in_basic = false;
+    let mut in_literal = false;
+    for (index, ch) in line.char_indices() {
+        match ch {
+            '"' if !in_literal => in_basic = !in_basic,
+            '\'' if !in_basic => in_literal = !in_literal,
+            '#' if !in_basic && !in_literal => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Inspect whether the config declares a custom transport (`remote.transport`). Used only when the
+/// config fails to parse / its `[remote]` section is invalid, to distinguish a config that intends a
+/// custom transport (fail closed) from one that does not (fall back to ssh).
+///
+/// Prefers a structural check: parse the raw text to a `toml::Value` and look up `remote.transport`.
+/// This recognizes every valid TOML spelling — `[remote.transport]`, `[ remote.transport ]`, and the
+/// inline `[remote]` + `transport = { ... }` form — even when the typed `[remote]` section failed to
+/// deserialize (only the structured *typed* config is unavailable then; the raw value still parses).
+/// Falls back to a lenient text scan only when the TOML is too broken to parse to a value at all.
+/// Returns `Unknown` when a present config file cannot be read, so the caller fails closed.
+fn config_declares_transport() -> TransportDeclared {
+    let path = crate::config::config_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        // Present but unreadable (permission denied, is-a-directory, an unreadable parent, transient
+        // IO): we cannot rule out a configured transport. Treat as Unknown so the caller fails closed.
+        // Only a genuinely absent file (`NotFound`) means no transport is configured. Do NOT use
+        // `Path::exists()` to make this call: it also returns false on non-`NotFound` errors (e.g.
+        // `EACCES`/`ENOTDIR` while stat-ing), which would misclassify an unreadable config as absent
+        // and fall *open* to ssh.
+        Err(err) => {
+            return if err.kind() == io::ErrorKind::NotFound {
+                TransportDeclared::No
+            } else {
+                TransportDeclared::Unknown
+            };
+        }
+    };
+    if let Ok(value) = content.parse::<toml::Value>() {
+        let declared = value
+            .get("remote")
+            .and_then(|remote| remote.as_table())
+            .is_some_and(|remote| remote.contains_key("transport"));
+        return if declared {
+            TransportDeclared::Yes
+        } else {
+            TransportDeclared::No
+        };
+    }
+    // TOML won't parse to a value (syntax error): best-effort scan. Strip spaces so spelling/spacing
+    // doesn't matter, skip comments, and accept any way a remote transport can be declared: a
+    // `[remote.transport]` table, a top-level dotted key (`remote.transport...`), a `transport` key
+    // inside a `[remote]` table, or a single-line inline table (`remote = { transport = ... }`). The
+    // catch-all — any non-comment line mentioning both `remote` and `transport` — keeps this robust
+    // to TOML spellings the specific checks miss. Over-detection only errs toward failing closed.
+    let mut in_remote_table = false;
+    let scanned = content.lines().any(|line| {
+        // Drop a trailing inline comment before scanning, so an unrelated comment that happens to
+        // mention `remote`/`transport` (e.g. `onboarding = false # remote transport`) can't trip the
+        // catch-all below into a false positive. Quote-aware so a `#` *inside* a string on a genuine
+        // transport line isn't mistaken for a comment (that would drop the keyword and fail open).
+        let trimmed = strip_toml_inline_comment(line).trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let compact: String = trimmed.chars().filter(|ch| !ch.is_whitespace()).collect();
+        if compact.starts_with("[remote.transport]") || compact.starts_with("[remote.transport.") {
+            return true;
+        }
+        // Top-level dotted key, e.g. `remote.transport.program = "..."` or `remote.transport = {...}`.
+        if compact.starts_with("remote.transport.") || compact.starts_with("remote.transport=") {
+            return true;
+        }
+        // Conservative catch-all: any single line that mentions both `remote` and `transport`
+        // (covers inline `remote = { transport = ... }`, quoted/dotted keys, etc.).
+        if compact.contains("remote") && compact.contains("transport") {
+            return true;
+        }
+        if compact.starts_with('[') {
+            in_remote_table = compact.starts_with("[remote]");
+            return false;
+        }
+        // Inside `[remote]`: a `transport = ...`, a dotted subkey `transport.program = ...`, or a
+        // quoted `"transport" = ...` all declare a custom transport.
+        in_remote_table
+            && (compact.starts_with("transport=")
+                || compact.starts_with("transport.")
+                || compact.starts_with("\"transport\""))
+    });
+    if scanned {
+        TransportDeclared::Yes
+    } else {
+        TransportDeclared::No
     }
 }
 
@@ -845,7 +1192,7 @@ fn prepare_remote_herdr(
     });
     let source = resolve_install_source(&remote_herdr.platform, override_binary)?;
     progress(RemoteProvisionStage::Installing);
-    let install_result = install_remote_herdr(target, &remote_herdr, &source.path);
+    let install_result = install_remote_herdr(target, &remote_herdr, &source.path, progress);
     source.cleanup();
     install_result?;
 
@@ -2101,70 +2448,620 @@ fn confirm_remote_install(
     Ok(())
 }
 
-fn install_remote_herdr(
-    target: &SshTarget,
-    remote_herdr: &RemoteHerdr,
-    source_path: &Path,
-) -> io::Result<()> {
-    // mktemp the staging file rather than a predictable "$dest.tmp.$$": `cat >` follows symlinks, so
-    // a guessable name in $HOME could be pre-planted (symlink redirect / pre-created file). mktemp
-    // creates an exclusive, unpredictable, owner-only file (no symlink follow), then we chmod+mv it
-    // into place.
-    let script = format!(
+/// Backstop deadline for a remote install over a custom transport. The binary upload is bounded by
+/// the copy completing; this kills a transport (e.g. autossh) that stalls the stdin copy or never
+/// exits, so an install can't hang the worker / leak the process indefinitely. Generous so a slow
+/// link uploading the ~11 MB binary is not killed mid-transfer.
+const INSTALL_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How often the install upload re-emits its `Installing` progress stage so the client's idle
+/// watchdog (which resets on each stage) doesn't abandon a slow-but-progressing transfer. Must be
+/// comfortably under that idle window (90s).
+const INSTALL_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// Cap on retained install stderr. The tail is kept to enrich a failure message; a verbose/looping
+/// custom transport could otherwise grow this without bound.
+const INSTALL_STDERR_TAIL_CAP: usize = 8 * 1024;
+
+/// How long a *failed* install waits to drain the last buffered stderr after the child has exited,
+/// before giving up on the reader. Well under the client idle window (90s): the child is already
+/// gone, so its error output is already buffered; this only bounds the wait for a descendant that
+/// escaped the process group and holds stderr open, so the failure path can't go silent to the 300s
+/// install deadline and let the caller time out into an overlapping retry.
+const INSTALL_FAILURE_STDERR_DRAIN: Duration = Duration::from_secs(3);
+
+/// Read `reader` to EOF, retaining only the last `cap` bytes. Always drains the pipe fully so a
+/// chatty child cannot deadlock on a full stderr buffer, but never grows memory past `cap`.
+/// Put a file descriptor into non-blocking mode so reads return `WouldBlock` instead of parking.
+fn set_nonblocking(fd: std::os::unix::io::RawFd) -> io::Result<()> {
+    // Retry on EINTR, consistent with the other syscall wrappers here, so a signal delivered during
+    // the fcntl can't spuriously fail a remote operation.
+    let flags = loop {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        break flags;
+    };
+    loop {
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        break;
+    }
+    Ok(())
+}
+
+/// Block until `pid` terminates **without reaping it** (leaves it as a zombie for a later reaping
+/// wait), returning `true` only for a clean exit with status 0. Used before a process-group
+/// `kill(-pid)`: once a child is reaped its pid — and therefore its process-group id — can be
+/// recycled by the OS, so signalling `-pid` after the reap could hit an unrelated group. Waiting
+/// non-reaping keeps the leader (hence the pgid) reserved so the group kill is unambiguously ours,
+/// and the returned success flag lets the caller preserve a legitimately backgrounded in-group helper
+/// on a clean success while reaping the group on a failed/killed exit. The caller must still reap
+/// afterward (e.g. via [`Child::wait`]).
+fn wait_exit_success_without_reaping(pid: i32) -> io::Result<bool> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // WEXITED: wait for termination. WNOWAIT: leave it waitable so `Child::wait` still reaps it.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            // A clean exit reports `CLD_EXITED` with a 0 status; a nonzero exit code or a terminating
+            // signal (`CLD_KILLED`/`CLD_DUMPED`) is not a success.
+            return Ok(info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+/// Non-reaping poll of `pid`: `Ok(true)` if it has terminated (left as a zombie for a later reaping
+/// wait), `Ok(false)` if still running. The non-blocking companion to
+/// [`wait_exit_success_without_reaping`] for callers that must keep doing work (e.g. emit progress)
+/// while waiting, and that will send a process-group signal before the final reap.
+fn child_exited_without_reaping(pid: i32) -> io::Result<bool> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            // Retry on EINTR like the other wait/poll helpers, so a signal delivered during the
+            // install wait loop can't spuriously fail provisioning.
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        // `info` was zeroed, and `WNOHANG` leaves `si_signo` at 0 when no child state is available; a
+        // terminated child sets it to `SIGCHLD`.
+        return Ok(info.si_signo != 0);
+    }
+}
+
+/// Drain a **non-blocking** reader to EOF or until `deadline`, retaining only the last `cap` bytes.
+/// Returns `(tail, hit_deadline)`. Unlike a blocking drain, this returns even when a descendant that
+/// escaped the process group (e.g. via `setsid`) keeps the pipe's write end open and EOF never
+/// arrives — so a bounded operation can report a timeout instead of parking on the reader forever.
+/// The caller must have set the reader's fd non-blocking (see [`set_nonblocking`]).
+fn read_to_capped_tail_until<R: io::Read>(
+    reader: &mut R,
+    cap: usize,
+    deadline: Instant,
+) -> (Vec<u8>, bool) {
+    let mut tail: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return (tail, false),
+            Ok(read) => {
+                tail.extend_from_slice(&chunk[..read]);
+                if tail.len() > cap {
+                    let overflow = tail.len() - cap;
+                    tail.drain(..overflow);
+                }
+                // Enforce the deadline even while data keeps flowing: a descendant that escaped the
+                // process group could emit continuously and never yield a `WouldBlock`, so a check
+                // only in that branch would let this loop run forever.
+                if Instant::now() >= deadline {
+                    return (tail, true);
+                }
+            }
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            // Treat WouldBlock AND any other unexpected read error the same: keep trying until the
+            // deadline, then report a timeout. An unexpected error must not masquerade as a clean EOF
+            // (`hit_deadline = false`) — in `run_bounded_output` that would end the reader early, set
+            // `done`, and stop the watchdog before the child exits, letting the subsequent unbounded
+            // `wait_exit_success_without_reaping` hang on a stuck child. Reporting the deadline keeps
+            // the probe bounded so the cleanup path reliably kills the process group.
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    return (tail, true);
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// Like [`read_to_capped_tail_until`] but also stops when `stop` is set, returning whatever tail has
+/// been drained so far. Used by the install stderr reader: a *failed* install joins this reader for
+/// its error tail, and the reader's own deadline is the long absolute install cap. If a descendant
+/// that escaped the process group holds stderr open past the child's exit, EOF never arrives, so the
+/// failure path sets `stop` after a brief buffered-drain window to keep that join well under the
+/// caller's idle timeout instead of parking to the install deadline.
+fn read_to_capped_tail_until_stop<R: io::Read>(
+    reader: &mut R,
+    cap: usize,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> Vec<u8> {
+    let mut tail: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return tail;
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => return tail,
+            Ok(read) => {
+                tail.extend_from_slice(&chunk[..read]);
+                if tail.len() > cap {
+                    let overflow = tail.len() - cap;
+                    tail.drain(..overflow);
+                }
+                if Instant::now() >= deadline {
+                    return tail;
+                }
+            }
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            // WouldBlock and any other unexpected error are handled the same: keep trying until the
+            // deadline (or until `stop`), rather than ending early on a transient read error.
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return tail;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    return tail;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// The remote install shell script. Stages the streamed binary in an unpredictable mktemp file
+/// (`cat >` follows symlinks, so a guessable `$dest.tmp` in `$HOME` could be pre-planted), then
+/// **verifies the staged byte count equals `expected_len` before `mv`**. A local read error or a
+/// custom transport that closes stdin after only part of the payload would otherwise make the remote
+/// `cat/mv` succeed and overwrite a working binary with a truncated one; on a size mismatch the
+/// script deletes the temp file (via the EXIT trap) and exits non-zero, leaving the destination
+/// untouched.
+fn build_install_script(install_suffix: &str, expected_len: u64) -> String {
+    format!(
         r#"dest="$HOME/{install_suffix}"
 dir="${{dest%/*}}"
 mkdir -p "$dir"
 tmp="$(mktemp "${{dest}}.tmp.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 cat > "$tmp"
+got="$(wc -c < "$tmp" | tr -d '[:space:]')"
+if [ "$got" != "{expected_len}" ]; then
+  echo "install payload truncated: staged $got bytes, expected {expected_len}" >&2
+  exit 1
+fi
 chmod 755 "$tmp"
 mv "$tmp" "$dest"
 trap - EXIT
-"#,
-        install_suffix = remote_herdr.install_suffix
-    );
+"#
+    )
+}
+
+fn install_remote_herdr(
+    target: &SshTarget,
+    remote_herdr: &RemoteHerdr,
+    source_path: &Path,
+    progress: &ProgressSink,
+) -> io::Result<()> {
+    // Open the source binary BEFORE starting the remote transport: a failure here must not leave a
+    // spawned child/watchdog behind (the watchdog would later SIGKILL a possibly-reused process
+    // group), and must not let the remote `cat` see an immediate EOF and install an empty file. Its
+    // length is embedded in the install script so the remote verifies the staged file before
+    // replacing the destination (see below).
+    let mut source = File::open(source_path)?;
+    let expected_len = source.metadata()?.len();
+    let script = build_install_script(&remote_herdr.install_suffix, expected_len);
 
     // Capture (never inherit) the install child's output: this also runs inside the in-client
     // add-remote worker, where the raw-mode TUI owns the terminal, so any inherited byte (ssh's
     // "Permanently added … to known hosts" warning, remote shell chatter) scrolls/garbles the
     // screen mid-provision (issue #32 follow-up). stdout is discarded; stderr is kept only to
     // enrich a failure message.
-    let mut child = target
-        .command(&format!("sh -eu -c {}", shell_quote(&script)))
+    use std::os::unix::io::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut command = target.command(&format!("sh -eu -c {}", shell_quote(&script)));
+    // Lead a new process group so the whole install transport tree (a custom wrapper may spawn ssh
+    // children) can be killed on the watchdog deadline below.
+    command.process_group(0);
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh install: {err}")))?;
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("failed to start install transport: {err}"),
+            )
+        })?;
 
-    let mut source = File::open(source_path)?;
-    let copy_result = match child.stdin.take() {
-        Some(mut stdin) => io::copy(&mut source, &mut stdin).map(|_| ()),
-        None => Err(io::Error::new(
+    let mut child_stdin = child.stdin.take().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::BrokenPipe, "install transport stdin missing")
+    })?;
+    // Non-blocking stdin so a single backpressured `write` can't park longer than the client's idle
+    // window: the copy loop below beats progress while waiting for the pipe to drain (see the loop),
+    // so a slow-but-progressing transport isn't false-failed. The absolute bound stays the install
+    // watchdog.
+    let install_stdin_fd = child_stdin.as_raw_fd();
+    set_nonblocking(install_stdin_fd)?;
+    // Drain stderr on its own thread while we stream the ~11 MB binary to stdin. A custom
+    // `[remote.transport]` may be a verbose wrapper/autossh, and the old "stderr stays tiny"
+    // assumption no longer holds: if the child filled its stderr pipe buffer it would stop reading
+    // stdin, and our blocking write of the binary would deadlock against it. Retain only a bounded
+    // tail so a transport that emits stderr forever can't exhaust memory.
+    let mut child_stderr = child.stderr.take().ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::BrokenPipe,
-            "ssh install stdin missing",
-        )),
+            "install transport stderr missing",
+        )
+    })?;
+    // Deadline-aware drain so an stderr holder that escaped the process group can't park this join.
+    // The reader also observes `stderr_stop` so the terminal paths below can end it promptly (well
+    // under the caller's idle timeout) instead of waiting out the absolute install deadline.
+    set_nonblocking(child_stderr.as_raw_fd())?;
+    let install_deadline_at = Instant::now() + INSTALL_TRANSPORT_TIMEOUT;
+    let stderr_stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = Arc::clone(&stderr_stop);
+    let stderr_reader = thread::spawn(move || {
+        read_to_capped_tail_until_stop(
+            &mut child_stderr,
+            INSTALL_STDERR_TAIL_CAP,
+            install_deadline_at,
+            &reader_stop,
+        )
+    });
+
+    // Watchdog: SIGKILL the install transport group if it has not finished within the deadline. A
+    // custom transport (autossh) that keeps retrying could otherwise leave the stdin copy / wait
+    // blocked forever and accumulate stuck processes across retry ticks. Killing the child makes the
+    // blocking `io::copy` (a stalled child stops reading stdin) and `wait` below return.
+    let install_pid = child.id() as i32;
+    let install_done = Arc::new(AtomicBool::new(false));
+    let watchdog_done = Arc::clone(&install_done);
+    let watchdog = thread::spawn(move || {
+        let start = Instant::now();
+        while start.elapsed() < INSTALL_TRANSPORT_TIMEOUT {
+            if watchdog_done.load(Ordering::SeqCst) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if !watchdog_done.load(Ordering::SeqCst) {
+            // Safety: `install_pid` leads its own group (set above); `kill` has no other effect here.
+            unsafe {
+                libc::kill(-install_pid, libc::SIGKILL);
+            }
+        }
+    });
+
+    // Stream the binary, beating `progress(Installing)` periodically so the client's idle watchdog
+    // (which resets on each progress stage) does not abandon a slow-but-progressing upload. Because
+    // stdin is non-blocking, a single write that backpressures no longer parks silently past the
+    // client's idle window: the inner loop below beats while polling `POLLOUT`, so the client waits
+    // for the worker instead of false-failing and retrying a still-running install. A completely
+    // wedged transport is still bounded by the install watchdog, which SIGKILLs the group and makes
+    // the write fail.
+    let mut copy_result = Ok(());
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut last_beat = Instant::now();
+    let maybe_beat = |last_beat: &mut Instant| {
+        if last_beat.elapsed() >= INSTALL_PROGRESS_HEARTBEAT {
+            progress(RemoteProvisionStage::Installing);
+            *last_beat = Instant::now();
+        }
     };
-    // The ~11 MB binary went to stdin above; stderr stays tiny (one ssh warning at most), so
-    // wait_with_output cannot deadlock on a full pipe.
-    let output = child.wait_with_output()?;
+    'copy: loop {
+        let read = match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                copy_result = Err(err);
+                break;
+            }
+        };
+        let mut written = 0;
+        while written < read {
+            match child_stdin.write(&buffer[written..read]) {
+                Ok(0) => {
+                    copy_result = Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "install transport closed stdin early",
+                    ));
+                    break 'copy;
+                }
+                Ok(bytes_written) => written += bytes_written,
+                Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    // Wait for the pipe to drain, but keep beating so a slow transport isn't
+                    // false-failed while it is still making progress.
+                    let mut poll_fd = libc::pollfd {
+                        fd: install_stdin_fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let ready = unsafe { libc::poll(&mut poll_fd, 1, 250) };
+                    if ready < 0 {
+                        let poll_err = io::Error::last_os_error();
+                        // EINTR just retries the write next pass; any other poll error is real.
+                        if poll_err.kind() != io::ErrorKind::Interrupted {
+                            copy_result = Err(poll_err);
+                            break 'copy;
+                        }
+                    }
+                }
+                Err(err) => {
+                    copy_result = Err(err);
+                    break 'copy;
+                }
+            }
+            maybe_beat(&mut last_beat);
+        }
+        maybe_beat(&mut last_beat);
+    }
+    // Close stdin so the remote `cat` sees EOF and the child can exit.
+    drop(child_stdin);
+
+    // Reap the child, then clear any descendant that inherited stderr so the drain gets EOF promptly.
+    // Without this, a successful install whose descendant holds stderr would wait out the drain's
+    // 300s deadline — outliving the client's 90s idle watchdog and false-failing a completed install.
+    // The leader has exited, so the kill only reaps lingering group members (an empty group is a
+    // harmless ESRCH no-op). Safety: `install_pid` leads its own group (set above).
+    //
+    // Keep beating progress through this reap so the post-upload wait stays observable: a transport
+    // that consumes the whole payload then hangs before exiting must not let the client's idle
+    // timeout fire — that would clear the operation and let a retry start a second install while this
+    // child is still mutating the remote. The install watchdog SIGKILLs the group at the absolute
+    // deadline, which makes `try_wait` observe the exit and this loop return.
+    // Wait for the child to exit WITHOUT reaping it, beating progress so the post-upload wait stays
+    // observable (see codex note above). Non-reaping keeps the leader's pid — and thus the group id —
+    // reserved so the `kill(-install_pid)` below can't land on a recycled pid belonging to an
+    // unrelated local process group.
+    let exit_wait = loop {
+        match child_exited_without_reaping(install_pid) {
+            Ok(true) => break Ok(()),
+            Ok(false) => {
+                maybe_beat(&mut last_beat);
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => break Err(err),
+        }
+    };
+    // Stop the watchdog; it already SIGKILLed the whole transport group if the install exceeded its
+    // absolute deadline (the forced-timeout teardown, while the leader was still unreaped).
+    install_done.store(true, Ordering::SeqCst);
+    let _ = watchdog.join();
+    exit_wait?;
+    // Peek the exit result without reaping, then reap the group unless the install *cleanly
+    // succeeded*: a failed/killed install may have left an in-group helper that would otherwise
+    // accumulate across provision retries. A clean success preserves a valid backgrounded in-group
+    // helper (e.g. a ControlPersist-style master); a descendant holding stderr open is handled by
+    // `stderr_stop`. Leader still unreaped → `-install_pid` is our group.
+    let install_success = wait_exit_success_without_reaping(install_pid).unwrap_or(false);
+    if !install_success {
+        // Safety: `install_pid` leads its own group (set above) and is not yet reaped.
+        unsafe {
+            libc::kill(-install_pid, libc::SIGKILL);
+        }
+    }
+    let status = child.wait()?; // reap the leader last
     copy_result?;
 
-    if output.status.success() {
+    if status.success() {
+        // Do NOT block on the stderr drain for a successful install: the tail only enriches a
+        // failure message, and a daemonized/setsid descendant that escaped the process group could
+        // hold stderr open until the reader's own deadline — outliving the client's 90s idle window
+        // and false-failing a completed install. Signal the reader to stop, then detach it (dropping
+        // the handle) so it ends promptly on its own without leaking or blocking this return.
+        stderr_stop.store(true, Ordering::SeqCst);
+        drop(stderr_reader);
         Ok(())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Failure: the stderr tail helps diagnose it, but the reader's deadline is the 300s install
+        // cap. The child has already exited, so its error output is buffered; give the reader a brief
+        // window to surface it (beating progress so this doesn't go silent), then stop it so a
+        // descendant that escaped the process group and holds stderr open can't push this join past
+        // the caller's idle timeout into an overlapping retry.
+        let drain_deadline = Instant::now() + INSTALL_FAILURE_STDERR_DRAIN;
+        while !stderr_reader.is_finished() && Instant::now() < drain_deadline {
+            maybe_beat(&mut last_beat);
+            thread::sleep(Duration::from_millis(50));
+        }
+        stderr_stop.store(true, Ordering::SeqCst);
+        // A panic in the stderr reader shouldn't be silently swallowed as empty output on an install
+        // that is already failing — surface it in the diagnostic instead.
+        let stderr = stderr_reader
+            .join()
+            .unwrap_or_else(|_| b"<stderr reader thread panicked>".to_vec());
+        let stderr = String::from_utf8_lossy(&stderr);
         let stderr = stderr.trim();
         Err(io::Error::other(if stderr.is_empty() {
-            format!("remote install exited with {}", output.status)
+            format!("remote install exited with {status}")
         } else {
-            format!("remote install exited with {}: {stderr}", output.status)
+            format!("remote install exited with {status}: {stderr}")
         }))
     }
 }
 
+/// Cap on a single one-shot remote probe (`ssh_output`). The built-in ssh transport already bounds
+/// its connect with `-o ConnectTimeout=10`; this is the backstop for a custom `[remote.transport]`
+/// program (e.g. autossh) that retries forever, so an unreachable host fails a provisioning probe
+/// fast instead of hanging it and leaking the spawned transport across retry ticks. The long-lived
+/// bridge is intentionally not bounded — a roaming transport's persistence there is desired.
+const SSH_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on retained probe output (per stream). Normal probe output (uname, version strings) is tiny;
+/// this only bounds a transport that floods stdout/stderr.
+const PROBE_OUTPUT_CAP: usize = 64 * 1024;
+
+/// Run a one-shot command to completion, bounded by `deadline`. stdout and stderr are drained
+/// concurrently (so a chatty transport that fills a pipe buffer can't block its own exit — the bug
+/// the install path also guards against), retaining only a bounded tail of each. On timeout the
+/// child and its whole process group are SIGKILLed (a custom transport may have spawned ssh
+/// children) and a `TimedOut` error is returned; killing the child unblocks the drain/wait.
+fn run_bounded_output(mut command: Command, deadline: Duration) -> io::Result<Output> {
+    use std::os::unix::io::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+    // Put the child in its own process group so the whole transport tree can be killed on timeout.
+    command.process_group(0);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let pid = child.id() as i32;
+
+    // Drain both pipes concurrently and deadline-aware: non-blocking reads stop at the deadline even
+    // if a descendant that escaped the process group (setsid/new session) keeps the pipe open, so a
+    // reader can never park forever. Killing the group (watchdog below) handles in-group children.
+    let deadline_at = Instant::now() + deadline;
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "probe stdout missing"))?;
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "probe stderr missing"))?;
+    set_nonblocking(child_stdout.as_raw_fd())?;
+    set_nonblocking(child_stderr.as_raw_fd())?;
+    let stdout_reader = thread::spawn(move || {
+        read_to_capped_tail_until(&mut child_stdout, PROBE_OUTPUT_CAP, deadline_at)
+    });
+    let stderr_reader = thread::spawn(move || {
+        read_to_capped_tail_until(&mut child_stderr, PROBE_OUTPUT_CAP, deadline_at)
+    });
+
+    // Watchdog: SIGKILL the process group at the deadline. Killing the child makes the pipes hit EOF
+    // and `wait` return, so a hung/looping transport can't block forever.
+    let done = Arc::new(AtomicBool::new(false));
+    let watchdog_done = Arc::clone(&done);
+    let watchdog = thread::spawn(move || {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            if watchdog_done.load(Ordering::SeqCst) {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if watchdog_done.load(Ordering::SeqCst) {
+            return false;
+        }
+        // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        true
+    });
+
+    // The deadline-aware readers always return (even on an escaped pipe holder), so these joins are
+    // bounded. `hit_deadline` from either reader, or a watchdog kill, means the operation timed out.
+    // Do NOT reap the child yet: every `kill(-pid)` below must run while the leader is still unreaped
+    // so its pid — and therefore the group id — is guaranteed ours. Reaping first would free the pid
+    // for up to the whole deadline (the readers can block that long on an escaped pipe holder), and a
+    // recycled pid could redirect the group kill at an unrelated local process group.
+    // Default to empty output if a reader thread's join fails. Propagating early here would skip the
+    // watchdog-stop / group-kill / reap sequence below and leak the child — and the readers run only
+    // the panic-free `read_to_capped_tail_until`, so a join failure cannot actually occur. The
+    // `timed_out` signal below still bounds a genuinely bad run.
+    let (stdout, stdout_timed_out) = stdout_reader.join().unwrap_or_default();
+    let (stderr, stderr_timed_out) = stderr_reader.join().unwrap_or_default();
+    let reader_timed_out = stdout_timed_out || stderr_timed_out;
+    // Decide whether the command *cleanly succeeded* — but keep the watchdog ARMED while doing so.
+    // On a clean completion the readers hit EOF; however a transport that closes its stdout/stderr
+    // yet keeps running also yields clean EOF here, and then the leader is still alive. Only the
+    // still-armed watchdog's deadline kill bounds the non-reaping success peek below — disarming the
+    // watchdog first (as an earlier version did) let the peek park forever on such a live child. On a
+    // reader timeout we already know a kill is needed and must not block peeking a child that may not
+    // have exited.
+    let exited_success = if reader_timed_out {
+        false
+    } else {
+        wait_exit_success_without_reaping(pid).unwrap_or(false)
+    };
+    // The child has now exited (cleanly, or because the watchdog killed it): stop the watchdog and
+    // reap the group. If the direct child exited fast but left an in-group descendant holding a pipe,
+    // the watchdog may have lost the deadline race; killing here guarantees that descendant is gone
+    // instead of leaking across retrying probes. The leader is still unreaped, so `-pid` is
+    // unambiguously our group; on a clean success this kill is skipped so a legitimately backgrounded
+    // in-group helper (e.g. a ControlPersist-style master) survives.
+    done.store(true, Ordering::SeqCst);
+    let watchdog_killed = watchdog.join().unwrap_or(false);
+    let timed_out = watchdog_killed || reader_timed_out;
+    if timed_out || !exited_success {
+        // Safety: `pid` leads its own group (set above) and is not yet reaped; `kill` has no other effect.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let status = child.wait()?; // reap the leader last
+
+    if timed_out {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "remote transport command exceeded {}s and was killed (unreachable host, or a \
+                 custom [remote.transport] that does not time out)",
+                deadline.as_secs()
+            ),
+        ));
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn ssh_output(target: &SshTarget, command: &str) -> io::Result<Output> {
-    target.command(command).output()
+    run_bounded_output(target.command(command), SSH_PROBE_TIMEOUT)
 }
 
 fn remote_bridge_command(
@@ -2328,6 +3225,8 @@ fn bridge_connection(
     session_name: &str,
     kind: RemoteBridgeKind,
 ) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
     let mut command = target.command(&remote_bridge_command(remote_herdr, session_name, kind));
     command
         .stdin(Stdio::piped())
@@ -2336,40 +3235,187 @@ fn bridge_connection(
         // ssh chatter (host-key notices, multiplexing notes, transient warnings) would corrupt /
         // spam the screen. A genuine bridge failure surfaces as a dropped stream → reconnect, and
         // connection-setup errors are already reported by the detect/install phase.
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        // Own process group so a transport that ignores stdin EOF (e.g. autossh) can be killed as a
+        // tree when the local stream closes, instead of outliving the connection.
+        .process_group(0);
 
-    let mut child = command
-        .spawn()
-        .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdin missing"))?;
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
+    let mut child = command.spawn().map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("failed to start transport bridge: {err}"),
+        )
+    })?;
+    let pid = child.id() as i32;
+    let mut child_stdin = child.stdin.take().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::BrokenPipe, "transport bridge stdin missing")
+    })?;
+    // Make the upload writer non-blocking so a transport (or an escaped descendant holding the read
+    // end) that stops draining stdin can't park the upload thread in `write` past teardown — see
+    // `write_all_until_stop`. This fd is the transport's stdin pipe, distinct from the local socket,
+    // so it does not affect the socket clones below.
+    let child_stdin_fd = child_stdin.as_raw_fd();
+    set_nonblocking(child_stdin_fd)?;
+    let mut child_stdout = child.stdout.take().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::BrokenPipe, "transport bridge stdout missing")
+    })?;
     let mut stream_to_child = stream.try_clone()?;
+    // A dedicated clone the watchdog polls for local-peer hangup. It must observe the disconnect
+    // independently of the upload thread: a wedged transport that stops reading its stdin can park
+    // the upload thread in `write_all` so it never reaches its read-side EOF and never sets
+    // `local_closed`, which would otherwise leave the watchdog idle and the bridge unkilled.
+    let watchdog_stream = stream.try_clone()?;
     let mut child_to_stream = stream;
+    let upload_fd = stream_to_child.as_raw_fd();
+    let download_fd = child_stdout.as_raw_fd();
+    let download_write_fd = child_to_stream.as_raw_fd();
+    let watchdog_fd = watchdog_stream.as_raw_fd();
 
+    // Teardown flag shared with both copy threads. After the child exits and its group is cleared
+    // (below), we set this so the copy loops stop even if a descendant that escaped the process
+    // group (e.g. via `setsid`) keeps a pipe's write end open and EOF never arrives — otherwise the
+    // blocking join would park forever, leaking the worker thread + its fds per bridge connection.
+    let teardown = Arc::new(AtomicBool::new(false));
+
+    // The upload thread reads from the local stream; when it returns, the local side hit EOF/error
+    // (the client disconnected). Signal that so the watchdog can stop a transport that keeps its
+    // child alive past the disconnect.
+    let local_closed = Arc::new(AtomicBool::new(false));
+    let upload_closed = Arc::clone(&local_closed);
+    let upload_stop = Arc::clone(&teardown);
     let upload = thread::spawn(move || {
-        let _ = copy_flush(&mut stream_to_child, &mut child_stdin);
+        let _ = copy_flush_until_stop(
+            &mut stream_to_child,
+            upload_fd,
+            &mut child_stdin,
+            child_stdin_fd,
+            &upload_stop,
+        );
+        // Drop child_stdin (closing it → remote EOF) and flag the disconnect.
+        drop(child_stdin);
+        upload_closed.store(true, Ordering::SeqCst);
     });
+    let download_stop = Arc::clone(&teardown);
     let download = thread::spawn(move || {
-        let _ = copy_flush(&mut child_stdout, &mut child_to_stream);
+        // The download writer is the local socket (blocking): a stuck local reader is bounded by the
+        // hangup watchdog (a disconnect yields `EPIPE`/`POLLHUP`), and it shares its file description
+        // with the upload reader, so it must stay blocking.
+        let _ = copy_flush_until_stop(
+            &mut child_stdout,
+            download_fd,
+            &mut child_to_stream,
+            download_write_fd,
+            &download_stop,
+        );
         let _ = child_to_stream.shutdown(std::net::Shutdown::Write);
     });
 
-    let status = child.wait()?;
+    // Watchdog: once the local stream has closed, give the transport a grace window to exit on its
+    // own (a well-behaved transport sees stdin EOF and quits); if it ignores that and keeps the
+    // child alive, SIGKILL the whole transport group so a disconnect can't leak it across reconnects.
+    //
+    // It detects the disconnect two ways so a wedged transport can't defeat it: `local_closed` (set
+    // when the upload thread reaches read-side EOF) covers the common case, and polling `watchdog_fd`
+    // for `POLLHUP` covers the case where the upload thread is parked in `write_all` to a transport
+    // that stopped reading its stdin — then it never reaches EOF, so the poll is the only signal.
+    let watchdog_done = Arc::new(AtomicBool::new(false));
+    let watchdog_finished = Arc::clone(&watchdog_done);
+    let watchdog = thread::spawn(move || {
+        // Hold the clone open for the thread's lifetime so `watchdog_fd` stays valid to poll.
+        let _watchdog_stream = watchdog_stream;
+        loop {
+            if watchdog_finished.load(Ordering::SeqCst) {
+                return;
+            }
+            // Poll for a local-peer hangup. `events` must include `POLLIN` for `POLLHUP` to be
+            // reported on a socket (macOS reports nothing for `events = 0`); the 200ms timeout also
+            // paces the `local_closed` / finished re-checks.
+            let mut poll_fd = libc::pollfd {
+                fd: watchdog_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, 200) };
+            let mut poll_failed = false;
+            if ready < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    // A signal interrupted the poll; retry (the 200ms timeout paces the loop, so a
+                    // one-off EINTR doesn't hot-spin).
+                    continue;
+                }
+                // A real poll error (e.g. EBADF) means we can no longer observe the local socket.
+                // Fail safe: treat it as a hangup and tear the transport down rather than looping
+                // forever without teardown, which would leak a persistent transport (autossh).
+                poll_failed = true;
+            }
+            let hung_up = ready > 0
+                && (poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0;
+
+            if watchdog_finished.load(Ordering::SeqCst) {
+                return;
+            }
+            if hung_up || poll_failed || local_closed.load(Ordering::SeqCst) {
+                // Give the transport a grace window to exit on its own, but poll `watchdog_finished`
+                // during it: when the bridge exits promptly after the disconnect (the common case),
+                // the main thread signals `watchdog_done` mid-grace, and a single blocking sleep would
+                // otherwise make `watchdog.join()` stall the whole teardown for the full grace period.
+                let grace_deadline = Instant::now() + BRIDGE_SHUTDOWN_GRACE;
+                while Instant::now() < grace_deadline {
+                    if watchdog_finished.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                if !watchdog_finished.load(Ordering::SeqCst) {
+                    // Safety: `pid` leads its own group (set above); `kill` has no other effect here.
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
+                return;
+            }
+            // A readable wake without a hangup means buffered upload data the parked upload thread
+            // hasn't drained. Back off so this loop doesn't spin while the transport is wedged.
+            if ready > 0 {
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
+
+    // Wait for the transport to exit WITHOUT reaping it (the watchdog above kills a wedged transport
+    // to make this return). Keeping the leader unreaped holds its pid — and thus the group id —
+    // reserved, so the group kill below can never land on a recycled pid belonging to an unrelated
+    // local process group. The success flag decides that kill.
+    let exit_success = wait_exit_success_without_reaping(pid);
+    // Stop the copy threads and the watchdog first so no other thread will signal the group.
+    teardown.store(true, Ordering::SeqCst);
+    watchdog_done.store(true, Ordering::SeqCst);
+    let _ = watchdog.join();
+    // Reap the group unless the transport cleanly exited: a failed/killed bridge (or the watchdog's
+    // forced disconnect) may have left an in-group helper that would otherwise accumulate across
+    // reconnects. A clean, remote-initiated exit preserves a legitimately backgrounded in-group helper
+    // (e.g. a ControlPersist-style master); the copy threads are cancellable via `teardown`, so their
+    // joins don't depend on this kill. Leader still unreaped → `-pid` is our group.
+    if !matches!(exit_success, Ok(true)) {
+        // Safety: `pid` leads its own group (set above) and is not yet reaped; `kill` has no other effect.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let reap_result = child.wait(); // reap the leader last
     let _ = upload.join();
     let _ = download.join();
+    // Surface a non-reaping-wait error first, then the reaped exit status.
+    exit_success?;
+    let status = reap_result?;
 
     if status.success() {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
-            format!("ssh bridge exited with {status}"),
+            format!("transport bridge exited with {status}"),
         ))
     }
 }
@@ -2387,6 +3433,120 @@ fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::
         };
 
         writer.write_all(&buffer[..bytes_read])?;
+        writer.flush()?;
+        total += bytes_read as u64;
+    }
+}
+
+/// Interval between `stop`/writability re-checks in the cancellable copy helpers.
+const STOP_POLL_INTERVAL_MS: libc::c_int = 250;
+
+/// Write all of `buf`, observing `stop`. When `writer_fd` is **non-blocking**, a reader that stops
+/// draining (e.g. a descendant that escaped the process group holds the pipe's read end open but
+/// never reads) fills the pipe and `write` returns `WouldBlock`; we then poll `POLLOUT` bounded by
+/// `STOP_POLL_INTERVAL_MS` and re-check `stop`, so teardown can't be parked mid-write. When
+/// `writer_fd` is blocking, `write` never yields `WouldBlock`, so this behaves like `write_all`.
+/// Returns `Ok(true)` if it returned early because `stop` was set, `Ok(false)` once `buf` is fully
+/// written.
+fn write_all_until_stop<W: io::Write>(
+    writer: &mut W,
+    writer_fd: std::os::unix::io::RawFd,
+    buf: &[u8],
+    stop: &AtomicBool,
+) -> io::Result<bool> {
+    let mut written = 0;
+    while written < buf.len() {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(true);
+        }
+        match writer.write(&buf[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "write returned 0 bytes",
+                ))
+            }
+            Ok(bytes_written) => written += bytes_written,
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let mut poll_fd = libc::pollfd {
+                    fd: writer_fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // Wake on writable or after the interval to re-check `stop`. Handle the poll result
+                // like the reader side does: EINTR just retries (a signal storm can't tight-spin
+                // because the write + `stop` check re-run each pass), and any other poll error is
+                // surfaced rather than silently dropped.
+                let ready = unsafe { libc::poll(&mut poll_fd, 1, STOP_POLL_INTERVAL_MS) };
+                if ready < 0 {
+                    let poll_err = io::Error::last_os_error();
+                    if poll_err.kind() != io::ErrorKind::Interrupted {
+                        return Err(poll_err);
+                    }
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(false)
+}
+
+/// Like [`copy_flush`], but cancellable on both ends: the copy loop observes `stop` even when the
+/// read end stays open or the write end stops draining. A blocking `copy_flush` parks in `read()`
+/// until EOF (or in `write()` until the reader drains); if a custom transport daemonizes and a
+/// descendant that escaped the process group keeps a pipe open after the leader is SIGKILLed, that
+/// EOF/drain never arrives and the copy thread — plus its fds — would leak per bridge connection,
+/// accumulating across reconnects. `poll()` on the reader wakes immediately on data (so the
+/// interactive stream sees no added latency) and otherwise wakes every `STOP_POLL_INTERVAL_MS` to
+/// re-check `stop`; the write side is bounded the same way (see [`write_all_until_stop`]) when
+/// `writer_fd` is non-blocking. So a bounded teardown can join this thread instead of parking on a
+/// wedged pipe forever. `reader_fd`/`writer_fd` must be the raw fds backing `reader`/`writer`.
+fn copy_flush_until_stop<R: io::Read, W: io::Write>(
+    reader: &mut R,
+    reader_fd: std::os::unix::io::RawFd,
+    writer: &mut W,
+    writer_fd: std::os::unix::io::RawFd,
+    stop: &AtomicBool,
+) -> io::Result<u64> {
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut total = 0;
+
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(total);
+        }
+
+        let mut poll_fd = libc::pollfd {
+            fd: reader_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, STOP_POLL_INTERVAL_MS) };
+        if ready < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if ready == 0 {
+            // Timed out with no readable data: loop back to re-check `stop`.
+            continue;
+        }
+
+        let bytes_read = match reader.read(&mut buffer) {
+            Ok(0) => return Ok(total),
+            Ok(bytes_read) => bytes_read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            // A non-blocking reader can report readable then yield `WouldBlock` on a race; retry.
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(err) => return Err(err),
+        };
+
+        if write_all_until_stop(writer, writer_fd, &buffer[..bytes_read], stop)? {
+            return Ok(total);
+        }
         writer.flush()?;
         total += bytes_read as u64;
     }
@@ -2542,11 +3702,36 @@ mod tests {
     use super::*;
 
     fn ssh_argv(target: &SshTarget, remote_command: &str) -> Vec<String> {
+        argv_with(target, remote_command, &TransportSpec::Ssh)
+    }
+
+    /// Args of the built command under an explicit transport spec (hermetic: never reads the
+    /// caller's real config).
+    fn argv_with(
+        target: &SshTarget,
+        remote_command: &str,
+        transport: &TransportSpec,
+    ) -> Vec<String> {
         target
-            .command(remote_command)
+            .build_command(remote_command, transport)
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// `(program, args)` of the built command under an explicit transport spec.
+    fn program_and_argv(
+        target: &SshTarget,
+        remote_command: &str,
+        transport: &TransportSpec,
+    ) -> (String, Vec<String>) {
+        let command = target.build_command(remote_command, transport);
+        let program = command.get_program().to_string_lossy().into_owned();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        (program, args)
     }
 
     #[test]
@@ -2649,6 +3834,1390 @@ mod tests {
                 "x"
             ]
         );
+    }
+
+    #[test]
+    fn custom_transport_swaps_program_and_expands_placeholders() {
+        let transport = TransportSpec::Custom {
+            program: "autossh".into(),
+            args: vec![
+                "-M".into(),
+                "0".into(),
+                "{options}".into(),
+                "-T".into(),
+                "{host}".into(),
+                "{remote_command}".into(),
+            ],
+        };
+        let target = SshTarget::new("iq-64", vec!["-p".into(), "2222".into()]);
+        let (program, argv) = program_and_argv(&target, "uname -s", &transport);
+        assert_eq!(program, "autossh");
+        // {options} expands inline to each option as its own arg; no -T/timeout/forwarding
+        // options are injected for a custom transport — the template owns the argv.
+        assert_eq!(argv, ["-M", "0", "-p", "2222", "-T", "iq-64", "uname -s"]);
+    }
+
+    #[test]
+    fn custom_transport_options_token_expands_to_zero_args_when_empty() {
+        let transport = TransportSpec::Custom {
+            program: "ssh".into(),
+            args: vec![
+                "{options}".into(),
+                "{host}".into(),
+                "{remote_command}".into(),
+            ],
+        };
+        let argv = argv_with(&SshTarget::bare("iq-64"), "x", &transport);
+        assert_eq!(argv, ["iq-64", "x"]);
+    }
+
+    #[test]
+    fn custom_transport_substitutes_within_a_token() {
+        // {host}/{remote_command} are substring-substituted, so a template can wrap them.
+        let transport = TransportSpec::Custom {
+            program: "wrapper".into(),
+            args: vec!["ssh://{host}".into(), "exec {remote_command}".into()],
+        };
+        let argv = argv_with(&SshTarget::bare("iq-64"), "herdr bridge", &transport);
+        assert_eq!(argv, ["ssh://iq-64", "exec herdr bridge"]);
+    }
+
+    #[test]
+    fn ssh_target_command_uses_snapshotted_transport() {
+        // `command()` must use the transport snapshotted on the target, not re-resolve config each
+        // build, so every step of one remote operation runs the same transport.
+        let target = SshTarget {
+            destination: "iq-64".into(),
+            options: vec!["-p".into(), "2222".into()],
+            transport: TransportSpec::Custom {
+                program: "autossh".into(),
+                args: vec![
+                    "{options}".into(),
+                    "{host}".into(),
+                    "{remote_command}".into(),
+                ],
+            },
+        };
+        let command = target.command("uname -s");
+        assert_eq!(command.get_program().to_string_lossy(), "autossh");
+        let argv: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(argv, ["-p", "2222", "iq-64", "uname -s"]);
+    }
+
+    #[test]
+    fn transport_spec_from_config_defaults_to_ssh() {
+        let remote = crate::config::model::RemoteConfig::default();
+        assert_eq!(
+            TransportSpec::from_config(&remote),
+            TransportResolution::Spec(TransportSpec::Ssh)
+        );
+    }
+
+    #[test]
+    fn transport_spec_from_config_rejects_blank_program() {
+        // A present [remote.transport] with a blank or omitted program is a malformed custom
+        // transport (Invalid), not "no transport" (Spec(Ssh)): it must not silently downgrade to ssh.
+        for program in ["   ", ""] {
+            let remote = crate::config::model::RemoteConfig {
+                transport: Some(crate::config::model::RemoteTransportConfig {
+                    program: program.into(),
+                    args: vec!["{host}".into(), "{remote_command}".into()],
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                TransportSpec::from_config(&remote),
+                TransportResolution::Invalid
+            );
+        }
+    }
+
+    #[test]
+    fn transport_spec_from_config_uses_custom_program() {
+        let remote = crate::config::model::RemoteConfig {
+            transport: Some(crate::config::model::RemoteTransportConfig {
+                program: "autossh".into(),
+                args: vec!["{host}".into(), "{remote_command}".into()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            TransportSpec::from_config(&remote),
+            TransportResolution::Spec(TransportSpec::Custom {
+                program: "autossh".into(),
+                args: vec!["{host}".into(), "{remote_command}".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn transport_spec_from_config_trims_program() {
+        // The empty-program guard trims, so a padded-but-nonblank program must be stored trimmed
+        // too — otherwise `program = "autossh "` passes the guard then fails to spawn.
+        let remote = crate::config::model::RemoteConfig {
+            transport: Some(crate::config::model::RemoteTransportConfig {
+                program: "  autossh  ".into(),
+                args: vec!["{host}".into(), "{remote_command}".into()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            TransportSpec::from_config(&remote),
+            TransportResolution::Spec(TransportSpec::Custom {
+                program: "autossh".into(),
+                args: vec!["{host}".into(), "{remote_command}".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn transport_spec_from_config_rejects_template_without_remote_command() {
+        // A template that never runs the remote command would stream the herdr payload (incl. the
+        // install binary) into a bare shell/wrapper stdin; report it invalid so the resolver keeps
+        // the last valid transport rather than failing open to ssh.
+        let remote = crate::config::model::RemoteConfig {
+            transport: Some(crate::config::model::RemoteTransportConfig {
+                program: "ssh".into(),
+                args: vec!["{host}".into()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            TransportSpec::from_config(&remote),
+            TransportResolution::Invalid
+        );
+    }
+
+    #[test]
+    fn resolved_transport_keeps_last_valid_on_config_parse_error() {
+        // nextest runs each test in its own process, so the HERDR_CONFIG_PATH env var and the
+        // last-valid static inside resolved_transport are isolated from other tests.
+        let dir = std::env::temp_dir().join(format!("herdr-transport-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+
+        let valid = TransportSpec::Custom {
+            program: "autossh".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
+        // A valid custom transport resolves and is remembered as last-valid.
+        assert_eq!(resolve_transport().expect("transport resolves"), valid);
+
+        // A later malformed edit that still declares the transport must not silently downgrade the
+        // active transport to ssh: resolution keeps the last valid spec. (The config remains
+        // unparseable here — unterminated array — but the `[remote.transport]` stanza is present.)
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\n",
+        )
+        .expect("write broken config that still declares transport");
+        assert_eq!(resolve_transport().expect("transport resolves"), valid);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolved_transport_keeps_last_valid_on_invalid_template() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-tmpl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+
+        let valid = TransportSpec::Custom {
+            program: "autossh".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
+        assert_eq!(resolve_transport().expect("transport resolves"), valid);
+
+        // A syntactically valid edit whose transport template drops `{remote_command}` is a
+        // configured-but-invalid transport: keep the last valid spec rather than failing open to
+        // ssh, so a wrapper/fixed-host transport used as a routing boundary is not bypassed.
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\"]\n",
+        )
+        .expect("write invalid-template config");
+        assert_eq!(resolve_transport().expect("transport resolves"), valid);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolved_transport_keeps_last_valid_on_invalid_remote_section() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir =
+            std::env::temp_dir().join(format!("herdr-transport-section-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+
+        let valid = TransportSpec::Custom {
+            program: "autossh".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
+        assert_eq!(resolve_transport().expect("transport resolves"), valid);
+
+        // Valid TOML whose `[remote]` section fails to deserialize (bool field given a string) while
+        // still declaring the transport: load_live_config returns Ok with `remote` in
+        // invalid_sections and config.remote default. The transport must be kept, not overwritten
+        // with ssh derived from the default section.
+        std::fs::write(
+            &cfg,
+            "[remote]\nmanage_ssh_config = \"nope\"\n[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write invalid remote section that still declares transport");
+        assert_eq!(resolve_transport().expect("transport resolves"), valid);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_errors_on_invalid_template_without_prior_valid() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-err-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // A custom transport configured but invalid (no `{remote_command}`) with no prior valid
+        // transport must fail closed — refuse the operation rather than silently using ssh and
+        // bypassing the configured transport.
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"ssh\"\nargs = [\"{host}\"]\n",
+        )
+        .expect("write invalid-template config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+
+        assert!(resolve_transport().is_err());
+        assert!(crate::remote::SshTarget::resolved("iq-64", Vec::new()).is_err());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_errors_on_invalid_custom_after_default_ssh() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-dflt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // First resolve under a no-transport config: valid result is built-in ssh.
+        std::fs::write(&cfg, "[remote]\nmanage_ssh_config = true\n").expect("write default config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(
+            resolve_transport().expect("default resolves"),
+            TransportSpec::Ssh
+        );
+
+        // Now add an invalid custom transport. A cached default ssh must NOT satisfy the fallback:
+        // the operation fails closed instead of silently routing the new custom config over ssh.
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"ssh\"\nargs = [\"{host}\"]\n",
+        )
+        .expect("write invalid-template config");
+        assert!(resolve_transport().is_err());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_errors_on_unparseable_config_declaring_transport() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-unp1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // Config declares [remote.transport] but has a TOML syntax error (unterminated array), so
+        // load_live_config returns Err and the structured transport is unavailable. With no prior
+        // valid transport, fail closed rather than routing the configured transport over ssh.
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\n",
+        )
+        .expect("write unparseable config with transport");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_fails_closed_on_spaced_transport_header_with_invalid_remote() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-sp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // `[remote]` fails to deserialize (bool given a string) but the raw TOML still parses, and
+        // declares the transport with a spaced table header. The structural check must detect it
+        // and fail closed rather than routing over ssh.
+        std::fs::write(
+            &cfg,
+            "[remote]\nmanage_ssh_config = \"bad\"\n[ remote.transport ]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write spaced-header config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_fails_closed_on_inline_transport_with_invalid_remote() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-il-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // `[remote]` fails to deserialize but declares an inline `transport = { ... }`. The
+        // structural check must detect the nested transport field and fail closed.
+        std::fs::write(
+            &cfg,
+            "[remote]\nmanage_ssh_config = \"bad\"\ntransport = { program = \"autossh\", args = [\"{host}\", \"{remote_command}\"] }\n",
+        )
+        .expect("write inline-transport config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_drops_cached_custom_on_legible_removal_not_unparseable() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        let custom = TransportSpec::Custom {
+            program: "autossh".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(resolve_transport().expect("custom resolves"), custom);
+
+        // An UNPARSEABLE config that no longer shows the transport must NOT drop the boundary to ssh:
+        // a truncated / partially written file can hide a still-intended `[remote.transport]`, so the
+        // best-effort "no transport" scan is not authoritative. Keep the last valid custom transport
+        // (fail closed), matching the loader's keep-current behavior for a bad config (codex-13-1).
+        std::fs::write(&cfg, "oops = = broken\n").expect("write transport-less broken config");
+        assert_eq!(
+            resolve_transport().expect("keeps custom on unparseable config"),
+            custom
+        );
+
+        // A *legible* removal — a cleanly parsing config with no `[remote.transport]` — is
+        // authoritative: fall back to ssh (the transport was genuinely removed).
+        std::fs::write(&cfg, "onboarding = false\n").expect("write valid transport-less config");
+        assert_eq!(
+            resolve_transport().expect("ssh on legible removal"),
+            TransportSpec::Ssh
+        );
+
+        // After that legible removal (cache now ssh, not the old custom), adding an invalid custom
+        // transport must fail closed — the stale custom must not be resurrected.
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"autossh\"\nargs = [\"{host}\"]\n",
+        )
+        .expect("write invalid-template config");
+        assert!(resolve_transport().is_err());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_keeps_custom_when_config_path_is_unreadable() {
+        // A present-but-unreadable config path (here routed through a regular file → ENOTDIR, so
+        // `Path::exists()` is false) must not let `load_live_config`'s default-on-absence path resolve
+        // ssh and bypass the fail-closed custom transport boundary (codex-1-1). With a prior valid
+        // custom transport cached, resolution keeps it instead of silently downgrading to ssh.
+        let dir =
+            std::env::temp_dir().join(format!("herdr-transport-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        let custom = TransportSpec::Custom {
+            program: "corp-proxy".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"corp-proxy\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(resolve_transport().expect("custom resolves"), custom);
+
+        // Point the config path through a regular file so any read/stat fails with ENOTDIR and
+        // `Path::exists()` returns false — the exact case load_live_config's old exists() short-circuit
+        // mistook for "absent".
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let unreadable = blocker.join("config.toml");
+        assert!(
+            !unreadable.exists(),
+            "Path::exists() is false for this path"
+        );
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &unreadable);
+        assert_eq!(
+            resolve_transport().expect("keeps custom, never ssh"),
+            custom,
+            "an unreadable config path must fail closed, not fall open to ssh"
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_keeps_custom_on_invalid_remote_section_without_transport() {
+        // A typed-invalid `[remote]` section (parses as TOML, but the section fails to deserialize)
+        // that no longer shows a transport key is NOT a legible removal — it's a degraded/broken
+        // config. It must not authoritatively fall open to ssh over a previously valid custom
+        // transport; keep the custom (fail closed) until the config is valid again (codex-1-1).
+        let dir =
+            std::env::temp_dir().join(format!("herdr-transport-badremote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        let custom = TransportSpec::Custom {
+            program: "corp-proxy".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"corp-proxy\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(resolve_transport().expect("custom resolves"), custom);
+
+        // `manage_ssh_config` is a bool; a string value makes the whole `[remote]` section fail to
+        // deserialize (recorded in `invalid_sections`) while the TOML still parses. No transport key.
+        std::fs::write(&cfg, "[remote]\nmanage_ssh_config = \"bad\"\n")
+            .expect("write invalid [remote] section");
+        assert_eq!(
+            resolve_transport().expect("keeps custom, never ssh"),
+            custom,
+            "an invalid [remote] section without a transport key must fail closed, not fall to ssh"
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_keeps_custom_on_unparseable_config_without_visible_transport() {
+        // Direct regression for codex-13-1: a valid custom transport, then a fully unparseable config
+        // whose (best-effort) scan shows no transport at all, must keep the custom transport rather
+        // than silently routing remote operations over built-in ssh and bypassing the user's
+        // wrapper/proxy boundary during a transient bad edit.
+        let dir =
+            std::env::temp_dir().join(format!("herdr-transport-unparse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        let custom = TransportSpec::Custom {
+            program: "corp-proxy".into(),
+            args: vec!["{host}".into(), "{remote_command}".into()],
+        };
+        std::fs::write(
+            &cfg,
+            "[remote.transport]\nprogram = \"corp-proxy\"\nargs = [\"{host}\", \"{remote_command}\"]\n",
+        )
+        .expect("write valid config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(resolve_transport().expect("custom resolves"), custom);
+
+        // Truncated mid-edit: valid up to a point, then cut off (unparseable) and missing the whole
+        // `[remote.transport]` stanza the scan would need to see.
+        std::fs::write(&cfg, "onboarding = false\n[remote\n").expect("write truncated config");
+        assert_eq!(
+            resolve_transport().expect("keeps custom, never ssh"),
+            custom,
+            "an unparseable config with no visible transport must not downgrade to ssh"
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_declares_transport_is_unknown_on_a_non_notfound_read_error() {
+        // A read error that is NOT "file absent" must fail closed as Unknown, not be misclassified as
+        // No via `Path::exists()` (which also returns false for such errors) — otherwise a
+        // permission/IO problem would fall open to ssh (copilot-2). Model a non-`NotFound` error
+        // portably by routing the config path *through a regular file*, so the read fails with
+        // `ENOTDIR` and `Path::exists()` returns false.
+        let dir = std::env::temp_dir().join(format!("herdr-cfg-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let cfg = blocker.join("config.toml"); // traverses through a file → ENOTDIR on read
+        assert!(
+            std::fs::read_to_string(&cfg).is_err(),
+            "reading through a file must error"
+        );
+        assert!(
+            !cfg.exists(),
+            "Path::exists() is false for this non-NotFound error"
+        );
+
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(
+            config_declares_transport(),
+            TransportDeclared::Unknown,
+            "a present-but-unreadable config must fail closed as Unknown, not No"
+        );
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_declares_transport_is_no_when_the_file_is_absent() {
+        // The genuine "no config file" case (NotFound) still reports No so a user who never
+        // configured a custom transport is not forced into a fail-closed error.
+        let dir = std::env::temp_dir().join(format!("herdr-cfg-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("does-not-exist.toml");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(config_declares_transport(), TransportDeclared::No);
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_toml_inline_comment_is_quote_aware() {
+        assert_eq!(strip_toml_inline_comment("a = 1 # c"), "a = 1 ");
+        assert_eq!(strip_toml_inline_comment("# whole line"), "");
+        assert_eq!(
+            strip_toml_inline_comment("no comment here"),
+            "no comment here"
+        );
+        // A `#` inside a basic or literal string is not a comment.
+        assert_eq!(strip_toml_inline_comment("x = \"a#b\""), "x = \"a#b\"");
+        assert_eq!(strip_toml_inline_comment("y = 'a#b' # c"), "y = 'a#b' ");
+    }
+
+    #[test]
+    fn config_declares_transport_ignores_inline_comment_in_text_scan() {
+        // An unparseable config whose only mention of remote/transport is in an inline comment must
+        // not be scanned as declaring a transport — otherwise the catch-all fails closed spuriously
+        // (copilot-C). The trailing `[broken` keeps the file unparseable so the text-scan path runs.
+        let dir = std::env::temp_dir().join(format!("herdr-cfg-comment-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, "onboarding = false # remote transport\n[broken\n")
+            .expect("write config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(config_declares_transport(), TransportDeclared::No);
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_declares_transport_still_detects_a_declaration_with_a_trailing_comment() {
+        // Stripping inline comments must not cause a false negative: a real `[remote.transport]` with
+        // a trailing comment, in an unparseable file, is still detected (fail closed).
+        let dir =
+            std::env::temp_dir().join(format!("herdr-cfg-decl-comment-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // Unterminated array → unparseable → text-scan path; header has a trailing comment.
+        std::fs::write(
+            &cfg,
+            "[remote.transport] # my proxy\nprogram = \"x\"\nargs = [\n",
+        )
+        .expect("write config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(config_declares_transport(), TransportDeclared::Yes);
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_fails_closed_on_unparseable_config_with_dotted_transport() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-dot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // Transport declared via top-level dotted keys, plus a TOML syntax error elsewhere so the
+        // structured parse fails and the fallback scan must still detect the declaration.
+        std::fs::write(
+            &cfg,
+            "remote.transport.program = \"autossh\"\nremote.transport.args = [\"{host}\", \"{remote_command}\"]\noops = = broken\n",
+        )
+        .expect("write dotted-transport unparseable config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_fails_closed_on_unparseable_config_with_inline_transport() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-inl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // Transport declared via a top-level inline table, plus a TOML syntax error elsewhere so the
+        // structured parse fails and the fallback scan must still detect the declaration.
+        std::fs::write(
+            &cfg,
+            "remote = { transport = { program = \"corp-wrapper\", args = [\"{host}\", \"{remote_command}\"] } }\noops = = broken\n",
+        )
+        .expect("write inline-transport unparseable config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_fails_closed_on_unparseable_config_with_dotted_subkey_transport() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-sub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // Transport declared with a dotted subkey under [remote], plus a TOML syntax error so the
+        // structured parse fails and the fallback scan must still detect the declaration.
+        std::fs::write(
+            &cfg,
+            "[remote]\ntransport.program = \"autossh\"\ntransport.args = [\"{host}\", \"{remote_command}\"]\noops = = broken\n",
+        )
+        .expect("write dotted-subkey unparseable config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_fails_closed_on_unreadable_config() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-unr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // Point the config path at a directory: read_to_string fails (present but unreadable), so
+        // a configured transport cannot be ruled out and the resolver must fail closed, not ssh.
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &dir);
+        assert!(resolve_transport().is_err());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_transport_defaults_ssh_on_unparseable_config_without_transport() {
+        // nextest isolates each test in its own process (own env var + own last-valid static).
+        let dir = std::env::temp_dir().join(format!("herdr-transport-unp2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg = dir.join("config.toml");
+        // A config that fails to parse but declares no transport must not break `--remote` for the
+        // common no-transport user: fall back to built-in ssh.
+        std::fs::write(&cfg, "oops = = broken\n").expect("write unparseable config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &cfg);
+        assert_eq!(
+            resolve_transport().expect("ssh default"),
+            TransportSpec::Ssh
+        );
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_to_capped_tail_until_retains_only_the_last_bytes() {
+        // A transport that emits more output than the cap must not grow memory: only the tail is
+        // kept, and it is the LAST bytes (for the failure message), not the head. A Cursor reads to
+        // EOF without blocking, exercising the cap path of the deadline-aware drain.
+        let data: Vec<u8> = (0..20_000u32).map(|byte| byte as u8).collect();
+        let (tail, hit_deadline) = read_to_capped_tail_until(
+            &mut std::io::Cursor::new(data.clone()),
+            4096,
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(!hit_deadline);
+        assert_eq!(tail.len(), 4096);
+        assert_eq!(tail, &data[data.len() - 4096..]);
+    }
+
+    #[test]
+    fn read_to_capped_tail_until_returns_at_deadline_under_continuous_output() {
+        // A descendant that escaped the process group could emit continuously (read() always returns
+        // data, never WouldBlock/EOF). The drain must still return at the deadline instead of looping
+        // forever.
+        struct EndlessReader;
+        impl io::Read for EndlessReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                buf.iter_mut().for_each(|byte| *byte = b'x');
+                Ok(buf.len())
+            }
+        }
+        let start = Instant::now();
+        let (data, hit_deadline) =
+            read_to_capped_tail_until(&mut EndlessReader, 4096, start + Duration::from_millis(200));
+        assert!(
+            hit_deadline,
+            "continuous output past the deadline must report a timeout"
+        );
+        assert_eq!(data.len(), 4096, "output stays capped");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return at the deadline, not loop forever on flowing data"
+        );
+    }
+
+    #[test]
+    fn read_to_capped_tail_until_keeps_small_output_intact() {
+        let (tail, hit_deadline) = read_to_capped_tail_until(
+            &mut std::io::Cursor::new(b"boom".to_vec()),
+            4096,
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(!hit_deadline);
+        assert_eq!(tail, b"boom");
+    }
+
+    #[test]
+    fn read_to_capped_tail_until_returns_at_deadline_when_pipe_stays_open() {
+        // Model an escaped descendant holding the pipe: the write end is kept open so the read end
+        // never sees EOF. The non-blocking deadline-aware drain must return `hit_deadline = true`
+        // shortly after the deadline instead of parking forever.
+        use std::os::unix::io::AsRawFd as _;
+        let (mut reader, _writer) =
+            std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        set_nonblocking(reader.as_raw_fd()).expect("set non-blocking");
+        let start = Instant::now();
+        let (data, hit_deadline) =
+            read_to_capped_tail_until(&mut reader, 4096, start + Duration::from_millis(200));
+        assert!(
+            hit_deadline,
+            "an open pipe past the deadline must report a timeout"
+        );
+        assert!(data.is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return shortly after the deadline, not park on the open pipe"
+        );
+        // Some data already buffered before the deadline is still retained.
+        // (_writer dropped here closes the write end.)
+    }
+
+    #[test]
+    fn read_to_capped_tail_until_returns_eof_data_before_deadline() {
+        let (mut reader, mut writer) =
+            std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        use std::io::Write as _;
+        use std::os::unix::io::AsRawFd as _;
+        writer.write_all(b"hello").expect("write");
+        drop(writer); // close write end → reader sees EOF after "hello"
+        set_nonblocking(reader.as_raw_fd()).expect("set non-blocking");
+        let (data, hit_deadline) =
+            read_to_capped_tail_until(&mut reader, 4096, Instant::now() + Duration::from_secs(5));
+        assert!(
+            !hit_deadline,
+            "EOF before the deadline must not report a timeout"
+        );
+        assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn read_to_capped_tail_until_treats_an_unexpected_error_as_timeout_not_eof() {
+        // A hard read error must not masquerade as a clean EOF: in run_bounded_output that would end
+        // the reader early, stop the watchdog, and let the unbounded post-reader wait hang on a stuck
+        // child. It must keep trying until the deadline, then report hit_deadline = true (copilot-11).
+        struct ErroringReader;
+        impl io::Read for ErroringReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("boom"))
+            }
+        }
+        let start = Instant::now();
+        let (data, hit_deadline) = read_to_capped_tail_until(
+            &mut ErroringReader,
+            4096,
+            start + Duration::from_millis(150),
+        );
+        assert!(
+            hit_deadline,
+            "an unexpected read error must be bounded by the deadline, not reported as clean EOF"
+        );
+        assert!(data.is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return near the deadline, not spin"
+        );
+    }
+
+    #[test]
+    fn read_to_capped_tail_until_stop_returns_when_stopped_with_pipe_open() {
+        // A failed install joins the stderr reader for its error tail, but a descendant that escaped
+        // the process group can hold stderr open so EOF never arrives — the reader's own deadline is
+        // the 300s install cap. The failure path sets `stop` after a short window; the drain must
+        // then return promptly (with whatever it buffered) instead of parking to the deadline
+        // (codex-9-1). A far deadline here proves only `stop` ends it.
+        use std::io::Write as _;
+        use std::os::unix::io::AsRawFd as _;
+        let (mut reader, mut writer) =
+            std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        writer.write_all(b"boom").expect("write buffered stderr");
+        set_nonblocking(reader.as_raw_fd()).expect("set non-blocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            read_to_capped_tail_until_stop(
+                &mut reader,
+                4096,
+                Instant::now() + Duration::from_secs(300),
+                &thread_stop,
+            )
+        });
+        thread::sleep(Duration::from_millis(100)); // let it drain "boom" then park (writer still open)
+        let start = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        let tail = worker.join().expect("worker joins");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return shortly after stop, not park to the install deadline"
+        );
+        assert_eq!(tail, b"boom", "buffered stderr is still returned");
+        drop(writer); // (held open above to keep the read end from seeing EOF)
+    }
+
+    #[test]
+    fn copy_flush_until_stop_returns_when_stopped_with_pipe_open() {
+        // Model an escaped descendant holding the bridge pipe: the write end stays open so the read
+        // end never sees EOF and no data ever arrives. Setting the stop flag must unblock the copy
+        // within one poll interval instead of parking on the open pipe forever (codex-5-1).
+        use std::os::unix::io::AsRawFd as _;
+        let (mut reader, _writer) =
+            std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        let reader_fd = reader.as_raw_fd();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            let mut sink = Vec::new();
+            // Vec sink never blocks, so the writer fd is unused (-1).
+            copy_flush_until_stop(&mut reader, reader_fd, &mut sink, -1, &thread_stop)
+        });
+        // Let the copy loop settle into its poll wait, then request teardown.
+        thread::sleep(Duration::from_millis(100));
+        let start = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        let result = worker.join().expect("worker joins");
+        assert!(result.is_ok(), "stopped copy returns Ok, not an error");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return shortly after stop, not park on the open pipe"
+        );
+        // (_writer dropped here closes the write end.)
+    }
+
+    #[test]
+    fn copy_flush_until_stop_copies_until_eof() {
+        // Without the stop flag set, it behaves like `copy_flush`: drains all data, stops at EOF.
+        use std::io::Write as _;
+        use std::os::unix::io::AsRawFd as _;
+        let (mut reader, mut writer) =
+            std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        writer.write_all(b"payload").expect("write");
+        drop(writer); // close write end → reader sees EOF after "payload"
+        let reader_fd = reader.as_raw_fd();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut sink = Vec::new();
+        // Vec sink never blocks, so the writer fd is unused (-1).
+        let copied = copy_flush_until_stop(&mut reader, reader_fd, &mut sink, -1, &stop)
+            .expect("copy succeeds");
+        assert_eq!(copied, 7);
+        assert_eq!(sink, b"payload");
+    }
+
+    #[test]
+    fn write_all_until_stop_returns_when_stopped_with_wedged_writer() {
+        // Model a transport (or escaped descendant) that stops draining stdin: fill a non-blocking
+        // writer's buffer so further writes `WouldBlock`, hold the read end open without reading, then
+        // set the stop flag. The write must return `Ok(true)` (stopped) within a poll interval instead
+        // of parking forever — the write-side half of the bridge teardown bound (codex-7-1).
+        use std::io::Write as _;
+        use std::os::unix::io::AsRawFd as _;
+        let (reader_never_drains, mut writer) =
+            std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        let writer_fd = writer.as_raw_fd();
+        set_nonblocking(writer_fd).expect("set non-blocking");
+        // Fill the socket send buffer so the next write backpressures.
+        let filler = [0_u8; 65536];
+        loop {
+            match writer.write(&filler) {
+                Ok(_) => continue,
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => panic!("unexpected fill error: {err}"),
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            let payload = [1_u8; 4096];
+            write_all_until_stop(&mut writer, writer_fd, &payload, &thread_stop)
+        });
+        thread::sleep(Duration::from_millis(100)); // let it park in the POLLOUT wait
+        let start = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        let result = worker.join().expect("worker joins");
+        assert!(
+            matches!(result, Ok(true)),
+            "a stopped wedged write must report early stop, got {result:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return shortly after stop, not park on the wedged writer"
+        );
+        drop(reader_never_drains);
+    }
+
+    #[test]
+    fn install_remote_herdr_reaps_a_lingering_custom_transport() {
+        // End-to-end install over a custom transport that runs the install script LOCALLY, then
+        // lingers before exiting — modelling a transport that consumed the whole payload but is slow
+        // to exit. The post-upload reap must observe the exit and return the real status via the
+        // heartbeat-aware `try_wait` loop (codex-8-1), not a bare `child.wait()`, and the binary must
+        // land intact. HOME is redirected so the script installs into a temp dir; nextest runs each
+        // test in its own process, so mutating HOME here is isolated (same pattern as the config
+        // tests above).
+        let tmp = std::env::temp_dir().join(format!("herdr-install-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create temp HOME");
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+
+        let payload = vec![0xAB_u8; 4096];
+        let source = tmp.join("herdr-source");
+        std::fs::write(&source, &payload).expect("write source binary");
+
+        // `program` runs the remote command locally, then sleeps briefly so the transport child
+        // outlives the install itself — exercising the reap loop's `try_wait` polling.
+        let target = SshTarget {
+            destination: "unused-host".into(),
+            options: vec![],
+            transport: TransportSpec::Custom {
+                program: "sh".into(),
+                args: vec!["-c".into(), "{remote_command}; sleep 0.3".into()],
+            },
+        };
+        let remote_herdr =
+            RemoteHerdr::for_install_suffix(RemotePlatform::local(), ".local/bin/herdr-e2e".into());
+
+        let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let beats_sink = Arc::clone(&beats);
+        let progress = move |_stage: RemoteProvisionStage| {
+            beats_sink.fetch_add(1, Ordering::SeqCst);
+        };
+
+        let start = Instant::now();
+        let result = install_remote_herdr(&target, &remote_herdr, &source, &progress);
+        let elapsed = start.elapsed();
+
+        // Restore HOME before asserting so a failure doesn't leak the override into later work.
+        match prev_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(result.is_ok(), "install should succeed: {result:?}");
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "reap loop must return once the lingering transport exits, not park indefinitely"
+        );
+        let installed = tmp.join(".local/bin/herdr-e2e");
+        let got = std::fs::read(&installed).expect("installed binary readable");
+        assert_eq!(got, payload, "installed bytes must match the source binary");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn watchdog_poll_detects_local_hangup_independent_of_upload() {
+        // The bridge watchdog can't rely on the upload thread setting `local_closed`: a transport
+        // that stops reading stdin parks upload in `write_all`, so it never reaches read-side EOF
+        // (codex-6-1). The watchdog instead polls the local socket for a hangup. Guard that signal:
+        // an open, idle peer must NOT report a hangup, and a closed peer MUST — within one poll
+        // window — so teardown fires even while upload is wedged. `events` includes `POLLIN` because
+        // macOS reports nothing for `events = 0`.
+        use std::os::unix::io::AsRawFd as _;
+        let (watched, peer) = std::os::unix::net::UnixStream::pair().expect("create socket pair");
+        let watched_fd = watched.as_raw_fd();
+        let poll_hangup = |timeout_ms: libc::c_int| -> bool {
+            let mut poll_fd = libc::pollfd {
+                fd: watched_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+            ready > 0 && (poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+        };
+
+        assert!(
+            !poll_hangup(100),
+            "an open idle peer must not look like a hangup"
+        );
+        drop(peer); // client disconnects
+        let start = Instant::now();
+        assert!(
+            poll_hangup(500),
+            "a closed peer must report a hangup so the watchdog can fire while upload is parked"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "hangup must be detected promptly, not after a long park"
+        );
+    }
+
+    #[test]
+    fn install_script_rejects_a_truncated_payload_without_replacing_dest() {
+        // Run the generated install script locally with a HOME override, feeding FEWER bytes than
+        // expected (a transport that closed stdin early). It must exit non-zero and leave any
+        // existing binary untouched.
+        let dir = std::env::temp_dir().join(format!("herdr-install-trunc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp HOME");
+        let dest = dir.join(".local/bin/herdr");
+        std::fs::create_dir_all(dest.parent().unwrap()).expect("create bin dir");
+        std::fs::write(&dest, b"OLD-GOOD-BINARY").expect("seed existing binary");
+
+        let script = build_install_script(".local/bin/herdr", 100); // expect 100 bytes
+        let output = std::process::Command::new("sh")
+            .arg("-eu")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write as _;
+                child.stdin.take().unwrap().write_all(b"only-a-few-bytes")?; // < 100
+                child.wait_with_output()
+            })
+            .expect("run install script");
+
+        assert!(
+            !output.status.success(),
+            "truncated payload must fail the install"
+        );
+        assert_eq!(
+            std::fs::read(&dest).expect("dest still present"),
+            b"OLD-GOOD-BINARY",
+            "existing binary must not be replaced by a truncated payload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_script_replaces_dest_on_a_complete_payload() {
+        let dir = std::env::temp_dir().join(format!("herdr-install-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp HOME");
+        let payload = b"NEW-COMPLETE-BINARY";
+        let script = build_install_script(".local/bin/herdr", payload.len() as u64);
+        let output = std::process::Command::new("sh")
+            .arg("-eu")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write as _;
+                child.stdin.take().unwrap().write_all(payload)?;
+                child.wait_with_output()
+            })
+            .expect("run install script");
+
+        assert!(output.status.success(), "a complete payload must install");
+        assert_eq!(
+            std::fs::read(dir.join(".local/bin/herdr")).expect("dest written"),
+            payload
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_bounded_output_kills_a_hung_command() {
+        // A custom transport that never exits (here: a subshell that sleeps) must be killed at the
+        // deadline rather than hanging the probe and leaking the process.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 600");
+        let start = Instant::now();
+        let result = run_bounded_output(command, Duration::from_millis(200));
+        let err = result.expect_err("a hung command must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must return promptly after the deadline, not wait for the command"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_drains_chatty_output_without_timing_out() {
+        // A healthy command that writes far more than the OS pipe buffer then exits must succeed:
+        // the pipes are drained concurrently, so the child is never blocked into the deadline+kill.
+        // (Before concurrent draining this deadlocked and was wrongly reported as a timeout.)
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("yes | head -c 200000; exit 0");
+        let output = run_bounded_output(command, Duration::from_secs(10))
+            .expect("a chatty but healthy command must succeed");
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout.len(),
+            PROBE_OUTPUT_CAP,
+            "stdout should be retained up to the cap"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_times_out_when_a_descendant_holds_the_pipe() {
+        // The direct child exits immediately but backgrounds a descendant that inherited the pipes.
+        // The deadline must still fire (killing the whole group) instead of the reader joins
+        // blocking forever waiting for EOF from the lingering descendant.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 600 &");
+        let start = Instant::now();
+        let result = run_bounded_output(command, Duration::from_millis(300));
+        let err = result.expect_err("a descendant holding the pipe must hit the deadline");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must return shortly after the deadline, not hang on the reader join"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_kills_pipe_holding_descendant_on_timeout() {
+        // Liveness, not just the timeout error: the direct child exits immediately but backgrounds an
+        // in-group descendant that holds stdout open. The readers reach the deadline and `done` is
+        // set, which can make the watchdog skip its own kill (deadline race) — so the cleanup must
+        // SIGKILL the group unconditionally, or the descendant leaks across retrying probes
+        // (codex-10-1). Prove the backgrounded `sleep` is gone after the call returns.
+        let pidfile =
+            std::env::temp_dir().join(format!("herdr-bounded-descendant-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        // `$!` is the backgrounded sleep's pid; it inherits the piped stdout and outlives the shell.
+        let script = format!("sleep 600 & echo $! > '{}'; exit 0", pidfile.display());
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&script);
+        let start = Instant::now();
+        let result = run_bounded_output(command, Duration::from_millis(300));
+        assert_eq!(
+            result.expect_err("held-open stdout must time out").kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "returns near the deadline"
+        );
+
+        let descendant: i32 = std::fs::read_to_string(&pidfile)
+            .expect("pidfile written")
+            .trim()
+            .parse()
+            .expect("descendant pid parses");
+        // `kill(pid, 0)` succeeds while the process exists (even as a zombie) and fails with ESRCH
+        // once it is gone/reaped. Poll briefly since SIGKILL + reparent-reap is asynchronous.
+        let mut alive = true;
+        for _ in 0..100 {
+            if unsafe { libc::kill(descendant, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if alive {
+            // Cleanup guard so a regression doesn't leak a 600s sleep.
+            unsafe {
+                libc::kill(descendant, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(
+            !alive,
+            "the pipe-holding descendant must be killed with the group after a timeout"
+        );
+    }
+
+    #[test]
+    fn non_reaping_wait_helpers_detect_exit_then_allow_a_clean_reap() {
+        // The reuse-safe cleanup detects the child's exit WITHOUT reaping it (so its pid — and thus
+        // the group id — stays reserved for a safe `kill(-pid)`), then reaps with `Child::wait`.
+        // Guard the primitives: the poll reports "running" before exit and "exited" after, the
+        // blocking success-peek reports the real success/failure, and the later reap still yields the
+        // real status with no double-reap or lost zombie (codex-11-1 / codex-14-1).
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.2; exit 7")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id() as i32;
+        assert!(
+            !child_exited_without_reaping(pid).expect("poll running child"),
+            "a still-running child must not report exited"
+        );
+        assert!(
+            !wait_exit_success_without_reaping(pid)
+                .expect("non-reaping success peek returns on exit"),
+            "a nonzero exit must not report success"
+        );
+        assert!(
+            child_exited_without_reaping(pid).expect("poll exited child"),
+            "an exited-but-unreaped child must report exited"
+        );
+        let status = child.wait().expect("reap the preserved zombie");
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "the real exit status survives the non-reaping waits"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_leaves_a_clean_success_background_helper_alive() {
+        // A valid transport may background an in-group helper that closes its stdio (e.g. a
+        // ControlPersist-style master), then exit 0. On a clean, non-timed-out probe there is no held
+        // pipe to clean up, so the cleanup must NOT SIGKILL the group — doing so would destroy that
+        // helper on every normal probe (codex-12-1). Verify the helper survives a successful probe.
+        let pidfile =
+            std::env::temp_dir().join(format!("herdr-bounded-helper-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        // The helper redirects its stdio away from the probe pipes, so stdout hits EOF immediately and
+        // the probe completes successfully (no deadline, no watchdog kill).
+        let script = format!(
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}'; exit 0",
+            pidfile.display()
+        );
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&script);
+        let output =
+            run_bounded_output(command, Duration::from_secs(5)).expect("clean probe succeeds");
+        assert!(output.status.success(), "probe exits successfully");
+
+        let helper: i32 = std::fs::read_to_string(&pidfile)
+            .expect("pidfile written")
+            .trim()
+            .parse()
+            .expect("helper pid parses");
+        // `kill(pid, 0)` succeeds while the process exists.
+        let alive = unsafe { libc::kill(helper, 0) } == 0;
+        // Clean up the helper regardless of the assertion outcome.
+        unsafe {
+            libc::kill(helper, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(
+            alive,
+            "a backgrounded in-group helper must survive a clean successful probe"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_bounds_a_transport_that_closes_stdio_but_keeps_running() {
+        // A transport that closes its stdout/stderr but keeps running yields clean EOF on both
+        // readers (not a reader timeout). The still-armed watchdog must enforce the deadline so the
+        // non-reaping success peek can't park forever on the live child (copilot-12). Without the fix
+        // this call hangs.
+        let mut command = Command::new("sh");
+        // Close fd 1 and 2, then sleep: the readers see EOF immediately but the leader stays alive.
+        command.arg("-c").arg("exec 1>&- 2>&-; sleep 600");
+        let start = Instant::now();
+        let result = run_bounded_output(command, Duration::from_millis(300));
+        assert_eq!(
+            result.expect_err("must time out, not hang").kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must return near the deadline, not hang on the live child"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_kills_background_helper_on_failed_exit() {
+        // codex-14-1: a transport that backgrounds an in-group helper (stdio closed) then exits
+        // NONZERO must not leave the helper alive — a failed probe's helpers would otherwise
+        // accumulate across reconnect/provision retries. Only a clean success preserves the helper.
+        let pidfile =
+            std::env::temp_dir().join(format!("herdr-bounded-failhelper-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let script = format!(
+            "sleep 600 </dev/null >/dev/null 2>&1 & echo $! > '{}'; exit 1",
+            pidfile.display()
+        );
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&script);
+        let output = run_bounded_output(command, Duration::from_secs(5))
+            .expect("a failed command returns output, not a timeout error");
+        assert!(!output.status.success(), "probe exited nonzero");
+
+        let helper: i32 = std::fs::read_to_string(&pidfile)
+            .expect("pidfile written")
+            .trim()
+            .parse()
+            .expect("helper pid parses");
+        let mut alive = true;
+        for _ in 0..100 {
+            if unsafe { libc::kill(helper, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if alive {
+            unsafe {
+                libc::kill(helper, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(
+            !alive,
+            "a failed probe's backgrounded in-group helper must be killed with the group"
+        );
+    }
+
+    #[test]
+    fn run_bounded_output_returns_quick_command_output() {
+        // A command that finishes within the deadline returns its captured output normally.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("printf hi");
+        let output = run_bounded_output(command, Duration::from_secs(5)).expect("completes");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hi");
     }
 
     fn probe_lines(version: &str, protocol: u32, bridge_ok: bool) -> String {
