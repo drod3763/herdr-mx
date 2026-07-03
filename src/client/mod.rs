@@ -4805,9 +4805,14 @@ fn recompose_composited_frame(state: &mut ClientState, rebuild: bool) {
         .supervisor_model
         .as_ref()
         .and_then(|model| model.client_menu().map(|menu| menu.selected));
+    let prefix_armed = state
+        .compositor
+        .as_ref()
+        .is_some_and(|comp| comp.prefix_armed());
     let Some(frame_data) = state.shell_cache.as_ref().map(|shell| {
         let mut frame = compositor::overlay_content_onto_shell(shell, &active_frame);
         compositor::apply_hover_overlay(&mut frame, shell, hover, menu_selected);
+        compositor::apply_prefix_bar(&mut frame, shell, prefix_armed);
         frame
     }) else {
         return;
@@ -4871,6 +4876,9 @@ fn render_incoming_server_frame(
             comp.hover(),
             model.client_menu().map(|menu| menu.selected),
         );
+        // Paint the client-local prefix indicator bar when prefix is armed (like the hover overlay,
+        // the flag is live so it survives a content-only repaint without a shell rebuild).
+        compositor::apply_prefix_bar(&mut frame_data, shell, comp.prefix_armed());
         compose_elapsed = compose_started.elapsed();
     }
     flush_composited_frame(state, frame_data, compose_elapsed, shell_rebuilt);

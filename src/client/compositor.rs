@@ -291,6 +291,24 @@ pub(crate) struct ComposedShell {
     /// painted per-frame by [`apply_hover_overlay`] from THIS geometry + the live hover target. The
     /// geometry depends only on the model/view/size, exactly like the shell, so it is cached with it.
     hover: HoverGeometry,
+    /// The prefix-mode indicator bar, prebuilt from the (stable) snapshot styling so it can be
+    /// blitted onto the content region's bottom row per-frame by [`apply_prefix_bar`] when the
+    /// client-local prefix is armed. The client owns prefix mode (`prefix_armed`) and never puts the
+    /// server into `Mode::Prefix`, so the server frame carries no bar — the client draws its own,
+    /// mirroring the monolithic host's `render_prefix_overlay`. Gating is live at paint time; the
+    /// cells depend only on config/style/size, so they cache with the shell like `hover`. `None` when
+    /// the content region is empty.
+    prefix_bar: Option<PrefixBarRow>,
+}
+
+/// The prebuilt prefix-mode indicator bar row: the composited cells for the content region's bottom
+/// row plus their target origin. [`apply_prefix_bar`] blits `cells` starting at `(x, y)` when the
+/// client-local prefix is armed.
+#[derive(Clone)]
+struct PrefixBarRow {
+    x: u16,
+    y: u16,
+    cells: Vec<CellData>,
 }
 
 /// #56: per-frame hover/selection highlight geometry, carried on the (hover-less) cached shell so a
@@ -1467,6 +1485,8 @@ impl ClientCompositor {
             || model.worktree_picker().is_some()
             || model.ssh_host_picker().is_some();
 
+        let prefix_bar = build_prefix_bar_row(&snapshot, sidebar_width, content_width, host_height);
+
         ComposedShell {
             frame,
             excluded_rects,
@@ -1476,6 +1496,7 @@ impl ClientCompositor {
             host_width,
             host_height,
             hover,
+            prefix_bar,
         }
     }
 
@@ -1983,6 +2004,15 @@ impl ClientSidebarSnapshot {
         // item 2 (C3): host-banner styling rides UiSettingsInfo over the wire.
         app.sidebar_host = settings.sidebar_host.clone();
         app.global_menu_extra_labels = vec!["add remote", "manage remotes"];
+        // The prefix-mode indicator bar (blitted by `apply_prefix_bar` when the client-local prefix
+        // is armed) reads the prefix combo + sidebar-nav labels from the SAME local config the
+        // client input path resolves (`client_navigation_keybinds`), so its key hints match what
+        // actually triggers the actions. Loaded here — per shell rebuild, not per content frame.
+        let client_config = crate::config::Config::load().config;
+        app.keybinds = client_config.keybinds();
+        let (prefix_code, prefix_mods) = client_config.prefix_key();
+        app.prefix_code = prefix_code;
+        app.prefix_mods = prefix_mods;
         // #25: gate the SHARED renderer onto its collapsed layout BEFORE geometry is computed, so
         // the collapsed sections + toggle rect are what gets laid out and what `hit_test` reads
         // back. Collapsed keeps the normal sidebar width (mirrors the server: width is unchanged,
@@ -2700,6 +2730,41 @@ fn render_client_shell(
 
     let buffer = terminal.backend().buffer().clone();
     FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[])
+}
+
+/// Prebuild the prefix-mode indicator bar for the content region's bottom row using the SHARED
+/// [`crate::ui::render_prefix_overlay`] (the same renderer the monolithic host draws), so the
+/// composited client's bar can never drift from the server's. Rendered into a one-row scratch
+/// backend the width of the content region — `render_prefix_overlay` draws on the LAST row of the
+/// area it is given, so a height-1 area lands the bar on row 0 — then captured as cells positioned
+/// at the content region's bottom row. Returns `None` when the content region is empty.
+fn build_prefix_bar_row(
+    snapshot: &ClientSidebarSnapshot,
+    sidebar_width: u16,
+    content_width: u16,
+    host_height: u16,
+) -> Option<PrefixBarRow> {
+    if content_width == 0 || host_height == 0 {
+        return None;
+    }
+    let backend = ratatui::backend::TestBackend::new(content_width, 1);
+    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should not fail");
+    terminal
+        .draw(|frame| {
+            crate::ui::render_prefix_overlay(
+                &snapshot.app,
+                frame,
+                Rect::new(0, 0, content_width, 1),
+            );
+        })
+        .expect("render prefix bar to TestBackend should not fail");
+    let buffer = terminal.backend().buffer().clone();
+    let row = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
+    Some(PrefixBarRow {
+        x: sidebar_width,
+        y: host_height.saturating_sub(1),
+        cells: row.cells,
+    })
 }
 
 fn render_filter_label(snapshot: &ClientSidebarSnapshot, frame: &mut ratatui::Frame) {
@@ -3650,6 +3715,25 @@ pub(crate) fn apply_hover_overlay(
     }
 }
 
+/// Blit the prebuilt prefix-mode indicator bar onto the composited frame when the client-local
+/// prefix is armed. Mirrors [`apply_hover_overlay`]: the cells/position are cached on the shell, but
+/// the live `prefix_armed` flag gates the paint per-frame so arming/disarming prefix needs no shell
+/// rebuild. A no-op when disarmed or when the shell carries no bar (empty content region).
+pub(crate) fn apply_prefix_bar(frame: &mut FrameData, shell: &ComposedShell, prefix_armed: bool) {
+    if !prefix_armed {
+        return;
+    }
+    let Some(bar) = shell.prefix_bar.as_ref() else {
+        return;
+    };
+    for (col, cell) in bar.cells.iter().enumerate() {
+        let x = bar.x.saturating_add(col as u16);
+        if let Some(target) = frame_cell_mut(frame, x, bar.y) {
+            *target = cell.clone();
+        }
+    }
+}
+
 fn recolor_affordance(frame: &mut FrameData, rect: Option<Rect>, geom: &HoverGeometry) {
     if let Some(rect) = rect {
         recolor_rect_fg(frame, rect, geom.affordance_from, geom.affordance_to);
@@ -4072,6 +4156,74 @@ mod tests {
 
         assert_eq!(composed.width, 8);
         assert_eq!(composed.cells[7].symbol, "x");
+    }
+
+    #[test]
+    fn prefix_bar_paints_content_bottom_row_when_armed() {
+        // The composited client owns prefix mode locally (the server stays in `Mode::Terminal`), so
+        // the bar must be drawn client-side. When armed, `apply_prefix_bar` blits it onto the
+        // content region's bottom row. Regression guard for the mx bar-missing bug.
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: Some("master".into()),
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let (host_w, host_h, sidebar_w) = (60, 6, 20);
+        let mut compositor = ClientCompositor::new(sidebar_w);
+        compositor.arm_prefix(vec![0x02]); // ctrl+b bytes (content irrelevant to the render)
+        let shell = compositor.build_shell(&model, host_w, host_h, std::time::Instant::now());
+        let content = frame(host_w - sidebar_w, host_h, &["content"]);
+        let mut composed = overlay_content_onto_shell(&shell, &content);
+        apply_prefix_bar(&mut composed, &shell, compositor.prefix_armed());
+
+        assert!(
+            row_text(&composed, host_h - 1).contains("PREFIX"),
+            "prefix bar must paint the content bottom row while prefix is armed"
+        );
+    }
+
+    #[test]
+    fn prefix_bar_absent_when_not_armed() {
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: Some("master".into()),
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let (host_w, host_h, sidebar_w) = (60, 6, 20);
+        let compositor = ClientCompositor::new(sidebar_w);
+        let shell = compositor.build_shell(&model, host_w, host_h, std::time::Instant::now());
+        let content = frame(host_w - sidebar_w, host_h, &["content"]);
+        let mut composed = overlay_content_onto_shell(&shell, &content);
+        apply_prefix_bar(&mut composed, &shell, compositor.prefix_armed());
+
+        assert!(
+            !row_text(&composed, host_h - 1).contains("PREFIX"),
+            "no prefix bar should be painted while prefix is disarmed"
+        );
     }
 
     #[test]
