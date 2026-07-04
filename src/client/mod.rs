@@ -768,11 +768,19 @@ fn dispatch_composited_key_input_with_bindings(
         // no-op returns `Consumed`, which the event loop drops without a repaint, leaving the bar
         // stuck until an unrelated render; promote it to a local repaint. Every other dispatch this
         // returns (Redraw / ApiRequest / …) already recomposes, so pass those through unchanged.
+        //
+        // The sidebar collapse toggle is the exception: it returns `Consumed` on purpose (#58) so the
+        // width animation renders the FINAL layout on the next tick rather than an immediate redraw at
+        // the stale pre-toggle width. Its animation tick repaints anyway (clearing the bar), so leave
+        // its `Consumed` intact instead of forcing the pre-toggle repaint back in.
+        let clears_via_animation = keybinds.toggle_sidebar.matches_prefix_key(key);
         if let Some(dispatch) =
             sidebar_action_dispatch(keybinds, key, compositor, model, ActionTrigger::Prefix)
         {
             return Some(match dispatch {
-                ClientInputDispatch::Consumed => ClientInputDispatch::Redraw,
+                ClientInputDispatch::Consumed if !clears_via_animation => {
+                    ClientInputDispatch::Redraw
+                }
                 other => other,
             });
         }
