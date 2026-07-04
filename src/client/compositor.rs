@@ -2738,7 +2738,8 @@ fn render_client_shell(
 /// composited client's bar can never drift from the server's. Rendered into a one-row scratch
 /// backend the width of the content region — `render_prefix_overlay` draws on the LAST row of the
 /// area it is given, so a height-1 area lands the bar on row 0 — then captured as cells positioned
-/// at the content region's bottom row. Returns `None` when the content region is empty.
+/// at the content region's bottom row. Returns `None` when the content region is empty or the
+/// scratch render fails (no panic in this production render path — the bar is simply skipped).
 fn build_prefix_bar_row(
     snapshot: &ClientSidebarSnapshot,
     sidebar_width: u16,
@@ -2749,7 +2750,9 @@ fn build_prefix_bar_row(
         return None;
     }
     let backend = ratatui::backend::TestBackend::new(content_width, 1);
-    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should not fail");
+    // `.ok()?` rather than `.expect(...)`: skip the bar (return None) instead of panicking if the
+    // scratch render ever fails, per the no-panic convention for production code.
+    let mut terminal = ratatui::Terminal::new(backend).ok()?;
     terminal
         .draw(|frame| {
             crate::ui::render_prefix_overlay(
@@ -2758,7 +2761,7 @@ fn build_prefix_bar_row(
                 Rect::new(0, 0, content_width, 1),
             );
         })
-        .expect("render prefix bar to TestBackend should not fail");
+        .ok()?;
     let buffer = terminal.backend().buffer().clone();
     let row = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
     Some(PrefixBarRow {
