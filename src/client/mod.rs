@@ -5360,9 +5360,15 @@ async fn run_client_loop(
                             // change (e.g. the prefix bar clearing on disarm) shows on this keypress
                             // rather than waiting for the server's next frame. Yields the bytes to the
                             // shared send path below, exactly like `Forward`.
+                            //
+                            // Only the client-local `prefix_armed` flag changed — the sidebar model
+                            // is untouched — so recompose lightweightly (`rebuild=false`): keep the
+                            // cached shell + blit baseline and just re-blit. `apply_prefix_bar` reads
+                            // the now-disarmed flag and skips the bar (clearing it, restoring the
+                            // cursor). A `request_full_redraw` here would needlessly drop the shell
+                            // cache (forcing a `build_shell`/config reload) and reset the blit diff.
                             ClientInputDispatch::ForwardAndRedraw(data) => {
-                                state.request_full_redraw();
-                                render_cached_composited_frame(&mut state);
+                                recompose_composited_frame(&mut state, false);
                                 data
                             }
                             ClientInputDispatch::ServerControl { server_id, message } => {
