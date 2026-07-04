@@ -771,14 +771,17 @@ fn dispatch_composited_key_input_with_bindings(
         //
         // The sidebar collapse toggle is the exception: it returns `Consumed` on purpose (#58) so the
         // width animation renders the FINAL layout on the next tick rather than an immediate redraw at
-        // the stale pre-toggle width. Its animation tick repaints anyway (clearing the bar), so leave
-        // its `Consumed` intact instead of forcing the pre-toggle repaint back in.
-        let clears_via_animation = keybinds.toggle_sidebar.matches_prefix_key(key);
+        // the stale pre-toggle width. Detect that by whether a collapse animation is actually in
+        // flight AFTER the dispatch — not by the pressed key — so a duplicate binding where an
+        // earlier no-op action (checked before `toggle_sidebar`) shares the toggle's key still
+        // repaints instead of leaving the bar stuck with no animation scheduled. When no animation
+        // will render, promote a `Consumed` no-op to `Redraw` so the bar clears on this keypress.
         if let Some(dispatch) =
             sidebar_action_dispatch(keybinds, key, compositor, model, ActionTrigger::Prefix)
         {
+            let animation_will_render = compositor.sidebar_width_animating();
             return Some(match dispatch {
-                ClientInputDispatch::Consumed if !clears_via_animation => {
+                ClientInputDispatch::Consumed if !animation_will_render => {
                     ClientInputDispatch::Redraw
                 }
                 other => other,
@@ -9333,6 +9336,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn armed_prefix_collided_noop_action_redraws_when_no_toggle_animation() {
+        // A duplicate binding can share a key between an earlier client action and the sidebar
+        // collapse toggle. When the earlier action wins and resolves to a no-op (`Consumed`) without
+        // toggling the sidebar, leaving prefix mode must still repaint — the toggle exception applies
+        // only when a collapse animation is actually in flight, not merely when the pressed key
+        // matches the toggle binding. Regression guard for Codex codex-6-1.
+        let mut compositor = compositor::ClientCompositor::new(20);
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let mut keybinds = crate::config::Keybinds::default();
+        // Duplicate binding: `next_workspace` (checked first) and `toggle_sidebar` both on prefix+b.
+        keybinds.next_workspace = crate::config::ActionKeybinds::prefix("b");
+        keybinds.toggle_sidebar = crate::config::ActionKeybinds::prefix("b");
+        let prefix = (KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        compositor.arm_prefix(vec![0x02]);
+        // Empty model → `next_workspace` matches first and returns Consumed without toggling.
+        let key = crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::empty());
+        let dispatch = dispatch_composited_key_input_with_bindings(
+            key,
+            b"b",
+            &mut compositor,
+            &mut model,
+            &keybinds,
+            prefix,
+        );
+
+        assert_eq!(
+            dispatch,
+            Some(ClientInputDispatch::Redraw),
+            "a collided no-op action that did not toggle the sidebar must still schedule a redraw"
+        );
+        assert!(
+            !compositor.sidebar_collapsed_for_test(),
+            "the earlier no-op action ran, so the sidebar must not have toggled"
+        );
+    }
+
     fn mixed_remote_model_with_many_workspaces(
         main_count: usize,
         remote_count: usize,
@@ -9817,13 +9858,18 @@ mod tests {
 
                 // 'b' resolves the prefix-mode collapse: flips the CLIENT flag, disarms prefix, and
                 // is NOT forwarded to the server. #58: the collapse toggle returns `Consumed` (never a
-                // Forward) — the single collapse tick repaints the final width, no pre-toggle redraw.
+                // Forward) — the collapse animation repaints the final width, no pre-toggle redraw.
                 assert_eq!(
                     press_char('b', &mut compositor, &mut model),
                     ClientInputDispatch::Consumed
                 );
                 assert!(!compositor.prefix_armed());
                 assert!(compositor.sidebar_collapsed_for_test());
+
+                // Settle the collapse animation the way the loop's 80ms Timer does in production, so
+                // the next toggle starts from a settled width (codex-6-1: the toggle keeps `Consumed`
+                // only while an animation is actually in flight).
+                compositor.step_sidebar_width_animation();
 
                 // ctrl+b then b again expands — flips back the other direction.
                 assert_eq!(
