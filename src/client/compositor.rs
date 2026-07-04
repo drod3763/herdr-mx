@@ -1426,6 +1426,16 @@ impl ClientCompositor {
             host_height,
             now,
         );
+        // The prefix-mode indicator bar (blitted by `apply_prefix_bar` when the client-local prefix
+        // is armed) reads the prefix combo + sidebar-nav labels from the SAME local config the client
+        // input path resolves (`client_navigation_keybinds`), so its key hints match what actually
+        // triggers the actions. Loaded HERE — only on a shell rebuild — rather than in `from_model`,
+        // which also runs on every hit-test / hover-test and must stay free of config file I/O.
+        let client_config = crate::config::Config::load().config;
+        snapshot.app.keybinds = client_config.keybinds();
+        let (prefix_code, prefix_mods) = client_config.prefix_key();
+        snapshot.app.prefix_code = prefix_code;
+        snapshot.app.prefix_mods = prefix_mods;
         // #56: compute the hover highlight geometry from the (hover-less) snapshot BEFORE clearing
         // the baked hover, so it captures the same card/row/menu rects the renderer lays out.
         let hover = compute_hover_geometry(&snapshot);
@@ -2004,15 +2014,6 @@ impl ClientSidebarSnapshot {
         // item 2 (C3): host-banner styling rides UiSettingsInfo over the wire.
         app.sidebar_host = settings.sidebar_host.clone();
         app.global_menu_extra_labels = vec!["add remote", "manage remotes"];
-        // The prefix-mode indicator bar (blitted by `apply_prefix_bar` when the client-local prefix
-        // is armed) reads the prefix combo + sidebar-nav labels from the SAME local config the
-        // client input path resolves (`client_navigation_keybinds`), so its key hints match what
-        // actually triggers the actions. Loaded here — per shell rebuild, not per content frame.
-        let client_config = crate::config::Config::load().config;
-        app.keybinds = client_config.keybinds();
-        let (prefix_code, prefix_mods) = client_config.prefix_key();
-        app.prefix_code = prefix_code;
-        app.prefix_mods = prefix_mods;
         // #25: gate the SHARED renderer onto its collapsed layout BEFORE geometry is computed, so
         // the collapsed sections + toggle rect are what gets laid out and what `hit_test` reads
         // back. Collapsed keeps the normal sidebar width (mirrors the server: width is unchanged,
