@@ -3723,6 +3723,12 @@ pub(crate) fn apply_prefix_bar(frame: &mut FrameData, shell: &ComposedShell, pre
     if !prefix_armed {
         return;
     }
+    // Prefix is a client-local command mode. Hide the child (pane) cursor while it is active, matching
+    // the monolithic renderer (`render_panes` shows the pane cursor only in `Mode::Terminal`) and the
+    // modal path in `overlay_content_onto_shell`. Otherwise the copied server cursor keeps blinking —
+    // and can draw through the bar — during prefix mode. Done before the bar-cell blit so it applies
+    // even in the degenerate empty-content case where `prefix_bar` is `None`.
+    frame.cursor = None;
     let Some(bar) = shell.prefix_bar.as_ref() else {
         return;
     };
@@ -4223,6 +4229,50 @@ mod tests {
         assert!(
             !row_text(&composed, host_h - 1).contains("PREFIX"),
             "no prefix bar should be painted while prefix is disarmed"
+        );
+    }
+
+    #[test]
+    fn prefix_bar_hides_child_cursor_when_armed() {
+        // Prefix is a client-local command mode: the child (pane) cursor must be hidden while it is
+        // active, matching the monolithic renderer (which shows the pane cursor only in
+        // Mode::Terminal). Otherwise the server pane's cursor keeps blinking — and can draw through
+        // the bar — during prefix mode. Codex codex-1-2.
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: Some("master".into()),
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let (host_w, host_h, sidebar_w) = (60, 6, 20);
+        let mut compositor = ClientCompositor::new(sidebar_w);
+        compositor.arm_prefix(vec![0x02]);
+        let shell = compositor.build_shell(&model, host_w, host_h, std::time::Instant::now());
+        // `frame` sets a visible cursor; `overlay_content_onto_shell` copies it into the content
+        // region (no modal open), so it is present before the prefix overlay runs.
+        let content = frame(host_w - sidebar_w, host_h, &["content"]);
+        let mut composed = overlay_content_onto_shell(&shell, &content);
+        assert!(
+            composed.cursor.is_some(),
+            "sanity: the content cursor is composited before the prefix overlay"
+        );
+
+        apply_prefix_bar(&mut composed, &shell, compositor.prefix_armed());
+
+        assert!(
+            composed.cursor.is_none(),
+            "prefix mode must hide the child cursor, matching the monolithic renderer"
         );
     }
 
