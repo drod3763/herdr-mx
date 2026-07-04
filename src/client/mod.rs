@@ -763,11 +763,18 @@ fn dispatch_composited_key_input_with_bindings(
             return Some(ClientInputDispatch::Redraw);
         }
         // A client-rendered-sidebar action is handled locally and swallowed — the server never
-        // entered prefix mode (we never forwarded the prefix key).
+        // entered prefix mode (we never forwarded the prefix key). We just disarmed, so the
+        // client-drawn prefix bar must clear on this keypress. A client action that resolves to a
+        // no-op returns `Consumed`, which the event loop drops without a repaint, leaving the bar
+        // stuck until an unrelated render; promote it to a local repaint. Every other dispatch this
+        // returns (Redraw / ApiRequest / …) already recomposes, so pass those through unchanged.
         if let Some(dispatch) =
             sidebar_action_dispatch(keybinds, key, compositor, model, ActionTrigger::Prefix)
         {
-            return Some(dispatch);
+            return Some(match dispatch {
+                ClientInputDispatch::Consumed => ClientInputDispatch::Redraw,
+                other => other,
+            });
         }
         // Everything else is owned by the server's prefix state machine. Replay the buffered prefix
         // key + this key to the active server so it runs the action (#30). Recompose locally as we
@@ -9272,6 +9279,43 @@ mod tests {
         assert!(
             !compositor.prefix_armed(),
             "prefix must be disarmed after forwarding the follow-up key"
+        );
+    }
+
+    #[test]
+    fn armed_prefix_noop_client_action_still_requests_redraw() {
+        // A client-handled prefix action can resolve to a no-op (`Consumed`) — e.g. next-workspace
+        // with no workspaces. Leaving prefix mode must still schedule a local repaint so the
+        // client-drawn prefix bar clears, instead of the loop dropping the no-op with no render.
+        // Regression guard for Codex codex-3-1 (the client-action sibling of codex-1-1).
+        let mut compositor = compositor::ClientCompositor::new(20);
+        // Empty model: `next_workspace` has no target, so `step_workspace_focus` returns `Consumed`.
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let mut keybinds = crate::config::Keybinds::default();
+        // `next_workspace` is the first-checked client prefix action, so binding it to the test key
+        // avoids any collision with the other actions' default bindings.
+        keybinds.next_workspace = crate::config::ActionKeybinds::prefix("g");
+        let prefix = (KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        compositor.arm_prefix(vec![0x02]);
+        let key = crate::input::TerminalKey::new(KeyCode::Char('g'), KeyModifiers::empty());
+        let dispatch = dispatch_composited_key_input_with_bindings(
+            key,
+            b"g",
+            &mut compositor,
+            &mut model,
+            &keybinds,
+            prefix,
+        );
+
+        assert_eq!(
+            dispatch,
+            Some(ClientInputDispatch::Redraw),
+            "a no-op client action on prefix disarm must schedule a local redraw to clear the bar"
+        );
+        assert!(
+            !compositor.prefix_armed(),
+            "prefix must be disarmed after a client-handled follow-up key"
         );
     }
 
