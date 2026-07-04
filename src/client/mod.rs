@@ -352,6 +352,12 @@ enum ClientApiRefreshPolicy {
 #[derive(Debug, Clone, PartialEq)]
 enum ClientInputDispatch {
     Forward(Vec<u8>),
+    /// Like [`Forward`], but also schedule a local recompose before sending the bytes. Used when the
+    /// client leaves a client-local presentation state (e.g. disarming prefix to replay `prefix+key`
+    /// to the server): the client-drawn prefix bar must clear on THIS keypress rather than lingering
+    /// until the server happens to emit its next frame — which may be slow, or never if the forwarded
+    /// key is a no-op on the server.
+    ForwardAndRedraw(Vec<u8>),
     ServerControl {
         server_id: supervisor::ServerId,
         message: ClientMessage,
@@ -722,6 +728,20 @@ fn dispatch_composited_key_input(
     model: &mut supervisor::ClientSupervisorModel,
 ) -> Option<ClientInputDispatch> {
     let (keybinds, prefix) = client_navigation_keybinds();
+    dispatch_composited_key_input_with_bindings(key, data, compositor, model, &keybinds, prefix)
+}
+
+/// Config-injected core of [`dispatch_composited_key_input`], split out so the prefix/forward gating
+/// can be unit-tested with deterministic bindings instead of the ambient `client_navigation_keybinds`
+/// (`Config::load`).
+fn dispatch_composited_key_input_with_bindings(
+    key: crate::input::TerminalKey,
+    data: &[u8],
+    compositor: &mut compositor::ClientCompositor,
+    model: &mut supervisor::ClientSupervisorModel,
+    keybinds: &crate::config::Keybinds,
+    prefix: (KeyCode, KeyModifiers),
+) -> Option<ClientInputDispatch> {
     let is_press = matches!(
         key.kind,
         crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
@@ -745,15 +765,17 @@ fn dispatch_composited_key_input(
         // A client-rendered-sidebar action is handled locally and swallowed — the server never
         // entered prefix mode (we never forwarded the prefix key).
         if let Some(dispatch) =
-            sidebar_action_dispatch(&keybinds, key, compositor, model, ActionTrigger::Prefix)
+            sidebar_action_dispatch(keybinds, key, compositor, model, ActionTrigger::Prefix)
         {
             return Some(dispatch);
         }
         // Everything else is owned by the server's prefix state machine. Replay the buffered prefix
-        // key + this key to the active server so it runs the action (#30).
+        // key + this key to the active server so it runs the action (#30). Recompose locally as we
+        // forward: the client just disarmed prefix, so the client-drawn prefix bar must clear now
+        // instead of lingering until the server's next frame (see `ForwardAndRedraw`).
         let mut forwarded = prefix_bytes.unwrap_or_default();
         forwarded.extend_from_slice(data);
-        return Some(ClientInputDispatch::Forward(forwarded));
+        return Some(ClientInputDispatch::ForwardAndRedraw(forwarded));
     }
 
     // Not armed: a press of the configured prefix key arms prefix mode, buffering its raw bytes
@@ -766,7 +788,7 @@ fn dispatch_composited_key_input(
     }
 
     if is_press {
-        sidebar_action_dispatch(&keybinds, key, compositor, model, ActionTrigger::Direct)
+        sidebar_action_dispatch(keybinds, key, compositor, model, ActionTrigger::Direct)
     } else {
         None
     }
@@ -5319,6 +5341,15 @@ async fn run_client_loop(
                     {
                         match dispatch_composited_input(data, compositor, model, state.host_size) {
                             ClientInputDispatch::Forward(data) => data,
+                            // Recompose locally BEFORE forwarding so a client-local presentation
+                            // change (e.g. the prefix bar clearing on disarm) shows on this keypress
+                            // rather than waiting for the server's next frame. Yields the bytes to the
+                            // shared send path below, exactly like `Forward`.
+                            ClientInputDispatch::ForwardAndRedraw(data) => {
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                data
+                            }
                             ClientInputDispatch::ServerControl { server_id, message } => {
                                 if let Err(e) =
                                     queue_to_server_id(&server_writes, &server_id, message)
@@ -9207,6 +9238,41 @@ mod tests {
         assert!(!dispatch_requires_loop_handling(
             &ClientInputDispatch::Consumed
         ));
+    }
+
+    #[test]
+    fn armed_prefix_forwarding_server_key_requests_local_redraw() {
+        // Leaving prefix mode by forwarding a server-owned key must schedule a local recompose so
+        // the client-drawn prefix bar clears on THIS keypress, not only when the server's next frame
+        // lands. Regression guard: the plain `Forward` path left the bar stale (Codex codex-1-1).
+        let mut compositor = compositor::ClientCompositor::new(20);
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let keybinds = crate::config::Keybinds::default();
+        let prefix = (KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        compositor.arm_prefix(vec![0x02]); // ctrl+b bytes buffered on arm
+        assert!(compositor.prefix_armed());
+
+        // '%' is a server-owned prefix action (split); it is never in the client sidebar-nav subset,
+        // so it is replayed to the server as prefix+key rather than handled locally.
+        let key = crate::input::TerminalKey::new(KeyCode::Char('%'), KeyModifiers::empty());
+        let dispatch = dispatch_composited_key_input_with_bindings(
+            key,
+            b"%",
+            &mut compositor,
+            &mut model,
+            &keybinds,
+            prefix,
+        );
+
+        assert!(
+            matches!(dispatch, Some(ClientInputDispatch::ForwardAndRedraw(_))),
+            "forwarding a server-owned key on prefix disarm must schedule a local redraw, got {dispatch:?}"
+        );
+        assert!(
+            !compositor.prefix_armed(),
+            "prefix must be disarmed after forwarding the follow-up key"
+        );
     }
 
     fn mixed_remote_model_with_many_workspaces(
