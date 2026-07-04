@@ -9918,10 +9918,13 @@ mod tests {
             );
             assert!(compositor.prefix_armed());
 
-            // 'c' is not a client sidebar-nav binding → replay prefix + key to the server.
+            // 'c' is not a client sidebar-nav binding → replay prefix + key to the server, and
+            // repaint locally as we leave prefix mode so the client-drawn prefix bar clears now
+            // instead of waiting for the server's next frame (ForwardAndRedraw carries the SAME
+            // forwarded bytes as the old Forward).
             assert_eq!(
                 press_char('c', &mut compositor, &mut model),
-                ClientInputDispatch::Forward(vec![0x02, b'c'])
+                ClientInputDispatch::ForwardAndRedraw(vec![0x02, b'c'])
             );
             assert!(!compositor.prefix_armed());
         });
@@ -9942,7 +9945,7 @@ mod tests {
                 );
                 assert_eq!(
                     press_char('q', &mut compositor, &mut model),
-                    ClientInputDispatch::Forward(vec![0x02, b'q'])
+                    ClientInputDispatch::ForwardAndRedraw(vec![0x02, b'q'])
                 );
                 assert!(!compositor.prefix_armed());
             },
