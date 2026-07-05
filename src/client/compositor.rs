@@ -3762,7 +3762,9 @@ pub(crate) fn apply_prefix_bar(frame: &mut FrameData, shell: &ComposedShell, pre
     for (col, cell) in bar.cells.iter().enumerate() {
         let x = bar.x.saturating_add(col as u16);
         if let Some(target) = frame_cell_mut(frame, x, bar.y) {
-            *target = cell.clone();
+            // `clone_from` reuses the target cell's existing `symbol` String allocation instead of
+            // allocating a fresh one per column on every armed-frame blit.
+            target.clone_from(cell);
         }
     }
 }
