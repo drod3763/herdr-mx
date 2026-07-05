@@ -238,6 +238,13 @@ pub(crate) struct ClientCompositor {
     // subset of prefix actions (sidebar nav); the server owns the rest (tabs/panes/splits/detach),
     // so a key the client does not handle must reach the server WITH the prefix that preceded it.
     prefix_pending_bytes: Option<Vec<u8>>,
+    // Cached prefix-mode bindings for the indicator bar (keybind labels + the prefix combo),
+    // resolved from local config at startup and refreshed on config-reload events. Read by
+    // `build_shell_inner` so shell rebuilds never do synchronous config file I/O on the UI loop.
+    prefix_bindings: (
+        crate::config::Keybinds,
+        (crossterm::event::KeyCode, crossterm::event::KeyModifiers),
+    ),
     // #22: client-local collapsed worktree-group keys. The server persists its OWN set
     // (`AppState.collapsed_space_keys`); collapse of the client's AGGREGATED multi-host view is a
     // per-client display concern, so the client owns this set (no server round-trip). Fed into
@@ -544,6 +551,13 @@ impl ClientCompositor {
             collapse_progress: 0.0,
             prefix_armed: false,
             prefix_pending_bytes: None,
+            prefix_bindings: (
+                crate::config::Keybinds::default(),
+                (
+                    crossterm::event::KeyCode::Char('b'),
+                    crossterm::event::KeyModifiers::CONTROL,
+                ),
+            ),
             collapsed_space_keys: std::collections::HashSet::new(),
             menu_drag: None,
             working_since: HashMap::new(),
@@ -571,6 +585,17 @@ impl ClientCompositor {
     pub(crate) fn disarm_prefix(&mut self) {
         self.prefix_armed = false;
         self.prefix_pending_bytes = None;
+    }
+
+    /// Refresh the cached prefix-mode bindings (called at client startup and on config reload) so the
+    /// prefix indicator bar reads them from memory instead of loading config from disk on the render
+    /// loop.
+    pub(crate) fn set_prefix_bindings(
+        &mut self,
+        keybinds: crate::config::Keybinds,
+        prefix: (crossterm::event::KeyCode, crossterm::event::KeyModifiers),
+    ) {
+        self.prefix_bindings = (keybinds, prefix);
     }
 
     /// #30: take the buffered prefix-key bytes, used to replay `prefix + follow-up` to the server
@@ -1427,15 +1452,13 @@ impl ClientCompositor {
             now,
         );
         // The prefix-mode indicator bar (blitted by `apply_prefix_bar` when the client-local prefix
-        // is armed) reads the prefix combo + sidebar-nav labels from the SAME local config the client
-        // input path resolves (`client_navigation_keybinds`), so its key hints match what actually
-        // triggers the actions. Loaded HERE — only on a shell rebuild — rather than in `from_model`,
-        // which also runs on every hit-test / hover-test and must stay free of config file I/O.
-        let client_config = crate::config::Config::load().config;
-        snapshot.app.keybinds = client_config.keybinds();
-        let (prefix_code, prefix_mods) = client_config.prefix_key();
-        snapshot.app.prefix_code = prefix_code;
-        snapshot.app.prefix_mods = prefix_mods;
+        // is armed) reads the prefix combo + sidebar-nav labels from the cached bindings, resolved
+        // from the SAME local config the client input path resolves (`client_navigation_keybinds`)
+        // and refreshed at startup / on config reload. Read from memory here — no config file I/O on
+        // the render loop (shell rebuilds run on model/resize changes).
+        snapshot.app.keybinds = self.prefix_bindings.0.clone();
+        snapshot.app.prefix_code = self.prefix_bindings.1 .0;
+        snapshot.app.prefix_mods = self.prefix_bindings.1 .1;
         // #56: compute the hover highlight geometry from the (hover-less) snapshot BEFORE clearing
         // the baked hover, so it captures the same card/row/menu rects the renderer lays out.
         let hover = compute_hover_geometry(&snapshot);
@@ -4277,6 +4300,54 @@ mod tests {
         assert!(
             composed.cursor.is_none(),
             "prefix mode must hide the child cursor, matching the monolithic renderer"
+        );
+    }
+
+    #[test]
+    fn prefix_bar_uses_cached_bindings_not_config_io() {
+        // The bar reads the compositor's cached prefix bindings (seeded at startup / on reload), NOT
+        // a per-rebuild config load. A distinctive cached prefix (F9 → "f9") must show in the bar,
+        // proving `build_shell` used the cache rather than the ambient default (ctrl+b).
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: Some("master".into()),
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let (host_w, host_h, sidebar_w) = (60, 6, 20);
+        let mut compositor = ClientCompositor::new(sidebar_w);
+        compositor.set_prefix_bindings(
+            crate::config::Keybinds::default(),
+            (
+                crossterm::event::KeyCode::F(9),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+        );
+        compositor.arm_prefix(vec![0x02]);
+        let shell = compositor.build_shell(&model, host_w, host_h, std::time::Instant::now());
+        let content = frame(host_w - sidebar_w, host_h, &["content"]);
+        let mut composed = overlay_content_onto_shell(&shell, &content);
+        apply_prefix_bar(&mut composed, &shell, compositor.prefix_armed());
+
+        let bottom = row_text(&composed, host_h - 1);
+        assert!(
+            bottom.contains("PREFIX"),
+            "the prefix bar should still render"
+        );
+        assert!(
+            bottom.contains("f9"),
+            "the bar must show the cached prefix key (f9), got: {bottom:?}"
         );
     }
 

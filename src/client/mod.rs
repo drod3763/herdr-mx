@@ -2691,6 +2691,10 @@ fn run_client_with_mode(
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     #[cfg(unix)]
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
+    // Resolve the prefix-bar bindings before `loaded_config.config` is partially moved below (the
+    // sound config is moved out), so the compositor can seed its cache without re-reading config.
+    let client_prefix_keybinds = loaded_config.config.keybinds();
+    let client_prefix_combo = loaded_config.config.prefix_key();
     let sound_config = loaded_config.config.ui.sound;
     let direct_attach_requested = attach_request.is_some();
     let kitty_graphics_enabled =
@@ -2828,9 +2832,14 @@ fn run_client_with_mode(
     });
 
     let result = rt.block_on(async {
-        let client_compositor = render_plan
+        let mut client_compositor = render_plan
             .use_client_compositor
             .then(compositor::ClientCompositor::default);
+        // Seed the compositor's cached prefix bindings from local config once at startup so the
+        // prefix indicator bar renders correct labels without loading config on the render loop.
+        if let Some(compositor) = client_compositor.as_mut() {
+            compositor.set_prefix_bindings(client_prefix_keybinds, client_prefix_combo);
+        }
         run_client_loop(
             stream,
             should_quit,
@@ -5899,6 +5908,13 @@ async fn run_client_loop(
                             #[cfg(unix)]
                             &mut state.remote_image_paste_key,
                         );
+                        // Refresh the compositor's cached prefix bindings from the reloaded config so
+                        // the prefix bar labels track keybind/prefix changes. Event-driven (rare) and
+                        // off the render loop — exactly where a config load belongs.
+                        if let Some(compositor) = state.compositor.as_mut() {
+                            let cfg = crate::config::Config::load().config;
+                            compositor.set_prefix_bindings(cfg.keybinds(), cfg.prefix_key());
+                        }
                         // #58: a config reload may have changed the server-side sidebar settings
                         // (pane/tab/space rows), which the client renders from the server-pushed
                         // UiSettings. Re-fetch them off the UI loop NOW instead of waiting up to ~2s
