@@ -5902,19 +5902,15 @@ async fn run_client_loop(
                         let _ = stdout.flush();
                     }
                     ServerMessage::ReloadSoundConfig => {
+                        // Reload once and apply everything (sound / redraw / remote-image, plus the
+                        // compositor's cached prefix bindings so the bar labels track keybind changes).
                         reload_local_client_config(
                             &mut state.sound_config,
                             &mut state.redraw_on_focus_gained,
                             #[cfg(unix)]
                             &mut state.remote_image_paste_key,
+                            state.compositor.as_mut(),
                         );
-                        // Refresh the compositor's cached prefix bindings from the reloaded config so
-                        // the prefix bar labels track keybind/prefix changes. Event-driven (rare) and
-                        // off the render loop — exactly where a config load belongs.
-                        if let Some(compositor) = state.compositor.as_mut() {
-                            let cfg = crate::config::Config::load().config;
-                            compositor.set_prefix_bindings(cfg.keybinds(), cfg.prefix_key());
-                        }
                         // #58: a config reload may have changed the server-side sidebar settings
                         // (pane/tab/space rows), which the client renders from the server-pushed
                         // UiSettings. Re-fetch them off the UI loop NOW instead of waiting up to ~2s
@@ -6986,6 +6982,7 @@ fn reload_local_client_config(
         crossterm::event::KeyCode,
         crossterm::event::KeyModifiers,
     )>,
+    compositor: Option<&mut compositor::ClientCompositor>,
 ) {
     match crate::config::load_live_config() {
         Ok(loaded) => {
@@ -6994,6 +6991,12 @@ fn reload_local_client_config(
             }
             #[cfg(unix)]
             let loaded_remote_image_paste_key = client_remote_image_paste_key(&loaded.config);
+            // Refresh the compositor's cached prefix bindings from the SAME loaded config, before the
+            // sound config is moved out below — so a reload does one config load, not two.
+            if let Some(compositor) = compositor {
+                compositor
+                    .set_prefix_bindings(loaded.config.keybinds(), loaded.config.prefix_key());
+            }
             *sound_config = loaded.config.ui.sound;
             *redraw_on_focus_gained = loaded.config.ui.redraw_on_focus_gained;
             #[cfg(unix)]
@@ -8129,6 +8132,7 @@ mod tests {
             &mut redraw_on_focus_gained,
             #[cfg(unix)]
             &mut remote_image_paste_key,
+            None,
         );
 
         assert!(!redraw_on_focus_gained);
