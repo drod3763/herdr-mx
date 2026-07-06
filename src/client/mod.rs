@@ -690,6 +690,12 @@ fn dispatch_composited_input(
             .iter()
             .all(|event| matches!(event, crate::raw_input::RawInputEvent::Mouse(_)))
     {
+        // Like the single-event mouse arm above, a coalesced mouse read abandons a pending client
+        // prefix: disarm it (dropping the buffered prefix bytes) and repaint so the bar clears.
+        let was_armed = compositor.prefix_armed();
+        if was_armed {
+            compositor.disarm_prefix();
+        }
         let sidebar_width = compositor.sidebar_width().min(host_size.0);
         let mut forwarded = Vec::new();
         for event in &events {
@@ -707,10 +713,15 @@ fn dispatch_composited_input(
                 forwarded.extend_from_slice(&bytes);
             }
         }
-        return if forwarded.is_empty() {
+        let dispatch = if forwarded.is_empty() {
             ClientInputDispatch::Consumed
         } else {
             ClientInputDispatch::Forward(forwarded)
+        };
+        return if was_armed {
+            redraw_after_prefix_disarm(dispatch)
+        } else {
+            dispatch
         };
     }
 
@@ -9649,6 +9660,40 @@ mod tests {
                 ClientInputDispatch::Consumed | ClientInputDispatch::Forward(_)
             ),
             "the mouse dispatch must repaint so the prefix bar clears, got {dispatch:?}"
+        );
+    }
+
+    #[test]
+    fn coalesced_mouse_while_prefix_armed_disarms_and_repaints() {
+        // The coalesced multi-mouse branch (a single read carrying several SGR reports) must also
+        // abandon a pending client prefix, not just the single-event path. Codex codex-7-6.
+        let bytes = b"\x1b[<0;50;5M\x1b[<0;50;6M".to_vec();
+        let events = crate::raw_input::parse_raw_input_bytes_sync(&bytes);
+        assert!(
+            events.len() > 1
+                && events
+                    .iter()
+                    .all(|e| matches!(e, crate::raw_input::RawInputEvent::Mouse(_))),
+            "sanity: the test buffer must hit the coalesced all-mouse branch, got {events:?}"
+        );
+
+        let (mut model, _) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        compositor.arm_prefix(vec![0x02]);
+        assert!(compositor.prefix_armed());
+
+        let dispatch = dispatch_composited_input(bytes, &mut compositor, &mut model, (60, 16));
+
+        assert!(
+            !compositor.prefix_armed(),
+            "a coalesced mouse read must disarm the pending client prefix"
+        );
+        assert!(
+            !matches!(
+                dispatch,
+                ClientInputDispatch::Consumed | ClientInputDispatch::Forward(_)
+            ),
+            "the coalesced mouse dispatch must repaint so the prefix bar clears, got {dispatch:?}"
         );
     }
 
