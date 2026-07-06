@@ -598,6 +598,18 @@ impl ClientCompositor {
         self.prefix_bindings = (keybinds, prefix);
     }
 
+    /// Snapshot of the cached prefix-mode bindings (keybinds + prefix combo). Both the prefix bar
+    /// render path and the input dispatcher read this ONE cache, so the bar can never advertise a key
+    /// the dispatcher won't honor. Refreshed only at startup / on config reload.
+    pub(crate) fn prefix_bindings_snapshot(
+        &self,
+    ) -> (
+        crate::config::Keybinds,
+        (crossterm::event::KeyCode, crossterm::event::KeyModifiers),
+    ) {
+        self.prefix_bindings.clone()
+    }
+
     /// #30: take the buffered prefix-key bytes, used to replay `prefix + follow-up` to the server
     /// when the follow-up is not a client-handled sidebar action. Leaves the buffer empty.
     pub(crate) fn take_prefix_pending_bytes(&mut self) -> Option<Vec<u8>> {
@@ -1452,10 +1464,10 @@ impl ClientCompositor {
             now,
         );
         // The prefix-mode indicator bar (blitted by `apply_prefix_bar` when the client-local prefix
-        // is armed) reads the prefix combo + sidebar-nav labels from the cached bindings, resolved
-        // from the SAME local config the client input path resolves (`client_navigation_keybinds`)
-        // and refreshed at startup / on config reload. Read from memory here — no config file I/O on
-        // the render loop (shell rebuilds run on model/resize changes).
+        // is armed) reads the prefix combo + sidebar-nav labels from the cached bindings — the SAME
+        // snapshot the input dispatcher reads (`prefix_bindings_snapshot`), refreshed at startup / on
+        // config reload. Read from memory here — no config file I/O on the render loop (shell
+        // rebuilds run on model/resize changes).
         snapshot.app.keybinds = self.prefix_bindings.0.clone();
         snapshot.app.prefix_code = self.prefix_bindings.1 .0;
         snapshot.app.prefix_mods = self.prefix_bindings.1 .1;

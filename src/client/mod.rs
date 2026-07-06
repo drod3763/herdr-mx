@@ -727,13 +727,15 @@ fn dispatch_composited_key_input(
     compositor: &mut compositor::ClientCompositor,
     model: &mut supervisor::ClientSupervisorModel,
 ) -> Option<ClientInputDispatch> {
-    let (keybinds, prefix) = client_navigation_keybinds();
+    // Read the compositor's cached bindings — the SAME snapshot the prefix bar renders from — so the
+    // bar can never advertise a key the dispatcher won't honor, and no config file I/O runs per
+    // keypress. The cache is refreshed at startup and on config reload.
+    let (keybinds, prefix) = compositor.prefix_bindings_snapshot();
     dispatch_composited_key_input_with_bindings(key, data, compositor, model, &keybinds, prefix)
 }
 
 /// Config-injected core of [`dispatch_composited_key_input`], split out so the prefix/forward gating
-/// can be unit-tested with deterministic bindings instead of the ambient `client_navigation_keybinds`
-/// (`Config::load`).
+/// can be unit-tested with deterministic bindings instead of the compositor's cached prefix bindings.
 fn dispatch_composited_key_input_with_bindings(
     key: crate::input::TerminalKey,
     data: &[u8],
@@ -824,17 +826,6 @@ fn dispatch_composited_key_input_with_bindings(
 enum ActionTrigger {
     Direct,
     Prefix,
-}
-
-/// #24: resolve the client's effective keybindings (and the prefix combo). The client renders the
-/// sidebar with the SAME shared code as the server, and its sidebar-nav keys come from the same
-/// config the server reads; the client reuses `Config::keybinds()` / `Config::prefix_key()` (the
-/// identical resolution the server uses) rather than inventing a parallel binding source. Computed
-/// per keypress (keypresses are rare), so no caching is needed and a live config reload is
-/// naturally picked up on the next key.
-fn client_navigation_keybinds() -> (crate::config::Keybinds, (KeyCode, KeyModifiers)) {
-    let config = crate::config::Config::load().config;
-    (config.keybinds(), config.prefix_key())
 }
 
 /// #24: match `key` against the sidebar-nav bindings for the given trigger side and, if it matches,
@@ -9354,6 +9345,34 @@ mod tests {
         assert!(
             !compositor.prefix_armed(),
             "prefix must be disarmed after send-prefix"
+        );
+    }
+
+    #[test]
+    fn dispatch_uses_cached_prefix_binding_not_config_load() {
+        // The input dispatcher and the prefix bar must read ONE keybinding source (the compositor
+        // cache), so the bar can never advertise a key the dispatcher won't honor. Set a non-default
+        // cached prefix (ctrl+x) and assert the dispatcher arms on ctrl+x — proving it reads the cache
+        // rather than loading the ambient config (whose default prefix is ctrl+b). Codex codex-7-2.
+        let mut compositor = compositor::ClientCompositor::new(20);
+        compositor.set_prefix_bindings(
+            crate::config::Keybinds::default(),
+            (KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        assert!(!compositor.prefix_armed());
+
+        // ctrl+x matches the cached prefix → arms prefix mode.
+        let key = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        let dispatch = dispatch_composited_key_input(key, b"\x18", &mut compositor, &mut model);
+        assert_eq!(
+            dispatch,
+            Some(ClientInputDispatch::Redraw),
+            "the cached prefix (ctrl+x) should arm prefix mode"
+        );
+        assert!(
+            compositor.prefix_armed(),
+            "dispatch must honor the cached prefix binding (ctrl+x), not Config::load's default"
         );
     }
 
