@@ -1468,9 +1468,10 @@ impl ClientCompositor {
         // snapshot the input dispatcher reads (`prefix_bindings_snapshot`), refreshed at startup / on
         // config reload. Read from memory here — no config file I/O on the render loop (shell
         // rebuilds run on model/resize changes).
-        snapshot.app.keybinds = self.prefix_bindings.0.clone();
-        snapshot.app.prefix_code = self.prefix_bindings.1 .0;
-        snapshot.app.prefix_mods = self.prefix_bindings.1 .1;
+        let (keybinds, (prefix_code, prefix_mods)) = &self.prefix_bindings;
+        snapshot.app.keybinds = keybinds.clone();
+        snapshot.app.prefix_code = *prefix_code;
+        snapshot.app.prefix_mods = *prefix_mods;
         // #56: compute the hover highlight geometry from the (hover-less) snapshot BEFORE clearing
         // the baked hover, so it captures the same card/row/menu rects the renderer lays out.
         let hover = compute_hover_geometry(&snapshot);
