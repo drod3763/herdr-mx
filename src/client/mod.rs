@@ -5946,6 +5946,10 @@ async fn run_client_loop(
                             &mut state.remote_image_paste_key,
                             state.compositor.as_mut(),
                         );
+                        // Drop the cached shell so the prefix bar (its cells are prebuilt from the
+                        // bindings) rebuilds with the reloaded keybindings instead of showing stale
+                        // labels until the next model change.
+                        state.request_full_redraw();
                         // #58: a config reload may have changed the server-side sidebar settings
                         // (pane/tab/space rows), which the client renders from the server-pushed
                         // UiSettings. Re-fetch them off the UI loop NOW instead of waiting up to ~2s
