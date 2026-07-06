@@ -653,7 +653,20 @@ fn dispatch_composited_input(
 
     let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
     if let [crate::raw_input::RawInputEvent::Mouse(mouse)] = events.as_slice() {
-        return dispatch_composited_mouse_input(data, compositor, model, host_size, mouse);
+        // A mouse interaction abandons a pending client prefix: disarm it (dropping the buffered
+        // prefix bytes — never replayed) so the next typed key is normal input, not a prefix action.
+        // Ensure the result repaints so the prefix bar clears even when the mouse handler itself
+        // wouldn't (a no-op `Consumed` or a content `Forward`).
+        let was_armed = compositor.prefix_armed();
+        if was_armed {
+            compositor.disarm_prefix();
+        }
+        let dispatch = dispatch_composited_mouse_input(data, compositor, model, host_size, mouse);
+        return if was_armed {
+            redraw_after_prefix_disarm(dispatch)
+        } else {
+            dispatch
+        };
     }
 
     // #24: client-side sidebar keyboard navigation. Before forwarding a key to the focused remote
@@ -702,6 +715,17 @@ fn dispatch_composited_input(
     }
 
     ClientInputDispatch::Forward(data)
+}
+
+/// Ensure a mouse dispatch that just disarmed prefix still repaints so the prefix bar clears, even
+/// when the mouse handler itself wouldn't (a no-op `Consumed` or a content `Forward` to the pane).
+fn redraw_after_prefix_disarm(dispatch: ClientInputDispatch) -> ClientInputDispatch {
+    match dispatch {
+        ClientInputDispatch::Consumed => ClientInputDispatch::Redraw,
+        ClientInputDispatch::Forward(bytes) => ClientInputDispatch::ForwardAndRedraw(bytes),
+        // Redraw / HoverRedraw / ApiRequest / … already repaint.
+        other => other,
+    }
 }
 
 /// #24/#30: route a single keypress to a client-side sidebar-navigation action, mirroring the
@@ -9594,6 +9618,37 @@ mod tests {
         assert_eq!(
             model.filter(),
             &supervisor::ServerFilter::Server(supervisor::ServerId::main())
+        );
+    }
+
+    #[test]
+    fn mouse_input_while_prefix_armed_disarms_and_repaints() {
+        // A mouse interaction abandons a pending client prefix: it must disarm prefix (so the next
+        // typed key is normal input, not a prefix action) and repaint so the bar clears. Codex
+        // codex-7-5.
+        let (mut model, _) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        compositor.arm_prefix(vec![0x02]);
+        assert!(compositor.prefix_armed());
+
+        // A sidebar click (Down(Left) at col 24, row 1) while armed.
+        let dispatch = dispatch_composited_input(
+            b"\x1b[<0;24;1M".to_vec(),
+            &mut compositor,
+            &mut model,
+            (60, 16),
+        );
+
+        assert!(
+            !compositor.prefix_armed(),
+            "a mouse interaction must disarm the pending client prefix"
+        );
+        assert!(
+            !matches!(
+                dispatch,
+                ClientInputDispatch::Consumed | ClientInputDispatch::Forward(_)
+            ),
+            "the mouse dispatch must repaint so the prefix bar clears, got {dispatch:?}"
         );
     }
 
