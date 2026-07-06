@@ -9710,6 +9710,17 @@ mod tests {
         result
     }
 
+    /// Build a compositor whose prefix-binding cache is seeded from the currently-active config
+    /// (the temp config installed by `with_client_keys_config`), mirroring the startup seeding.
+    /// Dispatch reads the cache — not a per-keypress config load — so a config-driven keybinding test
+    /// must seed it, exactly as the real client does at startup / on reload.
+    fn configured_compositor(width: u16) -> compositor::ClientCompositor {
+        let mut compositor = compositor::ClientCompositor::new(width);
+        let cfg = crate::config::Config::load().config;
+        compositor.set_prefix_bindings(cfg.keybinds(), cfg.prefix_key());
+        compositor
+    }
+
     /// #24: feed a single bare char keypress (no modifiers) through the composited input path.
     fn press_char(
         c: char,
@@ -9726,7 +9737,7 @@ mod tests {
     fn next_workspace_key_focuses_next_workspace_across_server_boundary() {
         with_client_keys_config("[keys]\nnext_workspace = \"alt+n\"\n", || {
             let (mut model, remote_id) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
             assert_eq!(model.active_server_id(), &supervisor::ServerId::main());
 
             let dispatch =
@@ -9757,7 +9768,7 @@ mod tests {
     fn prev_workspace_key_wraps_to_last_workspace() {
         with_client_keys_config("[keys]\nprevious_workspace = \"alt+p\"\n", || {
             let (mut model, remote_id) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
 
             let dispatch =
                 dispatch_composited_input(b"\x1bp".to_vec(), &mut compositor, &mut model, (60, 16));
@@ -9848,7 +9859,7 @@ mod tests {
     fn new_workspace_key_opens_picker() {
         with_client_keys_config("[keys]\nnew_workspace = \"alt+m\"\n", || {
             let (mut model, _) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
             assert!(model.new_workspace_picker().is_none());
 
             let dispatch =
@@ -9864,7 +9875,7 @@ mod tests {
     fn rename_workspace_key_opens_rename_overlay_for_focused_workspace() {
         with_client_keys_config("[keys]\nrename_workspace = \"alt+r\"\n", || {
             let (mut model, _) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
             assert!(model.rename_workspace_form().is_none());
 
             let dispatch =
@@ -9884,7 +9895,7 @@ mod tests {
     fn close_workspace_key_opens_confirm_close_overlay_for_focused_workspace() {
         with_client_keys_config("[keys]\nclose_workspace = \"alt+d\"\n", || {
             let (mut model, _) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
             assert!(model.confirm_close_workspace().is_none());
 
             let dispatch =
@@ -9906,7 +9917,7 @@ mod tests {
     fn collapse_toggle_key_flips_sidebar_collapsed() {
         with_client_keys_config("[keys]\ntoggle_sidebar = \"alt+b\"\n", || {
             let (mut model, _) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
             assert!(!compositor.sidebar_collapsed_for_test());
 
             let dispatch =
@@ -9927,7 +9938,7 @@ mod tests {
             "[keys]\nprefix = \"ctrl+b\"\ntoggle_sidebar = \"prefix+b\"\n",
             || {
                 let (mut model, _) = mixed_remote_model();
-                let mut compositor = compositor::ClientCompositor::new(26);
+                let mut compositor = configured_compositor(26);
                 assert!(!compositor.sidebar_collapsed_for_test());
 
                 // ctrl+b (0x02) arms prefix mode: swallowed (Redraw), nothing forwarded yet.
@@ -9972,7 +9983,7 @@ mod tests {
     fn unbound_plain_key_is_forwarded_not_intercepted() {
         with_client_keys_config("[keys]\nnext_workspace = \"alt+n\"\n", || {
             let (mut model, _) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
 
             // 'x' matches no sidebar-nav binding and the prefix is not armed: Forward.
             assert_eq!(
@@ -9996,7 +10007,7 @@ mod tests {
             "[keys]\nprefix = \"ctrl+b\"\nnext_workspace = \"prefix+n\"\n",
             || {
                 let (mut model, remote_id) = mixed_remote_model();
-                let mut compositor = compositor::ClientCompositor::new(26);
+                let mut compositor = configured_compositor(26);
 
                 // Not armed: a bare 'n' is forwarded to the terminal (never hijacked).
                 assert_eq!(
@@ -10042,7 +10053,7 @@ mod tests {
     fn prefix_then_unhandled_key_forwards_prefix_and_key_to_server() {
         with_client_keys_config("[keys]\nprefix = \"ctrl+b\"\n", || {
             let (mut model, _remote_id) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
 
             // ctrl+b (0x02) arms prefix mode and is swallowed (not forwarded yet).
             assert_eq!(
@@ -10071,7 +10082,7 @@ mod tests {
             "[keys]\nprefix = \"ctrl+b\"\ndetach = \"prefix+q\"\n",
             || {
                 let (mut model, _remote_id) = mixed_remote_model();
-                let mut compositor = compositor::ClientCompositor::new(26);
+                let mut compositor = configured_compositor(26);
                 assert_eq!(
                     dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (60, 16)),
                     ClientInputDispatch::Redraw
