@@ -756,11 +756,17 @@ fn dispatch_composited_key_input_with_bindings(
         let prefix_bytes = compositor.take_prefix_pending_bytes();
         compositor.disarm_prefix();
         let key_event = key.as_key_event();
-        // Esc / the prefix key itself just leaves prefix mode, swallowed (mirrors the server).
-        if key_event.code == crossterm::event::KeyCode::Esc
-            || crate::config::terminal_key_matches_combo(key, prefix)
-        {
+        // Esc leaves prefix mode locally (swallowed) — the server never entered prefix mode.
+        if key_event.code == crossterm::event::KeyCode::Esc {
             return Some(ClientInputDispatch::Redraw);
+        }
+        // The prefix key again is "send prefix" (as the bar advertises): replay prefix+prefix to the
+        // server so its prefix handler passes a literal prefix byte to the focused pane (tmux
+        // send-prefix). Recompose locally to clear the client-drawn bar.
+        if crate::config::terminal_key_matches_combo(key, prefix) {
+            let mut forwarded = prefix_bytes.unwrap_or_default();
+            forwarded.extend_from_slice(data);
+            return Some(ClientInputDispatch::ForwardAndRedraw(forwarded));
         }
         // A client-rendered-sidebar action is handled locally and swallowed — the server never
         // entered prefix mode (we never forwarded the prefix key). We just disarmed, so the
@@ -9316,6 +9322,38 @@ mod tests {
         assert!(
             !compositor.prefix_armed(),
             "prefix must be disarmed after forwarding the follow-up key"
+        );
+    }
+
+    #[test]
+    fn armed_prefix_send_prefix_forwards_literal_prefix() {
+        // Pressing the prefix key again while armed is "send prefix" (as the bar advertises): the
+        // client must replay prefix+prefix to the server so its handler passes a literal prefix byte
+        // to the focused pane (tmux send-prefix), not swallow it like Esc. Regression: Codex codex-7-1.
+        let mut compositor = compositor::ClientCompositor::new(20);
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let keybinds = crate::config::Keybinds::default();
+        let prefix = (KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        compositor.arm_prefix(vec![0x02]); // first ctrl+b buffered on arm
+        let key = crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let dispatch = dispatch_composited_key_input_with_bindings(
+            key,
+            b"\x02", // second ctrl+b's byte
+            &mut compositor,
+            &mut model,
+            &keybinds,
+            prefix,
+        );
+
+        assert_eq!(
+            dispatch,
+            Some(ClientInputDispatch::ForwardAndRedraw(vec![0x02, 0x02])),
+            "prefix+prefix must forward the literal prefix (send-prefix) and clear the bar"
+        );
+        assert!(
+            !compositor.prefix_armed(),
+            "prefix must be disarmed after send-prefix"
         );
     }
 
