@@ -9328,10 +9328,12 @@ mod tests {
         let mut compositor = compositor::ClientCompositor::new(20);
         // Empty model: `next_workspace` has no target, so `step_workspace_focus` returns `Consumed`.
         let mut model = supervisor::ClientSupervisorModel::new("local");
-        let mut keybinds = crate::config::Keybinds::default();
         // `next_workspace` is the first-checked client prefix action, so binding it to the test key
         // avoids any collision with the other actions' default bindings.
-        keybinds.next_workspace = crate::config::ActionKeybinds::prefix("g");
+        let keybinds = crate::config::Keybinds {
+            next_workspace: crate::config::ActionKeybinds::prefix("g"),
+            ..crate::config::Keybinds::default()
+        };
         let prefix = (KeyCode::Char('b'), KeyModifiers::CONTROL);
 
         compositor.arm_prefix(vec![0x02]);
@@ -9365,10 +9367,12 @@ mod tests {
         // matches the toggle binding. Regression guard for Codex codex-6-1.
         let mut compositor = compositor::ClientCompositor::new(20);
         let mut model = supervisor::ClientSupervisorModel::new("local");
-        let mut keybinds = crate::config::Keybinds::default();
         // Duplicate binding: `next_workspace` (checked first) and `toggle_sidebar` both on prefix+b.
-        keybinds.next_workspace = crate::config::ActionKeybinds::prefix("b");
-        keybinds.toggle_sidebar = crate::config::ActionKeybinds::prefix("b");
+        let keybinds = crate::config::Keybinds {
+            next_workspace: crate::config::ActionKeybinds::prefix("b"),
+            toggle_sidebar: crate::config::ActionKeybinds::prefix("b"),
+            ..crate::config::Keybinds::default()
+        };
         let prefix = (KeyCode::Char('b'), KeyModifiers::CONTROL);
 
         compositor.arm_prefix(vec![0x02]);
