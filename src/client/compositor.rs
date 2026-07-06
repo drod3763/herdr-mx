@@ -241,8 +241,11 @@ pub(crate) struct ClientCompositor {
     // Cached prefix-mode bindings for the indicator bar (keybind labels + the prefix combo),
     // resolved from local config at startup and refreshed on config-reload events. Read by
     // `build_shell_inner` so shell rebuilds never do synchronous config file I/O on the UI loop.
+    // `Keybinds` is behind an `Arc` so the per-keypress dispatch snapshot is a cheap refcount clone,
+    // not a deep clone of the whole struct (its many `Vec`s); the deep clone is reserved for the rare
+    // shell rebuild.
     prefix_bindings: (
-        crate::config::Keybinds,
+        std::sync::Arc<crate::config::Keybinds>,
         (crossterm::event::KeyCode, crossterm::event::KeyModifiers),
     ),
     // #22: client-local collapsed worktree-group keys. The server persists its OWN set
@@ -552,7 +555,7 @@ impl ClientCompositor {
             prefix_armed: false,
             prefix_pending_bytes: None,
             prefix_bindings: (
-                crate::config::Keybinds::default(),
+                std::sync::Arc::new(crate::config::Keybinds::default()),
                 (
                     crossterm::event::KeyCode::Char('b'),
                     crossterm::event::KeyModifiers::CONTROL,
@@ -595,16 +598,17 @@ impl ClientCompositor {
         keybinds: crate::config::Keybinds,
         prefix: (crossterm::event::KeyCode, crossterm::event::KeyModifiers),
     ) {
-        self.prefix_bindings = (keybinds, prefix);
+        self.prefix_bindings = (std::sync::Arc::new(keybinds), prefix);
     }
 
     /// Snapshot of the cached prefix-mode bindings (keybinds + prefix combo). Both the prefix bar
     /// render path and the input dispatcher read this ONE cache, so the bar can never advertise a key
-    /// the dispatcher won't honor. Refreshed only at startup / on config reload.
+    /// the dispatcher won't honor. Refreshed only at startup / on config reload. The `Keybinds` ride
+    /// an `Arc`, so this per-keypress snapshot is a cheap refcount clone, not a deep struct clone.
     pub(crate) fn prefix_bindings_snapshot(
         &self,
     ) -> (
-        crate::config::Keybinds,
+        std::sync::Arc<crate::config::Keybinds>,
         (crossterm::event::KeyCode, crossterm::event::KeyModifiers),
     ) {
         self.prefix_bindings.clone()
@@ -1469,7 +1473,8 @@ impl ClientCompositor {
         // config reload. Read from memory here — no config file I/O on the render loop (shell
         // rebuilds run on model/resize changes).
         let (keybinds, (prefix_code, prefix_mods)) = &self.prefix_bindings;
-        snapshot.app.keybinds = keybinds.clone();
+        // Rare shell-rebuild path: deep-clone the Arc's inner Keybinds into the snapshot's AppState.
+        snapshot.app.keybinds = keybinds.as_ref().clone();
         snapshot.app.prefix_code = *prefix_code;
         snapshot.app.prefix_mods = *prefix_mods;
         // #56: compute the hover highlight geometry from the (hover-less) snapshot BEFORE clearing
