@@ -758,17 +758,20 @@ fn dispatch_composited_key_input_with_bindings(
         let prefix_bytes = compositor.take_prefix_pending_bytes();
         compositor.disarm_prefix();
         let key_event = key.as_key_event();
-        // Esc leaves prefix mode locally (swallowed) — the server never entered prefix mode.
-        if key_event.code == crossterm::event::KeyCode::Esc {
-            return Some(ClientInputDispatch::Redraw);
-        }
         // The prefix key again is "send prefix" (as the bar advertises): replay prefix+prefix to the
         // server so its prefix handler passes a literal prefix byte to the focused pane (tmux
-        // send-prefix). Recompose locally to clear the client-drawn bar.
+        // send-prefix). Recompose locally to clear the client-drawn bar. Checked BEFORE the Esc
+        // cancel so a configured `prefix = "esc"` still send-prefixes — mirroring the server's
+        // handle_prefix_key, which tests is_prefix_key before treating Esc as cancel.
         if crate::config::terminal_key_matches_combo(key, prefix) {
             let mut forwarded = prefix_bytes.unwrap_or_default();
             forwarded.extend_from_slice(data);
             return Some(ClientInputDispatch::ForwardAndRedraw(forwarded));
+        }
+        // Esc (when it is not the configured prefix) leaves prefix mode locally, swallowed — the
+        // server never entered prefix mode.
+        if key_event.code == crossterm::event::KeyCode::Esc {
+            return Some(ClientInputDispatch::Redraw);
         }
         // A client-rendered-sidebar action is handled locally and swallowed — the server never
         // entered prefix mode (we never forwarded the prefix key). We just disarmed, so the
@@ -9346,6 +9349,62 @@ mod tests {
             !compositor.prefix_armed(),
             "prefix must be disarmed after send-prefix"
         );
+    }
+
+    #[test]
+    fn armed_esc_prefix_send_prefix_forwards_literal_esc() {
+        // With `prefix = "esc"` (a documented config), Esc IS the prefix key, so pressing it while
+        // armed is send-prefix — it must forward esc+esc, NOT be swallowed as a cancel. The prefix
+        // match is checked before the generic Esc-cancel, mirroring the server. Codex codex-7-4.
+        let mut compositor = compositor::ClientCompositor::new(20);
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let keybinds = crate::config::Keybinds::default();
+        let prefix = (KeyCode::Esc, KeyModifiers::empty());
+
+        compositor.arm_prefix(vec![0x1b]); // first esc buffered on arm
+        let key = crate::input::TerminalKey::new(KeyCode::Esc, KeyModifiers::empty());
+        let dispatch = dispatch_composited_key_input_with_bindings(
+            key,
+            b"\x1b",
+            &mut compositor,
+            &mut model,
+            &keybinds,
+            prefix,
+        );
+
+        assert_eq!(
+            dispatch,
+            Some(ClientInputDispatch::ForwardAndRedraw(vec![0x1b, 0x1b])),
+            "esc-prefix send-prefix must forward the literal esc, not swallow it as cancel"
+        );
+        assert!(!compositor.prefix_armed());
+    }
+
+    #[test]
+    fn armed_prefix_esc_cancels_when_esc_is_not_prefix() {
+        // With a non-Esc prefix (ctrl+b), plain Esc while armed still cancels prefix mode locally.
+        let mut compositor = compositor::ClientCompositor::new(20);
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let keybinds = crate::config::Keybinds::default();
+        let prefix = (KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        compositor.arm_prefix(vec![0x02]);
+        let key = crate::input::TerminalKey::new(KeyCode::Esc, KeyModifiers::empty());
+        let dispatch = dispatch_composited_key_input_with_bindings(
+            key,
+            b"\x1b",
+            &mut compositor,
+            &mut model,
+            &keybinds,
+            prefix,
+        );
+
+        assert_eq!(
+            dispatch,
+            Some(ClientInputDispatch::Redraw),
+            "plain Esc (not the prefix) must cancel prefix mode locally"
+        );
+        assert!(!compositor.prefix_armed());
     }
 
     #[test]
