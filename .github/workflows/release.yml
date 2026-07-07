@@ -495,6 +495,10 @@ jobs:
           GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::TAP_DISPATCH_TOKEN secret is not set; skipping Homebrew tap dispatch. Add the secret to enable release-time bumps; the tap's daily cron updates the formula in the meantime."
+            exit 0
+          fi
           gh workflow run update-herdr-mx.yml \
             --repo drod3763/homebrew-tap \
             --field version="$TAG"
