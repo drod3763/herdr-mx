@@ -590,12 +590,12 @@ fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
             // A full redraw no longer clears the screen first (that blank window
             // flickers over remote links), so every cell must paint something to
             // overwrite whatever occupied this position in the previous frame.
-            // `cell.skip` marks cells ratatui doesn't draw itself (blank/graphics
-            // placeholders); paint a space so no stale glyph survives. Any graphics
-            // are spliced in after these cell writes and overlay the space. An empty
-            // symbol (a non-wide cell that carries no grapheme) is covered the same
-            // way. Wide-grapheme continuation cells are already handled by `to_skip`
-            // above and never reach here.
+            // `cell.skip` is ratatui's "don't emit this cell during diffing" hint.
+            // Its wide-grapheme-continuation case is already consumed by `to_skip`
+            // above, so a skip cell reaching here is a blank/graphics placeholder;
+            // paint a space so no stale glyph survives. Any graphics are spliced in
+            // after these cell writes and overlay the space. An empty symbol (a cell
+            // that carries no grapheme) is covered the same way.
             let symbol = if cell.skip || cell.symbol.is_empty() {
                 " "
             } else {
@@ -1617,8 +1617,9 @@ mod tests {
         // written, so nothing from a prior frame can survive underneath. Asserting
         // only the CUP would still pass if the cursor moved but no glyph was emitted
         // — the exact regression this test guards against. A style (SGR) sequence
-        // sits between each CUP and its glyph, but SGR/CUP bytes are only digits,
-        // ';', 'm', '[', and ESC, so the painted glyph ('A' or a space) is the sole
+        // sits between each CUP and its glyph, but the CUP (`ESC [ … H`) and SGR
+        // (`ESC [ … m`) bytes are only ESC, '[', digits, ';', 'H', and 'm' — none of
+        // which is a space or 'A'. So the painted glyph ('A' or a space) is the sole
         // such byte between one position's CUP and the next.
         let p1 = output_str
             .find("\x1b[1;1H")
