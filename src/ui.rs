@@ -25,11 +25,10 @@ use self::dialogs::{
     render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
 };
 use self::keybind_help::render_keybind_help_overlay;
-pub(crate) use self::menus::render_global_launcher_menu;
 use self::menus::{
-    render_context_menu, render_copy_mode_overlay, render_navigate_overlay, render_prefix_overlay,
-    render_resize_overlay,
+    render_context_menu, render_copy_mode_overlay, render_navigate_overlay, render_resize_overlay,
 };
+pub(crate) use self::menus::{render_global_launcher_menu, render_prefix_overlay};
 use self::mobile::{
     compute_mobile_header_hit_areas, is_mobile_width, mobile_switcher_max_scroll_for_height,
     mobile_toast_banner_rect, render_mobile_header, render_mobile_panel,
@@ -1303,6 +1302,48 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("PREFIX"));
+    }
+
+    fn render_prefix_bar_text(app: &AppState, width: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 4))
+            .expect("test terminal");
+        let area = ratatui::layout::Rect::new(0, 0, width, 4);
+        terminal
+            .draw(|frame| render_prefix_overlay(app, frame, area))
+            .expect("draw prefix overlay");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn prefix_bar_omits_esc_cancel_when_prefix_is_esc() {
+        // With prefix=esc, Esc is send-prefix (not cancel), so the bar must NOT advertise "esc cancel".
+        let mut app = crate::app::state::AppState::test_new();
+        app.mode = Mode::Prefix;
+        app.prefix_code = crossterm::event::KeyCode::Esc;
+        app.prefix_mods = crossterm::event::KeyModifiers::empty();
+        let rendered = render_prefix_bar_text(&app, 80);
+        assert!(rendered.contains("PREFIX"));
+        assert!(rendered.contains("send prefix"));
+        assert!(
+            !rendered.contains("cancel"),
+            "prefix=esc must not advertise esc-cancel, got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn prefix_bar_shows_esc_cancel_for_non_esc_prefix() {
+        // Default prefix (ctrl+b): Esc cancels, so the esc-cancel hint is shown.
+        let mut app = crate::app::state::AppState::test_new();
+        app.mode = Mode::Prefix;
+        let rendered = render_prefix_bar_text(&app, 80);
+        assert!(rendered.contains("cancel"));
+        assert!(rendered.contains("send prefix"));
     }
 
     #[test]

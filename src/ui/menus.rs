@@ -28,7 +28,7 @@ fn render_bottom_bar(frame: &mut Frame, area: Rect, line: Line<'_>, bg: ratatui:
     frame.render_widget(Paragraph::new(line), area);
 }
 
-pub(super) fn render_prefix_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+pub(crate) fn render_prefix_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
     let key = Style::default()
         .fg(app.palette.accent)
         .add_modifier(Modifier::BOLD);
@@ -42,18 +42,22 @@ pub(super) fn render_prefix_overlay(app: &AppState, frame: &mut Frame, area: Rec
     let help = prefix_rhs_label(&app.keybinds.help);
     let prefix = crate::config::format_key_combo((app.prefix_code, app.prefix_mods));
 
-    let line = Line::from(vec![
-        Span::styled(" PREFIX ", mode_style),
-        Span::raw(" "),
-        Span::styled("esc", key),
-        Span::styled(" cancel  ", dim),
-        Span::styled(prefix, key),
-        Span::styled(" send prefix  ", dim),
-        Span::styled(workspace_picker, key),
-        Span::styled(" workspace nav  ", dim),
-        Span::styled(help, key),
-        Span::styled(" keybinds", dim),
-    ]);
+    let prefix_is_esc =
+        app.prefix_code == crossterm::event::KeyCode::Esc && app.prefix_mods.is_empty();
+    let mut spans = vec![Span::styled(" PREFIX ", mode_style), Span::raw(" ")];
+    // With prefix=esc, Esc is "send prefix" (not cancel), so omit the misleading esc-cancel hint —
+    // the `{prefix} send prefix` span already renders "esc send prefix" in that config.
+    if !prefix_is_esc {
+        spans.push(Span::styled("esc", key));
+        spans.push(Span::styled(" cancel  ", dim));
+    }
+    spans.push(Span::styled(prefix, key));
+    spans.push(Span::styled(" send prefix  ", dim));
+    spans.push(Span::styled(workspace_picker, key));
+    spans.push(Span::styled(" workspace nav  ", dim));
+    spans.push(Span::styled(help, key));
+    spans.push(Span::styled(" keybinds", dim));
+    let line = Line::from(spans);
 
     let overlay_y = area.y + area.height.saturating_sub(1);
     let overlay_area = Rect::new(area.x, overlay_y, area.width, 1);

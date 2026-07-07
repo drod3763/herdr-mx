@@ -352,6 +352,12 @@ enum ClientApiRefreshPolicy {
 #[derive(Debug, Clone, PartialEq)]
 enum ClientInputDispatch {
     Forward(Vec<u8>),
+    /// Like [`Forward`], but also schedule a local recompose before sending the bytes. Used when the
+    /// client leaves a client-local presentation state (e.g. disarming prefix to replay `prefix+key`
+    /// to the server): the client-drawn prefix bar must clear on THIS keypress rather than lingering
+    /// until the server happens to emit its next frame — which may be slow, or never if the forwarded
+    /// key is a no-op on the server.
+    ForwardAndRedraw(Vec<u8>),
     ServerControl {
         server_id: supervisor::ServerId,
         message: ClientMessage,
@@ -647,7 +653,20 @@ fn dispatch_composited_input(
 
     let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
     if let [crate::raw_input::RawInputEvent::Mouse(mouse)] = events.as_slice() {
-        return dispatch_composited_mouse_input(data, compositor, model, host_size, mouse);
+        // A mouse interaction abandons a pending client prefix: disarm it (dropping the buffered
+        // prefix bytes — never replayed) so the next typed key is normal input, not a prefix action.
+        // Ensure the result repaints so the prefix bar clears even when the mouse handler itself
+        // wouldn't (a no-op `Consumed` or a content `Forward`).
+        let was_armed = compositor.prefix_armed();
+        if was_armed {
+            compositor.disarm_prefix();
+        }
+        let dispatch = dispatch_composited_mouse_input(data, compositor, model, host_size, mouse);
+        return if was_armed {
+            redraw_after_prefix_disarm(dispatch)
+        } else {
+            dispatch
+        };
     }
 
     // #24: client-side sidebar keyboard navigation. Before forwarding a key to the focused remote
@@ -657,6 +676,31 @@ fn dispatch_composited_input(
     if let [crate::raw_input::RawInputEvent::Key(key)] = events.as_slice() {
         if let Some(dispatch) = dispatch_composited_key_input(*key, &data, compositor, model) {
             return dispatch;
+        }
+    }
+
+    // A coalesced read carrying the prefix key + a follow-up in one chunk (fast typing; paste is a
+    // separate bracketed Paste event, so an all-Key read is genuine keypresses). Resolve it through
+    // the prefix state machine so a client-owned follow-up (sidebar nav/toggle) runs locally instead
+    // of being forwarded. A server-owned/unhandled follow-up forwards the raw read, which the
+    // server's own prefix machine handles correctly (no per-key byte reconstruction needed).
+    if let [crate::raw_input::RawInputEvent::Key(k1), crate::raw_input::RawInputEvent::Key(k2)] =
+        events.as_slice()
+    {
+        let (_, prefix) = compositor.prefix_bindings_snapshot();
+        if !compositor.prefix_armed() && crate::config::terminal_key_matches_combo(*k1, prefix) {
+            let _ = dispatch_composited_key_input(*k1, &data, compositor, model); // arms prefix
+            match dispatch_composited_key_input(*k2, &data, compositor, model) {
+                Some(ClientInputDispatch::Forward(_))
+                | Some(ClientInputDispatch::ForwardAndRedraw(_))
+                | None => {
+                    // Server-owned / unhandled follow-up: clear the client prefix state and forward
+                    // the raw read so the server's prefix machine runs prefix+key.
+                    compositor.disarm_prefix();
+                    return ClientInputDispatch::ForwardAndRedraw(data);
+                }
+                Some(other) => return other, // client-handled (action, or Esc/prefix cancel)
+            }
         }
     }
 
@@ -671,6 +715,12 @@ fn dispatch_composited_input(
             .iter()
             .all(|event| matches!(event, crate::raw_input::RawInputEvent::Mouse(_)))
     {
+        // Like the single-event mouse arm above, a coalesced mouse read abandons a pending client
+        // prefix: disarm it (dropping the buffered prefix bytes) and repaint so the bar clears.
+        let was_armed = compositor.prefix_armed();
+        if was_armed {
+            compositor.disarm_prefix();
+        }
         let sidebar_width = compositor.sidebar_width().min(host_size.0);
         let mut forwarded = Vec::new();
         for event in &events {
@@ -688,14 +738,30 @@ fn dispatch_composited_input(
                 forwarded.extend_from_slice(&bytes);
             }
         }
-        return if forwarded.is_empty() {
+        let dispatch = if forwarded.is_empty() {
             ClientInputDispatch::Consumed
         } else {
             ClientInputDispatch::Forward(forwarded)
         };
+        return if was_armed {
+            redraw_after_prefix_disarm(dispatch)
+        } else {
+            dispatch
+        };
     }
 
     ClientInputDispatch::Forward(data)
+}
+
+/// Ensure a mouse dispatch that just disarmed prefix still repaints so the prefix bar clears, even
+/// when the mouse handler itself wouldn't (a no-op `Consumed` or a content `Forward` to the pane).
+fn redraw_after_prefix_disarm(dispatch: ClientInputDispatch) -> ClientInputDispatch {
+    match dispatch {
+        ClientInputDispatch::Consumed => ClientInputDispatch::Redraw,
+        ClientInputDispatch::Forward(bytes) => ClientInputDispatch::ForwardAndRedraw(bytes),
+        // Redraw / HoverRedraw / ApiRequest / … already repaint.
+        other => other,
+    }
 }
 
 /// #24/#30: route a single keypress to a client-side sidebar-navigation action, mirroring the
@@ -721,7 +787,23 @@ fn dispatch_composited_key_input(
     compositor: &mut compositor::ClientCompositor,
     model: &mut supervisor::ClientSupervisorModel,
 ) -> Option<ClientInputDispatch> {
-    let (keybinds, prefix) = client_navigation_keybinds();
+    // Read the compositor's cached bindings — the SAME snapshot the prefix bar renders from — so the
+    // bar can never advertise a key the dispatcher won't honor, and no config file I/O runs per
+    // keypress. The cache is refreshed at startup and on config reload.
+    let (keybinds, prefix) = compositor.prefix_bindings_snapshot();
+    dispatch_composited_key_input_with_bindings(key, data, compositor, model, &keybinds, prefix)
+}
+
+/// Config-injected core of [`dispatch_composited_key_input`], split out so the prefix/forward gating
+/// can be unit-tested with deterministic bindings instead of the compositor's cached prefix bindings.
+fn dispatch_composited_key_input_with_bindings(
+    key: crate::input::TerminalKey,
+    data: &[u8],
+    compositor: &mut compositor::ClientCompositor,
+    model: &mut supervisor::ClientSupervisorModel,
+    keybinds: &crate::config::Keybinds,
+    prefix: (KeyCode, KeyModifiers),
+) -> Option<ClientInputDispatch> {
     let is_press = matches!(
         key.kind,
         crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
@@ -736,24 +818,53 @@ fn dispatch_composited_key_input(
         let prefix_bytes = compositor.take_prefix_pending_bytes();
         compositor.disarm_prefix();
         let key_event = key.as_key_event();
-        // Esc / the prefix key itself just leaves prefix mode, swallowed (mirrors the server).
-        if key_event.code == crossterm::event::KeyCode::Esc
-            || crate::config::terminal_key_matches_combo(key, prefix)
-        {
+        // The prefix key again is "send prefix" (as the bar advertises): replay prefix+prefix to the
+        // server so its prefix handler passes a literal prefix byte to the focused pane (tmux
+        // send-prefix). Recompose locally to clear the client-drawn bar. Checked BEFORE the Esc
+        // cancel so a configured `prefix = "esc"` still send-prefixes — mirroring the server's
+        // handle_prefix_key, which tests is_prefix_key before treating Esc as cancel.
+        if crate::config::terminal_key_matches_combo(key, prefix) {
+            let mut forwarded = prefix_bytes.unwrap_or_default();
+            forwarded.extend_from_slice(data);
+            return Some(ClientInputDispatch::ForwardAndRedraw(forwarded));
+        }
+        // Esc (when it is not the configured prefix) leaves prefix mode locally, swallowed — the
+        // server never entered prefix mode.
+        if key_event.code == crossterm::event::KeyCode::Esc {
             return Some(ClientInputDispatch::Redraw);
         }
         // A client-rendered-sidebar action is handled locally and swallowed — the server never
-        // entered prefix mode (we never forwarded the prefix key).
+        // entered prefix mode (we never forwarded the prefix key). We just disarmed, so the
+        // client-drawn prefix bar must clear on this keypress. A client action that resolves to a
+        // no-op returns `Consumed`, which the event loop drops without a repaint, leaving the bar
+        // stuck until an unrelated render; promote it to a local repaint. Every other dispatch this
+        // returns (Redraw / ApiRequest / …) already recomposes, so pass those through unchanged.
+        //
+        // The sidebar collapse toggle is the exception: it returns `Consumed` on purpose (#58) so the
+        // width animation renders the FINAL layout on the next tick rather than an immediate redraw at
+        // the stale pre-toggle width. Detect that by whether a collapse animation is actually in
+        // flight AFTER the dispatch — not by the pressed key — so a duplicate binding where an
+        // earlier no-op action (checked before `toggle_sidebar`) shares the toggle's key still
+        // repaints instead of leaving the bar stuck with no animation scheduled. When no animation
+        // will render, promote a `Consumed` no-op to `Redraw` so the bar clears on this keypress.
         if let Some(dispatch) =
-            sidebar_action_dispatch(&keybinds, key, compositor, model, ActionTrigger::Prefix)
+            sidebar_action_dispatch(keybinds, key, compositor, model, ActionTrigger::Prefix)
         {
-            return Some(dispatch);
+            let animation_will_render = compositor.sidebar_width_animating();
+            return Some(match dispatch {
+                ClientInputDispatch::Consumed if !animation_will_render => {
+                    ClientInputDispatch::Redraw
+                }
+                other => other,
+            });
         }
         // Everything else is owned by the server's prefix state machine. Replay the buffered prefix
-        // key + this key to the active server so it runs the action (#30).
+        // key + this key to the active server so it runs the action (#30). Recompose locally as we
+        // forward: the client just disarmed prefix, so the client-drawn prefix bar must clear now
+        // instead of lingering until the server's next frame (see `ForwardAndRedraw`).
         let mut forwarded = prefix_bytes.unwrap_or_default();
         forwarded.extend_from_slice(data);
-        return Some(ClientInputDispatch::Forward(forwarded));
+        return Some(ClientInputDispatch::ForwardAndRedraw(forwarded));
     }
 
     // Not armed: a press of the configured prefix key arms prefix mode, buffering its raw bytes
@@ -766,7 +877,7 @@ fn dispatch_composited_key_input(
     }
 
     if is_press {
-        sidebar_action_dispatch(&keybinds, key, compositor, model, ActionTrigger::Direct)
+        sidebar_action_dispatch(keybinds, key, compositor, model, ActionTrigger::Direct)
     } else {
         None
     }
@@ -778,17 +889,6 @@ fn dispatch_composited_key_input(
 enum ActionTrigger {
     Direct,
     Prefix,
-}
-
-/// #24: resolve the client's effective keybindings (and the prefix combo). The client renders the
-/// sidebar with the SAME shared code as the server, and its sidebar-nav keys come from the same
-/// config the server reads; the client reuses `Config::keybinds()` / `Config::prefix_key()` (the
-/// identical resolution the server uses) rather than inventing a parallel binding source. Computed
-/// per keypress (keypresses are rare), so no caching is needed and a live config reload is
-/// naturally picked up on the next key.
-fn client_navigation_keybinds() -> (crate::config::Keybinds, (KeyCode, KeyModifiers)) {
-    let config = crate::config::Config::load().config;
-    (config.keybinds(), config.prefix_key())
 }
 
 /// #24: match `key` against the sidebar-nav bindings for the given trigger side and, if it matches,
@@ -2651,6 +2751,10 @@ fn run_client_with_mode(
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     #[cfg(unix)]
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
+    // Resolve the prefix-bar bindings before `loaded_config.config` is partially moved below (the
+    // sound config is moved out), so the compositor can seed its cache without re-reading config.
+    let client_prefix_keybinds = loaded_config.config.keybinds();
+    let client_prefix_combo = loaded_config.config.prefix_key();
     let sound_config = loaded_config.config.ui.sound;
     let direct_attach_requested = attach_request.is_some();
     let kitty_graphics_enabled =
@@ -2788,9 +2892,14 @@ fn run_client_with_mode(
     });
 
     let result = rt.block_on(async {
-        let client_compositor = render_plan
+        let mut client_compositor = render_plan
             .use_client_compositor
             .then(compositor::ClientCompositor::default);
+        // Seed the compositor's cached prefix bindings from local config once at startup so the
+        // prefix indicator bar renders correct labels without loading config on the render loop.
+        if let Some(compositor) = client_compositor.as_mut() {
+            compositor.set_prefix_bindings(client_prefix_keybinds, client_prefix_combo);
+        }
         run_client_loop(
             stream,
             should_quit,
@@ -4805,9 +4914,14 @@ fn recompose_composited_frame(state: &mut ClientState, rebuild: bool) {
         .supervisor_model
         .as_ref()
         .and_then(|model| model.client_menu().map(|menu| menu.selected));
+    let prefix_armed = state
+        .compositor
+        .as_ref()
+        .is_some_and(|comp| comp.prefix_armed());
     let Some(frame_data) = state.shell_cache.as_ref().map(|shell| {
         let mut frame = compositor::overlay_content_onto_shell(shell, &active_frame);
         compositor::apply_hover_overlay(&mut frame, shell, hover, menu_selected);
+        compositor::apply_prefix_bar(&mut frame, shell, prefix_armed);
         frame
     }) else {
         return;
@@ -4871,6 +4985,9 @@ fn render_incoming_server_frame(
             comp.hover(),
             model.client_menu().map(|menu| menu.selected),
         );
+        // Paint the client-local prefix indicator bar when prefix is armed (like the hover overlay,
+        // the flag is live so it survives a content-only repaint without a shell rebuild).
+        compositor::apply_prefix_bar(&mut frame_data, shell, comp.prefix_armed());
         compose_elapsed = compose_started.elapsed();
     }
     flush_composited_frame(state, frame_data, compose_elapsed, shell_rebuilt);
@@ -5311,6 +5428,21 @@ async fn run_client_loop(
                     {
                         match dispatch_composited_input(data, compositor, model, state.host_size) {
                             ClientInputDispatch::Forward(data) => data,
+                            // Recompose locally BEFORE forwarding so a client-local presentation
+                            // change (e.g. the prefix bar clearing on disarm) shows on this keypress
+                            // rather than waiting for the server's next frame. Yields the bytes to the
+                            // shared send path below, exactly like `Forward`.
+                            //
+                            // Only the client-local `prefix_armed` flag changed — the sidebar model
+                            // is untouched — so recompose lightweightly (`rebuild=false`): keep the
+                            // cached shell + blit baseline and just re-blit. `apply_prefix_bar` reads
+                            // the now-disarmed flag and skips the bar (clearing it, restoring the
+                            // cursor). A `request_full_redraw` here would needlessly drop the shell
+                            // cache (forcing a `build_shell`/config reload) and reset the blit diff.
+                            ClientInputDispatch::ForwardAndRedraw(data) => {
+                                recompose_composited_frame(&mut state, false);
+                                data
+                            }
                             ClientInputDispatch::ServerControl { server_id, message } => {
                                 if let Err(e) =
                                     queue_to_server_id(&server_writes, &server_id, message)
@@ -5830,12 +5962,19 @@ async fn run_client_loop(
                         let _ = stdout.flush();
                     }
                     ServerMessage::ReloadSoundConfig => {
+                        // Reload once and apply everything (sound / redraw / remote-image, plus the
+                        // compositor's cached prefix bindings so the bar labels track keybind changes).
                         reload_local_client_config(
                             &mut state.sound_config,
                             &mut state.redraw_on_focus_gained,
                             #[cfg(unix)]
                             &mut state.remote_image_paste_key,
+                            state.compositor.as_mut(),
                         );
+                        // Drop the cached shell so the prefix bar (its cells are prebuilt from the
+                        // bindings) rebuilds with the reloaded keybindings instead of showing stale
+                        // labels until the next model change.
+                        state.request_full_redraw();
                         // #58: a config reload may have changed the server-side sidebar settings
                         // (pane/tab/space rows), which the client renders from the server-pushed
                         // UiSettings. Re-fetch them off the UI loop NOW instead of waiting up to ~2s
@@ -6907,6 +7046,7 @@ fn reload_local_client_config(
         crossterm::event::KeyCode,
         crossterm::event::KeyModifiers,
     )>,
+    compositor: Option<&mut compositor::ClientCompositor>,
 ) {
     match crate::config::load_live_config() {
         Ok(loaded) => {
@@ -6915,6 +7055,12 @@ fn reload_local_client_config(
             }
             #[cfg(unix)]
             let loaded_remote_image_paste_key = client_remote_image_paste_key(&loaded.config);
+            // Refresh the compositor's cached prefix bindings from the SAME loaded config, before the
+            // sound config is moved out below — so a reload does one config load, not two.
+            if let Some(compositor) = compositor {
+                compositor
+                    .set_prefix_bindings(loaded.config.keybinds(), loaded.config.prefix_key());
+            }
             *sound_config = loaded.config.ui.sound;
             *redraw_on_focus_gained = loaded.config.ui.redraw_on_focus_gained;
             #[cfg(unix)]
@@ -8050,6 +8196,7 @@ mod tests {
             &mut redraw_on_focus_gained,
             #[cfg(unix)]
             &mut remote_image_paste_key,
+            None,
         );
 
         assert!(!redraw_on_focus_gained);
@@ -9201,6 +9348,236 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn armed_prefix_forwarding_server_key_requests_local_redraw() {
+        // Leaving prefix mode by forwarding a server-owned key must schedule a local recompose so
+        // the client-drawn prefix bar clears on THIS keypress, not only when the server's next frame
+        // lands. Regression guard: the plain `Forward` path left the bar stale (Codex codex-1-1).
+        let mut compositor = compositor::ClientCompositor::new(20);
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let keybinds = crate::config::Keybinds::default();
+        let prefix = (KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        compositor.arm_prefix(vec![0x02]); // ctrl+b bytes buffered on arm
+        assert!(compositor.prefix_armed());
+
+        // '%' is a server-owned prefix action (split); it is never in the client sidebar-nav subset,
+        // so it is replayed to the server as prefix+key rather than handled locally.
+        let key = crate::input::TerminalKey::new(KeyCode::Char('%'), KeyModifiers::empty());
+        let dispatch = dispatch_composited_key_input_with_bindings(
+            key,
+            b"%",
+            &mut compositor,
+            &mut model,
+            &keybinds,
+            prefix,
+        );
+
+        assert!(
+            matches!(dispatch, Some(ClientInputDispatch::ForwardAndRedraw(_))),
+            "forwarding a server-owned key on prefix disarm must schedule a local redraw, got {dispatch:?}"
+        );
+        assert!(
+            !compositor.prefix_armed(),
+            "prefix must be disarmed after forwarding the follow-up key"
+        );
+    }
+
+    #[test]
+    fn armed_prefix_send_prefix_forwards_literal_prefix() {
+        // Pressing the prefix key again while armed is "send prefix" (as the bar advertises): the
+        // client must replay prefix+prefix to the server so its handler passes a literal prefix byte
+        // to the focused pane (tmux send-prefix), not swallow it like Esc. Regression: Codex codex-7-1.
+        let mut compositor = compositor::ClientCompositor::new(20);
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let keybinds = crate::config::Keybinds::default();
+        let prefix = (KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        compositor.arm_prefix(vec![0x02]); // first ctrl+b buffered on arm
+        let key = crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let dispatch = dispatch_composited_key_input_with_bindings(
+            key,
+            b"\x02", // second ctrl+b's byte
+            &mut compositor,
+            &mut model,
+            &keybinds,
+            prefix,
+        );
+
+        assert_eq!(
+            dispatch,
+            Some(ClientInputDispatch::ForwardAndRedraw(vec![0x02, 0x02])),
+            "prefix+prefix must forward the literal prefix (send-prefix) and clear the bar"
+        );
+        assert!(
+            !compositor.prefix_armed(),
+            "prefix must be disarmed after send-prefix"
+        );
+    }
+
+    #[test]
+    fn armed_esc_prefix_send_prefix_forwards_literal_esc() {
+        // With `prefix = "esc"` (a documented config), Esc IS the prefix key, so pressing it while
+        // armed is send-prefix — it must forward esc+esc, NOT be swallowed as a cancel. The prefix
+        // match is checked before the generic Esc-cancel, mirroring the server. Codex codex-7-4.
+        let mut compositor = compositor::ClientCompositor::new(20);
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let keybinds = crate::config::Keybinds::default();
+        let prefix = (KeyCode::Esc, KeyModifiers::empty());
+
+        compositor.arm_prefix(vec![0x1b]); // first esc buffered on arm
+        let key = crate::input::TerminalKey::new(KeyCode::Esc, KeyModifiers::empty());
+        let dispatch = dispatch_composited_key_input_with_bindings(
+            key,
+            b"\x1b",
+            &mut compositor,
+            &mut model,
+            &keybinds,
+            prefix,
+        );
+
+        assert_eq!(
+            dispatch,
+            Some(ClientInputDispatch::ForwardAndRedraw(vec![0x1b, 0x1b])),
+            "esc-prefix send-prefix must forward the literal esc, not swallow it as cancel"
+        );
+        assert!(!compositor.prefix_armed());
+    }
+
+    #[test]
+    fn armed_prefix_esc_cancels_when_esc_is_not_prefix() {
+        // With a non-Esc prefix (ctrl+b), plain Esc while armed still cancels prefix mode locally.
+        let mut compositor = compositor::ClientCompositor::new(20);
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let keybinds = crate::config::Keybinds::default();
+        let prefix = (KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        compositor.arm_prefix(vec![0x02]);
+        let key = crate::input::TerminalKey::new(KeyCode::Esc, KeyModifiers::empty());
+        let dispatch = dispatch_composited_key_input_with_bindings(
+            key,
+            b"\x1b",
+            &mut compositor,
+            &mut model,
+            &keybinds,
+            prefix,
+        );
+
+        assert_eq!(
+            dispatch,
+            Some(ClientInputDispatch::Redraw),
+            "plain Esc (not the prefix) must cancel prefix mode locally"
+        );
+        assert!(!compositor.prefix_armed());
+    }
+
+    #[test]
+    fn dispatch_uses_cached_prefix_binding_not_config_load() {
+        // The input dispatcher and the prefix bar must read ONE keybinding source (the compositor
+        // cache), so the bar can never advertise a key the dispatcher won't honor. Set a non-default
+        // cached prefix (ctrl+x) and assert the dispatcher arms on ctrl+x — proving it reads the cache
+        // rather than loading the ambient config (whose default prefix is ctrl+b). Codex codex-7-2.
+        let mut compositor = compositor::ClientCompositor::new(20);
+        compositor.set_prefix_bindings(
+            crate::config::Keybinds::default(),
+            (KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        assert!(!compositor.prefix_armed());
+
+        // ctrl+x matches the cached prefix → arms prefix mode.
+        let key = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        let dispatch = dispatch_composited_key_input(key, b"\x18", &mut compositor, &mut model);
+        assert_eq!(
+            dispatch,
+            Some(ClientInputDispatch::Redraw),
+            "the cached prefix (ctrl+x) should arm prefix mode"
+        );
+        assert!(
+            compositor.prefix_armed(),
+            "dispatch must honor the cached prefix binding (ctrl+x), not Config::load's default"
+        );
+    }
+
+    #[test]
+    fn armed_prefix_noop_client_action_still_requests_redraw() {
+        // A client-handled prefix action can resolve to a no-op (`Consumed`) — e.g. next-workspace
+        // with no workspaces. Leaving prefix mode must still schedule a local repaint so the
+        // client-drawn prefix bar clears, instead of the loop dropping the no-op with no render.
+        // Regression guard for Codex codex-3-1 (the client-action sibling of codex-1-1).
+        let mut compositor = compositor::ClientCompositor::new(20);
+        // Empty model: `next_workspace` has no target, so `step_workspace_focus` returns `Consumed`.
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        // `next_workspace` is the first-checked client prefix action, so binding it to the test key
+        // avoids any collision with the other actions' default bindings.
+        let keybinds = crate::config::Keybinds {
+            next_workspace: crate::config::ActionKeybinds::prefix("g"),
+            ..crate::config::Keybinds::default()
+        };
+        let prefix = (KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        compositor.arm_prefix(vec![0x02]);
+        let key = crate::input::TerminalKey::new(KeyCode::Char('g'), KeyModifiers::empty());
+        let dispatch = dispatch_composited_key_input_with_bindings(
+            key,
+            b"g",
+            &mut compositor,
+            &mut model,
+            &keybinds,
+            prefix,
+        );
+
+        assert_eq!(
+            dispatch,
+            Some(ClientInputDispatch::Redraw),
+            "a no-op client action on prefix disarm must schedule a local redraw to clear the bar"
+        );
+        assert!(
+            !compositor.prefix_armed(),
+            "prefix must be disarmed after a client-handled follow-up key"
+        );
+    }
+
+    #[test]
+    fn armed_prefix_collided_noop_action_redraws_when_no_toggle_animation() {
+        // A duplicate binding can share a key between an earlier client action and the sidebar
+        // collapse toggle. When the earlier action wins and resolves to a no-op (`Consumed`) without
+        // toggling the sidebar, leaving prefix mode must still repaint — the toggle exception applies
+        // only when a collapse animation is actually in flight, not merely when the pressed key
+        // matches the toggle binding. Regression guard for Codex codex-6-1.
+        let mut compositor = compositor::ClientCompositor::new(20);
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        // Duplicate binding: `next_workspace` (checked first) and `toggle_sidebar` both on prefix+b.
+        let keybinds = crate::config::Keybinds {
+            next_workspace: crate::config::ActionKeybinds::prefix("b"),
+            toggle_sidebar: crate::config::ActionKeybinds::prefix("b"),
+            ..crate::config::Keybinds::default()
+        };
+        let prefix = (KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        compositor.arm_prefix(vec![0x02]);
+        // Empty model → `next_workspace` matches first and returns Consumed without toggling.
+        let key = crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::empty());
+        let dispatch = dispatch_composited_key_input_with_bindings(
+            key,
+            b"b",
+            &mut compositor,
+            &mut model,
+            &keybinds,
+            prefix,
+        );
+
+        assert_eq!(
+            dispatch,
+            Some(ClientInputDispatch::Redraw),
+            "a collided no-op action that did not toggle the sidebar must still schedule a redraw"
+        );
+        assert!(
+            !compositor.sidebar_collapsed_for_test(),
+            "the earlier no-op action ran, so the sidebar must not have toggled"
+        );
+    }
+
     fn mixed_remote_model_with_many_workspaces(
         main_count: usize,
         remote_count: usize,
@@ -9282,6 +9659,121 @@ mod tests {
             model.filter(),
             &supervisor::ServerFilter::Server(supervisor::ServerId::main())
         );
+    }
+
+    #[test]
+    fn mouse_input_while_prefix_armed_disarms_and_repaints() {
+        // A mouse interaction abandons a pending client prefix: it must disarm prefix (so the next
+        // typed key is normal input, not a prefix action) and repaint so the bar clears. Codex
+        // codex-7-5.
+        let (mut model, _) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        compositor.arm_prefix(vec![0x02]);
+        assert!(compositor.prefix_armed());
+
+        // A sidebar click (Down(Left) at col 24, row 1) while armed.
+        let dispatch = dispatch_composited_input(
+            b"\x1b[<0;24;1M".to_vec(),
+            &mut compositor,
+            &mut model,
+            (60, 16),
+        );
+
+        assert!(
+            !compositor.prefix_armed(),
+            "a mouse interaction must disarm the pending client prefix"
+        );
+        assert!(
+            !matches!(
+                dispatch,
+                ClientInputDispatch::Consumed | ClientInputDispatch::Forward(_)
+            ),
+            "the mouse dispatch must repaint so the prefix bar clears, got {dispatch:?}"
+        );
+    }
+
+    #[test]
+    fn coalesced_mouse_while_prefix_armed_disarms_and_repaints() {
+        // The coalesced multi-mouse branch (a single read carrying several SGR reports) must also
+        // abandon a pending client prefix, not just the single-event path. Codex codex-7-6.
+        let bytes = b"\x1b[<0;50;5M\x1b[<0;50;6M".to_vec();
+        let events = crate::raw_input::parse_raw_input_bytes_sync(&bytes);
+        assert!(
+            events.len() > 1
+                && events
+                    .iter()
+                    .all(|e| matches!(e, crate::raw_input::RawInputEvent::Mouse(_))),
+            "sanity: the test buffer must hit the coalesced all-mouse branch, got {events:?}"
+        );
+
+        let (mut model, _) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        compositor.arm_prefix(vec![0x02]);
+        assert!(compositor.prefix_armed());
+
+        let dispatch = dispatch_composited_input(bytes, &mut compositor, &mut model, (60, 16));
+
+        assert!(
+            !compositor.prefix_armed(),
+            "a coalesced mouse read must disarm the pending client prefix"
+        );
+        assert!(
+            !matches!(
+                dispatch,
+                ClientInputDispatch::Consumed | ClientInputDispatch::Forward(_)
+            ),
+            "the coalesced mouse dispatch must repaint so the prefix bar clears, got {dispatch:?}"
+        );
+    }
+
+    #[test]
+    fn coalesced_prefix_and_client_action_runs_locally() {
+        // A prefix key + a client-owned follow-up coalesced into one stdin read must still run the
+        // client action, not forward the raw bytes to the server. Codex codex-8-1.
+        let ev = crate::raw_input::parse_raw_input_bytes_sync(b"\x02b");
+        assert!(
+            ev.len() == 2
+                && ev
+                    .iter()
+                    .all(|e| matches!(e, crate::raw_input::RawInputEvent::Key(_))),
+            "sanity: ctrl+b + b must coalesce to two Key events, got {ev:?}"
+        );
+        with_client_keys_config(
+            "[keys]\nprefix = \"ctrl+b\"\ntoggle_sidebar = \"prefix+b\"\n",
+            || {
+                let (mut model, _) = mixed_remote_model();
+                let mut compositor = configured_compositor(26);
+                assert!(!compositor.sidebar_collapsed_for_test());
+                let _ = dispatch_composited_input(
+                    b"\x02b".to_vec(),
+                    &mut compositor,
+                    &mut model,
+                    (60, 16),
+                );
+                assert!(
+                    compositor.sidebar_collapsed_for_test(),
+                    "coalesced prefix+b must toggle the client sidebar"
+                );
+                assert!(!compositor.prefix_armed());
+            },
+        );
+    }
+
+    #[test]
+    fn coalesced_prefix_and_server_key_forwards_raw() {
+        // A prefix key + a server-owned follow-up coalesced into one read forwards the raw bytes so
+        // the server's own prefix machine runs prefix+key, and clears the client prefix state.
+        with_client_keys_config("[keys]\nprefix = \"ctrl+b\"\n", || {
+            let (mut model, _) = mixed_remote_model();
+            let mut compositor = configured_compositor(26);
+            let dispatch =
+                dispatch_composited_input(b"\x02c".to_vec(), &mut compositor, &mut model, (60, 16));
+            assert_eq!(
+                dispatch,
+                ClientInputDispatch::ForwardAndRedraw(b"\x02c".to_vec())
+            );
+            assert!(!compositor.prefix_armed());
+        });
     }
 
     #[test]
@@ -9456,6 +9948,17 @@ mod tests {
         result
     }
 
+    /// Build a compositor whose prefix-binding cache is seeded from the currently-active config
+    /// (the temp config installed by `with_client_keys_config`), mirroring the startup seeding.
+    /// Dispatch reads the cache — not a per-keypress config load — so a config-driven keybinding test
+    /// must seed it, exactly as the real client does at startup / on reload.
+    fn configured_compositor(width: u16) -> compositor::ClientCompositor {
+        let mut compositor = compositor::ClientCompositor::new(width);
+        let cfg = crate::config::Config::load().config;
+        compositor.set_prefix_bindings(cfg.keybinds(), cfg.prefix_key());
+        compositor
+    }
+
     /// #24: feed a single bare char keypress (no modifiers) through the composited input path.
     fn press_char(
         c: char,
@@ -9472,7 +9975,7 @@ mod tests {
     fn next_workspace_key_focuses_next_workspace_across_server_boundary() {
         with_client_keys_config("[keys]\nnext_workspace = \"alt+n\"\n", || {
             let (mut model, remote_id) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
             assert_eq!(model.active_server_id(), &supervisor::ServerId::main());
 
             let dispatch =
@@ -9503,7 +10006,7 @@ mod tests {
     fn prev_workspace_key_wraps_to_last_workspace() {
         with_client_keys_config("[keys]\nprevious_workspace = \"alt+p\"\n", || {
             let (mut model, remote_id) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
 
             let dispatch =
                 dispatch_composited_input(b"\x1bp".to_vec(), &mut compositor, &mut model, (60, 16));
@@ -9594,7 +10097,7 @@ mod tests {
     fn new_workspace_key_opens_picker() {
         with_client_keys_config("[keys]\nnew_workspace = \"alt+m\"\n", || {
             let (mut model, _) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
             assert!(model.new_workspace_picker().is_none());
 
             let dispatch =
@@ -9610,7 +10113,7 @@ mod tests {
     fn rename_workspace_key_opens_rename_overlay_for_focused_workspace() {
         with_client_keys_config("[keys]\nrename_workspace = \"alt+r\"\n", || {
             let (mut model, _) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
             assert!(model.rename_workspace_form().is_none());
 
             let dispatch =
@@ -9630,7 +10133,7 @@ mod tests {
     fn close_workspace_key_opens_confirm_close_overlay_for_focused_workspace() {
         with_client_keys_config("[keys]\nclose_workspace = \"alt+d\"\n", || {
             let (mut model, _) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
             assert!(model.confirm_close_workspace().is_none());
 
             let dispatch =
@@ -9652,7 +10155,7 @@ mod tests {
     fn collapse_toggle_key_flips_sidebar_collapsed() {
         with_client_keys_config("[keys]\ntoggle_sidebar = \"alt+b\"\n", || {
             let (mut model, _) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
             assert!(!compositor.sidebar_collapsed_for_test());
 
             let dispatch =
@@ -9673,7 +10176,7 @@ mod tests {
             "[keys]\nprefix = \"ctrl+b\"\ntoggle_sidebar = \"prefix+b\"\n",
             || {
                 let (mut model, _) = mixed_remote_model();
-                let mut compositor = compositor::ClientCompositor::new(26);
+                let mut compositor = configured_compositor(26);
                 assert!(!compositor.sidebar_collapsed_for_test());
 
                 // ctrl+b (0x02) arms prefix mode: swallowed (Redraw), nothing forwarded yet.
@@ -9685,13 +10188,18 @@ mod tests {
 
                 // 'b' resolves the prefix-mode collapse: flips the CLIENT flag, disarms prefix, and
                 // is NOT forwarded to the server. #58: the collapse toggle returns `Consumed` (never a
-                // Forward) — the single collapse tick repaints the final width, no pre-toggle redraw.
+                // Forward) — the collapse animation repaints the final width, no pre-toggle redraw.
                 assert_eq!(
                     press_char('b', &mut compositor, &mut model),
                     ClientInputDispatch::Consumed
                 );
                 assert!(!compositor.prefix_armed());
                 assert!(compositor.sidebar_collapsed_for_test());
+
+                // Settle the collapse animation the way the loop's 80ms Timer does in production, so
+                // the next toggle starts from a settled width (codex-6-1: the toggle keeps `Consumed`
+                // only while an animation is actually in flight).
+                compositor.step_sidebar_width_animation();
 
                 // ctrl+b then b again expands — flips back the other direction.
                 assert_eq!(
@@ -9713,7 +10221,7 @@ mod tests {
     fn unbound_plain_key_is_forwarded_not_intercepted() {
         with_client_keys_config("[keys]\nnext_workspace = \"alt+n\"\n", || {
             let (mut model, _) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
 
             // 'x' matches no sidebar-nav binding and the prefix is not armed: Forward.
             assert_eq!(
@@ -9737,7 +10245,7 @@ mod tests {
             "[keys]\nprefix = \"ctrl+b\"\nnext_workspace = \"prefix+n\"\n",
             || {
                 let (mut model, remote_id) = mixed_remote_model();
-                let mut compositor = compositor::ClientCompositor::new(26);
+                let mut compositor = configured_compositor(26);
 
                 // Not armed: a bare 'n' is forwarded to the terminal (never hijacked).
                 assert_eq!(
@@ -9783,7 +10291,7 @@ mod tests {
     fn prefix_then_unhandled_key_forwards_prefix_and_key_to_server() {
         with_client_keys_config("[keys]\nprefix = \"ctrl+b\"\n", || {
             let (mut model, _remote_id) = mixed_remote_model();
-            let mut compositor = compositor::ClientCompositor::new(26);
+            let mut compositor = configured_compositor(26);
 
             // ctrl+b (0x02) arms prefix mode and is swallowed (not forwarded yet).
             assert_eq!(
@@ -9792,10 +10300,13 @@ mod tests {
             );
             assert!(compositor.prefix_armed());
 
-            // 'c' is not a client sidebar-nav binding → replay prefix + key to the server.
+            // 'c' is not a client sidebar-nav binding → replay prefix + key to the server, and
+            // repaint locally as we leave prefix mode so the client-drawn prefix bar clears now
+            // instead of waiting for the server's next frame (ForwardAndRedraw carries the SAME
+            // forwarded bytes as the old Forward).
             assert_eq!(
                 press_char('c', &mut compositor, &mut model),
-                ClientInputDispatch::Forward(vec![0x02, b'c'])
+                ClientInputDispatch::ForwardAndRedraw(vec![0x02, b'c'])
             );
             assert!(!compositor.prefix_armed());
         });
@@ -9809,14 +10320,14 @@ mod tests {
             "[keys]\nprefix = \"ctrl+b\"\ndetach = \"prefix+q\"\n",
             || {
                 let (mut model, _remote_id) = mixed_remote_model();
-                let mut compositor = compositor::ClientCompositor::new(26);
+                let mut compositor = configured_compositor(26);
                 assert_eq!(
                     dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (60, 16)),
                     ClientInputDispatch::Redraw
                 );
                 assert_eq!(
                     press_char('q', &mut compositor, &mut model),
-                    ClientInputDispatch::Forward(vec![0x02, b'q'])
+                    ClientInputDispatch::ForwardAndRedraw(vec![0x02, b'q'])
                 );
                 assert!(!compositor.prefix_armed());
             },

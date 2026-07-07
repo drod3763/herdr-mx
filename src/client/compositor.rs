@@ -238,6 +238,16 @@ pub(crate) struct ClientCompositor {
     // subset of prefix actions (sidebar nav); the server owns the rest (tabs/panes/splits/detach),
     // so a key the client does not handle must reach the server WITH the prefix that preceded it.
     prefix_pending_bytes: Option<Vec<u8>>,
+    // Cached prefix-mode bindings for the indicator bar (keybind labels + the prefix combo),
+    // resolved from local config at startup and refreshed on config-reload events. Read by
+    // `build_shell_inner` so shell rebuilds never do synchronous config file I/O on the UI loop.
+    // `Keybinds` is behind an `Arc` so the per-keypress dispatch snapshot is a cheap refcount clone,
+    // not a deep clone of the whole struct (its many `Vec`s); the deep clone is reserved for the rare
+    // shell rebuild.
+    prefix_bindings: (
+        std::sync::Arc<crate::config::Keybinds>,
+        (crossterm::event::KeyCode, crossterm::event::KeyModifiers),
+    ),
     // #22: client-local collapsed worktree-group keys. The server persists its OWN set
     // (`AppState.collapsed_space_keys`); collapse of the client's AGGREGATED multi-host view is a
     // per-client display concern, so the client owns this set (no server round-trip). Fed into
@@ -291,6 +301,24 @@ pub(crate) struct ComposedShell {
     /// painted per-frame by [`apply_hover_overlay`] from THIS geometry + the live hover target. The
     /// geometry depends only on the model/view/size, exactly like the shell, so it is cached with it.
     hover: HoverGeometry,
+    /// The prefix-mode indicator bar, prebuilt from the (stable) snapshot styling so it can be
+    /// blitted onto the content region's bottom row per-frame by [`apply_prefix_bar`] when the
+    /// client-local prefix is armed. The client owns prefix mode (`prefix_armed`) and never puts the
+    /// server into `Mode::Prefix`, so the server frame carries no bar — the client draws its own,
+    /// mirroring the monolithic host's `render_prefix_overlay`. Gating is live at paint time; the
+    /// cells depend only on config/style/size, so they cache with the shell like `hover`. `None` when
+    /// the content region is empty.
+    prefix_bar: Option<PrefixBarRow>,
+}
+
+/// The prebuilt prefix-mode indicator bar row: the composited cells for the content region's bottom
+/// row plus their target origin. [`apply_prefix_bar`] blits `cells` starting at `(x, y)` when the
+/// client-local prefix is armed.
+#[derive(Clone)]
+struct PrefixBarRow {
+    x: u16,
+    y: u16,
+    cells: Vec<CellData>,
 }
 
 /// #56: per-frame hover/selection highlight geometry, carried on the (hover-less) cached shell so a
@@ -526,6 +554,13 @@ impl ClientCompositor {
             collapse_progress: 0.0,
             prefix_armed: false,
             prefix_pending_bytes: None,
+            prefix_bindings: (
+                std::sync::Arc::new(crate::config::Keybinds::default()),
+                (
+                    crossterm::event::KeyCode::Char('b'),
+                    crossterm::event::KeyModifiers::CONTROL,
+                ),
+            ),
             collapsed_space_keys: std::collections::HashSet::new(),
             menu_drag: None,
             working_since: HashMap::new(),
@@ -553,6 +588,30 @@ impl ClientCompositor {
     pub(crate) fn disarm_prefix(&mut self) {
         self.prefix_armed = false;
         self.prefix_pending_bytes = None;
+    }
+
+    /// Refresh the cached prefix-mode bindings (called at client startup and on config reload) so the
+    /// prefix indicator bar reads them from memory instead of loading config from disk on the render
+    /// loop.
+    pub(crate) fn set_prefix_bindings(
+        &mut self,
+        keybinds: crate::config::Keybinds,
+        prefix: (crossterm::event::KeyCode, crossterm::event::KeyModifiers),
+    ) {
+        self.prefix_bindings = (std::sync::Arc::new(keybinds), prefix);
+    }
+
+    /// Snapshot of the cached prefix-mode bindings (keybinds + prefix combo). Both the prefix bar
+    /// render path and the input dispatcher read this ONE cache, so the bar can never advertise a key
+    /// the dispatcher won't honor. Refreshed only at startup / on config reload. The `Keybinds` ride
+    /// an `Arc`, so this per-keypress snapshot is a cheap refcount clone, not a deep struct clone.
+    pub(crate) fn prefix_bindings_snapshot(
+        &self,
+    ) -> (
+        std::sync::Arc<crate::config::Keybinds>,
+        (crossterm::event::KeyCode, crossterm::event::KeyModifiers),
+    ) {
+        self.prefix_bindings.clone()
     }
 
     /// #30: take the buffered prefix-key bytes, used to replay `prefix + follow-up` to the server
@@ -1408,6 +1467,16 @@ impl ClientCompositor {
             host_height,
             now,
         );
+        // The prefix-mode indicator bar (blitted by `apply_prefix_bar` when the client-local prefix
+        // is armed) reads the prefix combo + sidebar-nav labels from the cached bindings — the SAME
+        // snapshot the input dispatcher reads (`prefix_bindings_snapshot`), refreshed at startup / on
+        // config reload. Read from memory here — no config file I/O on the render loop (shell
+        // rebuilds run on model/resize changes).
+        let (keybinds, (prefix_code, prefix_mods)) = &self.prefix_bindings;
+        // Rare shell-rebuild path: deep-clone the Arc's inner Keybinds into the snapshot's AppState.
+        snapshot.app.keybinds = keybinds.as_ref().clone();
+        snapshot.app.prefix_code = *prefix_code;
+        snapshot.app.prefix_mods = *prefix_mods;
         // #56: compute the hover highlight geometry from the (hover-less) snapshot BEFORE clearing
         // the baked hover, so it captures the same card/row/menu rects the renderer lays out.
         let hover = compute_hover_geometry(&snapshot);
@@ -1467,6 +1536,8 @@ impl ClientCompositor {
             || model.worktree_picker().is_some()
             || model.ssh_host_picker().is_some();
 
+        let prefix_bar = build_prefix_bar_row(&snapshot, sidebar_width, content_width, host_height);
+
         ComposedShell {
             frame,
             excluded_rects,
@@ -1476,6 +1547,7 @@ impl ClientCompositor {
             host_width,
             host_height,
             hover,
+            prefix_bar,
         }
     }
 
@@ -2702,6 +2774,44 @@ fn render_client_shell(
     FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[])
 }
 
+/// Prebuild the prefix-mode indicator bar for the content region's bottom row using the SHARED
+/// [`crate::ui::render_prefix_overlay`] (the same renderer the monolithic host draws), so the
+/// composited client's bar can never drift from the server's. Rendered into a one-row scratch
+/// backend the width of the content region — `render_prefix_overlay` draws on the LAST row of the
+/// area it is given, so a height-1 area lands the bar on row 0 — then captured as cells positioned
+/// at the content region's bottom row. Returns `None` when the content region is empty or the
+/// scratch render fails (no panic in this production render path — the bar is simply skipped).
+fn build_prefix_bar_row(
+    snapshot: &ClientSidebarSnapshot,
+    sidebar_width: u16,
+    content_width: u16,
+    host_height: u16,
+) -> Option<PrefixBarRow> {
+    if content_width == 0 || host_height == 0 {
+        return None;
+    }
+    let backend = ratatui::backend::TestBackend::new(content_width, 1);
+    // `.ok()?` rather than `.expect(...)`: skip the bar (return None) instead of panicking if the
+    // scratch render ever fails, per the no-panic convention for production code.
+    let mut terminal = ratatui::Terminal::new(backend).ok()?;
+    terminal
+        .draw(|frame| {
+            crate::ui::render_prefix_overlay(
+                &snapshot.app,
+                frame,
+                Rect::new(0, 0, content_width, 1),
+            );
+        })
+        .ok()?;
+    let buffer = terminal.backend().buffer().clone();
+    let row = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
+    Some(PrefixBarRow {
+        x: sidebar_width,
+        y: host_height.saturating_sub(1),
+        cells: row.cells,
+    })
+}
+
 fn render_filter_label(snapshot: &ClientSidebarSnapshot, frame: &mut ratatui::Frame) {
     let rect = filter_label_rect(snapshot.app.view.sidebar_rect, &snapshot.filter_label);
     if rect == Rect::default() {
@@ -3650,6 +3760,33 @@ pub(crate) fn apply_hover_overlay(
     }
 }
 
+/// Blit the prebuilt prefix-mode indicator bar onto the composited frame when the client-local
+/// prefix is armed. Mirrors [`apply_hover_overlay`]: the cells/position are cached on the shell, but
+/// the live `prefix_armed` flag gates the paint per-frame so arming/disarming prefix needs no shell
+/// rebuild. A no-op when disarmed or when the shell carries no bar (empty content region).
+pub(crate) fn apply_prefix_bar(frame: &mut FrameData, shell: &ComposedShell, prefix_armed: bool) {
+    if !prefix_armed {
+        return;
+    }
+    // Prefix is a client-local command mode. Hide the child (pane) cursor while it is active, matching
+    // the monolithic renderer (`render_panes` shows the pane cursor only in `Mode::Terminal`) and the
+    // modal path in `overlay_content_onto_shell`. Otherwise the copied server cursor keeps blinking —
+    // and can draw through the bar — during prefix mode. Done before the bar-cell blit so it applies
+    // even in the degenerate empty-content case where `prefix_bar` is `None`.
+    frame.cursor = None;
+    let Some(bar) = shell.prefix_bar.as_ref() else {
+        return;
+    };
+    for (col, cell) in bar.cells.iter().enumerate() {
+        let x = bar.x.saturating_add(col as u16);
+        if let Some(target) = frame_cell_mut(frame, x, bar.y) {
+            // `clone_from` reuses the target cell's existing `symbol` String allocation instead of
+            // allocating a fresh one per column on every armed-frame blit.
+            target.clone_from(cell);
+        }
+    }
+}
+
 fn recolor_affordance(frame: &mut FrameData, rect: Option<Rect>, geom: &HoverGeometry) {
     if let Some(rect) = rect {
         recolor_rect_fg(frame, rect, geom.affordance_from, geom.affordance_to);
@@ -4072,6 +4209,166 @@ mod tests {
 
         assert_eq!(composed.width, 8);
         assert_eq!(composed.cells[7].symbol, "x");
+    }
+
+    #[test]
+    fn prefix_bar_paints_content_bottom_row_when_armed() {
+        // The composited client owns prefix mode locally (the server stays in `Mode::Terminal`), so
+        // the bar must be drawn client-side. When armed, `apply_prefix_bar` blits it onto the
+        // content region's bottom row. Regression guard for the mx bar-missing bug.
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: Some("master".into()),
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let (host_w, host_h, sidebar_w) = (60, 6, 20);
+        let mut compositor = ClientCompositor::new(sidebar_w);
+        compositor.arm_prefix(vec![0x02]); // ctrl+b bytes (content irrelevant to the render)
+        let shell = compositor.build_shell(&model, host_w, host_h, std::time::Instant::now());
+        let content = frame(host_w - sidebar_w, host_h, &["content"]);
+        let mut composed = overlay_content_onto_shell(&shell, &content);
+        apply_prefix_bar(&mut composed, &shell, compositor.prefix_armed());
+
+        assert!(
+            row_text(&composed, host_h - 1).contains("PREFIX"),
+            "prefix bar must paint the content bottom row while prefix is armed"
+        );
+    }
+
+    #[test]
+    fn prefix_bar_absent_when_not_armed() {
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: Some("master".into()),
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let (host_w, host_h, sidebar_w) = (60, 6, 20);
+        let compositor = ClientCompositor::new(sidebar_w);
+        let shell = compositor.build_shell(&model, host_w, host_h, std::time::Instant::now());
+        let content = frame(host_w - sidebar_w, host_h, &["content"]);
+        let mut composed = overlay_content_onto_shell(&shell, &content);
+        apply_prefix_bar(&mut composed, &shell, compositor.prefix_armed());
+
+        assert!(
+            !row_text(&composed, host_h - 1).contains("PREFIX"),
+            "no prefix bar should be painted while prefix is disarmed"
+        );
+    }
+
+    #[test]
+    fn prefix_bar_hides_child_cursor_when_armed() {
+        // Prefix is a client-local command mode: the child (pane) cursor must be hidden while it is
+        // active, matching the monolithic renderer (which shows the pane cursor only in
+        // Mode::Terminal). Otherwise the server pane's cursor keeps blinking — and can draw through
+        // the bar — during prefix mode. Codex codex-1-2.
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: Some("master".into()),
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let (host_w, host_h, sidebar_w) = (60, 6, 20);
+        let mut compositor = ClientCompositor::new(sidebar_w);
+        compositor.arm_prefix(vec![0x02]);
+        let shell = compositor.build_shell(&model, host_w, host_h, std::time::Instant::now());
+        // `frame` sets a visible cursor; `overlay_content_onto_shell` copies it into the content
+        // region (no modal open), so it is present before the prefix overlay runs.
+        let content = frame(host_w - sidebar_w, host_h, &["content"]);
+        let mut composed = overlay_content_onto_shell(&shell, &content);
+        assert!(
+            composed.cursor.is_some(),
+            "sanity: the content cursor is composited before the prefix overlay"
+        );
+
+        apply_prefix_bar(&mut composed, &shell, compositor.prefix_armed());
+
+        assert!(
+            composed.cursor.is_none(),
+            "prefix mode must hide the child cursor, matching the monolithic renderer"
+        );
+    }
+
+    #[test]
+    fn prefix_bar_uses_cached_bindings_not_config_io() {
+        // The bar reads the compositor's cached prefix bindings (seeded at startup / on reload), NOT
+        // a per-rebuild config load. A distinctive cached prefix (F9 → "f9") must show in the bar,
+        // proving `build_shell` used the cache rather than the ambient default (ctrl+b).
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: Some("master".into()),
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let (host_w, host_h, sidebar_w) = (60, 6, 20);
+        let mut compositor = ClientCompositor::new(sidebar_w);
+        compositor.set_prefix_bindings(
+            crate::config::Keybinds::default(),
+            (
+                crossterm::event::KeyCode::F(9),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+        );
+        compositor.arm_prefix(vec![0x02]);
+        let shell = compositor.build_shell(&model, host_w, host_h, std::time::Instant::now());
+        let content = frame(host_w - sidebar_w, host_h, &["content"]);
+        let mut composed = overlay_content_onto_shell(&shell, &content);
+        apply_prefix_bar(&mut composed, &shell, compositor.prefix_armed());
+
+        let bottom = row_text(&composed, host_h - 1);
+        assert!(
+            bottom.contains("PREFIX"),
+            "the prefix bar should still render"
+        );
+        assert!(
+            bottom.contains("f9"),
+            "the bar must show the cached prefix key (f9), got: {bottom:?}"
+        );
     }
 
     #[test]
