@@ -1212,8 +1212,12 @@ mod tests {
             output_str.contains("\x1b[H"),
             "full redraw should home the cursor"
         );
+        // Assert on cell symbols that never appear in escape sequences. 'H' would
+        // be a false positive: the homing `\x1b[H` and every CUP end in 'H', so it
+        // is present regardless of whether any cell content was written. 'i' and
+        // '!' only come from the frame's cells.
         assert!(
-            output_str.contains('H') || output_str.contains('i'),
+            output_str.contains('i') && output_str.contains('!'),
             "should contain cell content"
         );
     }
@@ -1609,16 +1613,31 @@ mod tests {
         blit_frame_to(&mut output, &frame, None);
         let output_str = String::from_utf8(output).unwrap();
 
-        // Every non-wide position is addressed and painted (the skip/empty cells as
-        // spaces), so nothing from a prior frame can survive underneath.
-        assert!(output_str.contains("\x1b[1;1HA") || output_str.contains('A'));
+        // Every non-wide position must be addressed AND have its glyph actually
+        // written, so nothing from a prior frame can survive underneath. Asserting
+        // only the CUP would still pass if the cursor moved but no glyph was emitted
+        // — the exact regression this test guards against. A style (SGR) sequence
+        // sits between each CUP and its glyph, but SGR/CUP bytes are only digits,
+        // ';', 'm', '[', and ESC, so the painted glyph ('A' or a space) is the sole
+        // such byte between one position's CUP and the next.
+        let p1 = output_str
+            .find("\x1b[1;1H")
+            .expect("lead cell must be addressed");
+        let p2 = output_str
+            .find("\x1b[1;2H")
+            .expect("skip cell must be addressed");
+        let p3 = output_str
+            .find("\x1b[1;3H")
+            .expect("empty cell must be addressed");
+        assert!(p1 < p2 && p2 < p3, "cells must be painted left to right");
+        assert!(output_str[p1..p2].contains('A'), "lead cell must paint 'A'");
         assert!(
-            output_str.contains("\x1b[1;2H"),
-            "skip cell must be repainted"
+            output_str[p2..p3].contains(' '),
+            "skip cell must paint a space, not just move the cursor"
         );
         assert!(
-            output_str.contains("\x1b[1;3H"),
-            "empty cell must be repainted"
+            output_str[p3..].contains(' '),
+            "empty cell must paint a space, not just move the cursor"
         );
         assert!(
             !output_str.contains("\x1b[2J"),
