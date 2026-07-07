@@ -679,6 +679,31 @@ fn dispatch_composited_input(
         }
     }
 
+    // A coalesced read carrying the prefix key + a follow-up in one chunk (fast typing; paste is a
+    // separate bracketed Paste event, so an all-Key read is genuine keypresses). Resolve it through
+    // the prefix state machine so a client-owned follow-up (sidebar nav/toggle) runs locally instead
+    // of being forwarded. A server-owned/unhandled follow-up forwards the raw read, which the
+    // server's own prefix machine handles correctly (no per-key byte reconstruction needed).
+    if let [crate::raw_input::RawInputEvent::Key(k1), crate::raw_input::RawInputEvent::Key(k2)] =
+        events.as_slice()
+    {
+        let (_, prefix) = compositor.prefix_bindings_snapshot();
+        if !compositor.prefix_armed() && crate::config::terminal_key_matches_combo(*k1, prefix) {
+            let _ = dispatch_composited_key_input(*k1, &data, compositor, model); // arms prefix
+            match dispatch_composited_key_input(*k2, &data, compositor, model) {
+                Some(ClientInputDispatch::Forward(_))
+                | Some(ClientInputDispatch::ForwardAndRedraw(_))
+                | None => {
+                    // Server-owned / unhandled follow-up: clear the client prefix state and forward
+                    // the raw read so the server's prefix machine runs prefix+key.
+                    compositor.disarm_prefix();
+                    return ClientInputDispatch::ForwardAndRedraw(data);
+                }
+                Some(other) => return other, // client-handled (action, or Esc/prefix cancel)
+            }
+        }
+    }
+
     // #31 (multi-event): a single stdin read can coalesce several mouse reports (e.g. motion spam
     // under ?1003h). The single-event arm above misses those, so they would forward the raw HOST
     // column to the remote. Re-encode each content-area mouse event with the sidebar-translated
@@ -9699,6 +9724,56 @@ mod tests {
             ),
             "the coalesced mouse dispatch must repaint so the prefix bar clears, got {dispatch:?}"
         );
+    }
+
+    #[test]
+    fn coalesced_prefix_and_client_action_runs_locally() {
+        // A prefix key + a client-owned follow-up coalesced into one stdin read must still run the
+        // client action, not forward the raw bytes to the server. Codex codex-8-1.
+        let ev = crate::raw_input::parse_raw_input_bytes_sync(b"\x02b");
+        assert!(
+            ev.len() == 2
+                && ev
+                    .iter()
+                    .all(|e| matches!(e, crate::raw_input::RawInputEvent::Key(_))),
+            "sanity: ctrl+b + b must coalesce to two Key events, got {ev:?}"
+        );
+        with_client_keys_config(
+            "[keys]\nprefix = \"ctrl+b\"\ntoggle_sidebar = \"prefix+b\"\n",
+            || {
+                let (mut model, _) = mixed_remote_model();
+                let mut compositor = configured_compositor(26);
+                assert!(!compositor.sidebar_collapsed_for_test());
+                let _ = dispatch_composited_input(
+                    b"\x02b".to_vec(),
+                    &mut compositor,
+                    &mut model,
+                    (60, 16),
+                );
+                assert!(
+                    compositor.sidebar_collapsed_for_test(),
+                    "coalesced prefix+b must toggle the client sidebar"
+                );
+                assert!(!compositor.prefix_armed());
+            },
+        );
+    }
+
+    #[test]
+    fn coalesced_prefix_and_server_key_forwards_raw() {
+        // A prefix key + a server-owned follow-up coalesced into one read forwards the raw bytes so
+        // the server's own prefix machine runs prefix+key, and clears the client prefix state.
+        with_client_keys_config("[keys]\nprefix = \"ctrl+b\"\n", || {
+            let (mut model, _) = mixed_remote_model();
+            let mut compositor = configured_compositor(26);
+            let dispatch =
+                dispatch_composited_input(b"\x02c".to_vec(), &mut compositor, &mut model, (60, 16));
+            assert_eq!(
+                dispatch,
+                ClientInputDispatch::ForwardAndRedraw(b"\x02c".to_vec())
+            );
+            assert!(!compositor.prefix_armed());
+        });
     }
 
     #[test]
