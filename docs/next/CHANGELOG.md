@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## [0.7.3-mx.1] - 2026-07-08
+
+herdr-mx rebased onto upstream herdr 0.7.3 (see the [0.7.3] and [0.7.2] entries for upstream changes), keeping the multi-remote client, configurable remote transport, and sidebar.
+
+### Added
+- Remote attach now discovers package-managed `herdr` installs (Homebrew, mise, Nix) before offering to seed a sidecar binary, including mise ubi-backend layouts.
+
+### Changed
+- `herdr --remote` now keeps the remote server in a login-independent session, so a dropped SSH or network connection disconnects only the client instead of killing remote panes.
+
+### Fixed
+- Upstream's terminal cursor drawing, prefix input-source switching, SGR mouse handling, and image drop/paste bridging are wired onto the multi-remote client's render path.
+
 ## [0.7.3] - 2026-07-08
 
 ### Fixed
