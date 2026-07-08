@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteAddParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -16,24 +16,24 @@ pub struct RemoteAddParams {
     pub keybindings: crate::remote_registry::RemoteKeybindingsSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteRemoveParams {
     pub remote_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteRenameParams {
     pub remote_id: String,
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteSetAutoUpdateParams {
     pub remote_id: String,
     pub auto_update: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteSetEnabledParams {
     pub remote_id: String,
     pub enabled: bool,
@@ -42,7 +42,7 @@ pub struct RemoteSetEnabledParams {
 /// #19: move `workspace_id` so it sits at `insert_index` in the server's workspace list. The index
 /// is an insert position into the list as it stands *before* the move (0..=len), matching the
 /// monolithic `AppState::move_workspace` contract. Clamped server-side.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkspaceReorderParams {
     pub workspace_id: String,
     pub insert_index: usize,
@@ -51,13 +51,13 @@ pub struct WorkspaceReorderParams {
 /// Present when the workspace's checkout is a git repo even WITHOUT worktree-space
 /// membership (from the workspace's cached git metadata) — the signal client menus
 /// need to offer worktree actions on a plain git workspace.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkspaceGitInfo {
     pub repo_key: String,
     pub is_linked_worktree: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct UiSettingsInfo {
     pub sidebar_width: u16,
     pub sidebar_default_width: u16,

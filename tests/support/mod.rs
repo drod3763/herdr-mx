@@ -15,6 +15,8 @@ static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".herdr-test-owner-pid";
+// mx protocol = 1000 + upstream version; see src/protocol/wire.rs::PROTOCOL_VERSION.
+pub const CURRENT_PROTOCOL: u32 = 1016;
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
@@ -173,9 +175,10 @@ pub fn decode_varint_u32(payload: &[u8], offset: usize) -> Result<(u32, usize), 
 
 /// bincode tag of `ServerMessage::Compressed`. This MUST track the `ServerMessage` enum order in
 /// `src/protocol/wire.rs`: Welcome(0), Frame(1), Terminal(2), Graphics(3), ServerShutdown(4),
-/// Notify(5), Clipboard(6), WindowTitle(7), ReloadSoundConfig(8), MouseCapture(9), FrameDelta(10),
-/// Pong(11), Compressed(12). The v0.7.1 merge inserted FrameDelta + Pong, shifting Compressed 11->12.
-pub const COMPRESSED_MESSAGE_VARIANT: u32 = 12;
+/// Notify(5), Clipboard(6), WindowTitle(7), ReloadSoundConfig(8), MouseCapture(9),
+/// PrefixInputSource(10), FrameDelta(11), Pong(12), Compressed(13). The v0.7.3 merge inserted
+/// upstream's PrefixInputSource before the mx variants, shifting Compressed 12->13.
+pub const COMPRESSED_MESSAGE_VARIANT: u32 = 13;
 
 /// issue #13: frames are deflate-wrapped in `ServerMessage::Compressed`. Given a read
 /// `(variant, payload_after_variant)`, return the effective frame `(variant, payload)` — inflating

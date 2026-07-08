@@ -16,9 +16,13 @@ use serde::{Deserialize, Serialize};
 /// changes incompatibly — not for additive JSON API methods. A new method like mx's read-only
 /// `remote.ssh_config_hosts` (#11) is backward-compatible: old clients never send it, and a server
 /// that does not know it returns a normal method error the caller degrades on, so it needs no bump.
-/// v14: `FrameDelta` carries `base_checksum` and clients may send `RequestFullFrame` (delta-desync
-/// recovery); upstream v14 also adds `pane.move` (relocate a running pane across tabs/workspaces).
-pub const PROTOCOL_VERSION: u32 = 14;
+///
+/// mx versions are `1000 + <upstream version>`: mx appends its own wire variants
+/// (`Ping`/`RequestFullFrame`, `FrameDelta`/`Compressed`/`Pong`) after upstream's, so an mx peer
+/// and a stock herdr peer at the same upstream version have different message shapes. The offset
+/// makes that pairing fail cleanly at the version handshake instead of decoding garbage.
+/// 1016 = upstream v16 (observe/control terminal streams, prefix input source) + mx additions.
+pub const PROTOCOL_VERSION: u32 = 1016;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -403,10 +407,26 @@ pub enum ClientMessage {
     },
 
     /// Structured input events from platform clients that do not expose Unix-style raw bytes.
-    /// Tag 7: kept immediately after `AttachScroll` so the protocol-13 wire-tag ordering
-    /// (`client_message_wire_tags_preserve_protocol_13_order`) is preserved; the multi-remote
-    /// variants below are appended after it.
+    /// Tag 7: kept immediately after `AttachScroll` so the upstream wire-tag ordering
+    /// (`client_message_wire_tags_preserve_protocol_15_order`) is preserved; upstream's newer
+    /// variants and the mx-only variants are appended after it in that order.
     InputEvents { events: Vec<ClientInputEvent> },
+
+    /// Switch this connection into read-only terminal observe mode.
+    /// Tag 8: upstream v15/v16 variants keep upstream's wire-tag positions; the mx-only
+    /// variants are appended after them.
+    ObserveTerminal {
+        /// Pane, terminal, or agent target to observe.
+        target: String,
+    },
+
+    /// Switch this connection into writable terminal control mode.
+    ControlTerminal {
+        /// Pane, terminal, or agent target to control.
+        target: String,
+        /// Replace an existing writable controller for this terminal.
+        takeover: bool,
+    },
 
     /// Open the server-rendered settings UI for this client.
     OpenSettings,
@@ -459,7 +479,7 @@ pub struct CellData {
     pub fg: u32,
     /// Background color as a packed u32.
     pub bg: u32,
-    /// Bitmask of style modifiers (bold, italic, etc.).
+    /// Bitmask of style modifiers (bold, italic, etc.) plus Herdr extension bits.
     pub modifier: u16,
     /// Whether this cell should be skipped during diff-based rendering.
     pub skip: bool,
@@ -795,6 +815,16 @@ pub enum ServerMessage {
         enabled: bool,
     },
 
+    /// Apply the prefix-mode ASCII input-source change on the foreground client.
+    /// `active = true` → switch to an ASCII-capable source (saving the current one);
+    /// `active = false` → restore the saved source.
+    /// Upstream v16 variant: kept at upstream's wire-tag position; the mx-only variants
+    /// below are appended after it.
+    PrefixInputSource {
+        /// Whether the ASCII input source should be active.
+        active: bool,
+    },
+
     /// A delta against the client's last full frame for a semantic-frame client (issue #13). The
     /// client reconstructs the full frame from its cached baseline; servers send a full `Frame`
     /// first and whenever a delta would not be smaller / dimensions change. Placed last so the
@@ -889,15 +919,30 @@ fn u32_to_color(val: u32) -> ratatui::style::Color {
     }
 }
 
+const UNDERLINE_STYLE_SHIFT: u16 = 12;
+const UNDERLINE_STYLE_MASK: u16 = 0xF000;
+
 /// Converts a ratatui `Modifier` bitmask to a u16 for wire transport.
 pub(crate) fn modifier_to_u16(modifier: ratatui::style::Modifier) -> u16 {
     modifier.bits()
 }
 
+pub(crate) fn underline_style_from_modifier(modifier: u16) -> u8 {
+    ((modifier & UNDERLINE_STYLE_MASK) >> UNDERLINE_STYLE_SHIFT) as u8
+}
+
+pub(crate) fn modifier_with_underline_style(
+    modifier: ratatui::style::Modifier,
+    underline_style: u8,
+) -> ratatui::style::Modifier {
+    let bits = modifier.bits() | ((u16::from(underline_style) & 0x0F) << UNDERLINE_STYLE_SHIFT);
+    ratatui::style::Modifier::from_bits_retain(bits)
+}
+
 /// Converts a u16 back to a ratatui `Modifier`.
 #[cfg(test)]
 fn u16_to_modifier(val: u16) -> ratatui::style::Modifier {
-    ratatui::style::Modifier::from_bits_truncate(val)
+    ratatui::style::Modifier::from_bits_truncate(val & !UNDERLINE_STYLE_MASK)
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,7 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn client_message_wire_tags_preserve_protocol_14_order() {
+    fn client_message_wire_tags_preserve_protocol_15_order() {
         fn tag(msg: &ClientMessage) -> u8 {
             *bincode::serde::encode_to_vec(msg, bincode::config::standard())
                 .unwrap()
@@ -1345,6 +1390,24 @@ mod tests {
             6
         );
         assert_eq!(tag(&ClientMessage::InputEvents { events: Vec::new() }), 7);
+        assert_eq!(
+            tag(&ClientMessage::ObserveTerminal {
+                target: "w1:p1".to_owned(),
+            }),
+            8
+        );
+        assert_eq!(
+            tag(&ClientMessage::ControlTerminal {
+                target: "w1:p1".to_owned(),
+                takeover: false,
+            }),
+            9
+        );
+        // mx-only variants stay appended after upstream's so shared tags 0-9 match stock herdr.
+        assert_eq!(tag(&ClientMessage::OpenSettings), 10);
+        assert_eq!(tag(&ClientMessage::OpenKeybindHelp), 11);
+        assert_eq!(tag(&ClientMessage::Ping { nonce: 1 }), 12);
+        assert_eq!(tag(&ClientMessage::RequestFullFrame), 13);
     }
 
     #[test]
@@ -1464,6 +1527,29 @@ mod tests {
     fn client_attach_terminal_roundtrip() {
         let msg = ClientMessage::AttachTerminal {
             terminal_id: "term_123".to_owned(),
+            takeover: true,
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn client_observe_terminal_roundtrip() {
+        let msg = ClientMessage::ObserveTerminal {
+            target: "w1:p1".to_owned(),
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn client_control_terminal_roundtrip() {
+        let msg = ClientMessage::ControlTerminal {
+            target: "w1:p1".to_owned(),
             takeover: true,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
@@ -1689,6 +1775,17 @@ mod tests {
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn server_prefix_input_source_roundtrip() {
+        for active in [true, false] {
+            let msg = ServerMessage::PrefixInputSource { active };
+            let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+            let (decoded, _): (ServerMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(msg, decoded);
+        }
     }
 
     // ---- Framing ----

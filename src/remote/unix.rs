@@ -1129,7 +1129,7 @@ fn prepare_remote_herdr(
     let platform = detect_remote_platform(target)?;
     let remote_herdr = RemoteHerdr::for_platform(platform);
     let override_binary = remote_binary_override_path()?;
-    let path_remote_herdr = remote_binary_on_path_any(target, &remote_herdr)?;
+    let remote_binary_candidates = remote_binary_candidates(target, &remote_herdr)?;
     let exe_name_remote_herdr = remote_herdr_from_current_exe_name(&remote_herdr.platform);
 
     // #61: a FORCED update (the host-menu "update") always reseeds the current build, even when the
@@ -1138,15 +1138,14 @@ fn prepare_remote_herdr(
     // only the package version and accepts ANY commit suffix — so the update silently no-ops. Forcing
     // skips that match-and-skip the same way an explicit `override_binary` already does.
     if override_binary.is_none() && !force_reinstall {
-        if let Some(path_remote_herdr) = path_remote_herdr
-            .as_ref()
-            .filter(|candidate| remote_binary_matches(target, candidate).unwrap_or(false))
-        {
-            progress(RemoteProvisionStage::AlreadyInstalled);
-            return Ok(PreparedRemoteHerdr {
-                remote_herdr: path_remote_herdr.clone(),
-                installed_or_replaced: false,
-            });
+        for candidate in &remote_binary_candidates {
+            if remote_binary_matches(target, candidate).unwrap_or(false) {
+                progress(RemoteProvisionStage::AlreadyInstalled);
+                return Ok(PreparedRemoteHerdr {
+                    remote_herdr: candidate.clone(),
+                    installed_or_replaced: false,
+                });
+            }
         }
         if let Some(exe_name_remote_herdr) = exe_name_remote_herdr
             .as_ref()
@@ -1167,7 +1166,7 @@ fn prepare_remote_herdr(
         }
     }
 
-    if let Some(status_probe_herdr) = path_remote_herdr.as_ref().or_else(|| {
+    if let Some(status_probe_herdr) = remote_binary_candidates.first().or_else(|| {
         remote_binary_exists(target, &remote_herdr)
             .ok()
             .and_then(|exists| exists.then_some(&remote_herdr))
@@ -1232,6 +1231,122 @@ fn detect_remote_platform(target: &SshTarget) -> io::Result<RemotePlatform> {
     })
 }
 
+/// Discover pre-installed remote herdr binaries (#840): the PATH probe first, then
+/// well-known package-manager locations (Homebrew, mise, Nix) that a non-login ssh
+/// shell's PATH often misses. Callers verify each candidate with
+/// `remote_binary_matches` before using it, so a stale or foreign binary is skipped.
+fn remote_binary_candidates(
+    target: &SshTarget,
+    remote_herdr: &RemoteHerdr,
+) -> io::Result<Vec<RemoteHerdr>> {
+    let mut candidates = Vec::new();
+
+    if let Some(path_candidate) = remote_binary_on_path_any(target, remote_herdr)? {
+        push_if_new_remote_binary_candidate(&mut candidates, path_candidate);
+    }
+
+    let output = ssh_output(
+        target,
+        &known_remote_binary_candidate_script(&remote_herdr.platform),
+    )?;
+    if !output.status.success() {
+        return Err(command_failed("remote binary discovery failed", &output));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for candidate in remote_herdrs_from_path_discovery(remote_herdr, &stdout) {
+        push_if_new_remote_binary_candidate(&mut candidates, candidate);
+    }
+
+    Ok(candidates)
+}
+
+fn push_if_new_remote_binary_candidate(candidates: &mut Vec<RemoteHerdr>, candidate: RemoteHerdr) {
+    if !candidates
+        .iter()
+        .any(|existing| existing.shell_path == candidate.shell_path)
+    {
+        candidates.push(candidate);
+    }
+}
+
+fn known_remote_binary_candidate_script(platform: &RemotePlatform) -> String {
+    let mut script = String::from(
+        r#"home=${HOME:-}
+user=${USER:-}
+version="#,
+    );
+    script.push_str(&shell_quote(CURRENT_VERSION));
+    script.push_str(
+        r#"
+emit() {
+    path=$1
+    if [ -n "$path" ] && [ -x "$path" ]; then
+        printf '%s\n' "$path"
+    fi
+}
+if [ -n "$home" ]; then
+    emit "$home/.local/bin/herdr"
+fi
+"#,
+    );
+    if platform.os == "macos" {
+        script.push_str(
+            r#"    emit "/opt/homebrew/bin/herdr"
+    emit "/usr/local/bin/herdr"
+"#,
+        );
+    } else if platform.os == "linux" {
+        script.push_str(
+            r#"    emit "/home/linuxbrew/.linuxbrew/bin/herdr"
+"#,
+        );
+    }
+    // mise ubi-backend installs (mx ships as `ubi:drod3763/herdr-mx[exe=herdr]`) live under a
+    // backend-derived tool directory, so glob every tool dir instead of naming one; `emit`'s
+    // `-x` test drops unexpanded glob literals.
+    script.push_str(
+        r#"if [ -n "$home" ]; then
+    for tool_bin in "$home"/.local/share/mise/installs/*/"$version"/bin/herdr; do
+        emit "$tool_bin"
+    done
+    for tool_root in "$home"/.local/share/mise/installs/*/"$version"/herdr; do
+        emit "$tool_root"
+    done
+    emit "$home/.nix-profile/bin/herdr"
+fi
+if [ -n "$user" ]; then
+    emit "/etc/profiles/per-user/$user/bin/herdr"
+fi
+emit "/nix/var/nix/profiles/default/bin/herdr"
+emit "/run/current-system/sw/bin/herdr"
+"#,
+    );
+
+    script
+}
+
+fn remote_herdrs_from_path_discovery(remote_herdr: &RemoteHerdr, stdout: &str) -> Vec<RemoteHerdr> {
+    stdout
+        .lines()
+        .filter_map(|path| remote_herdr_from_path(remote_herdr, path))
+        .collect()
+}
+
+fn remote_herdr_from_path(remote_herdr: &RemoteHerdr, path: &str) -> Option<RemoteHerdr> {
+    let path = path.trim();
+    if !path.starts_with('/') {
+        return None;
+    }
+    if is_mise_shim_path(path) {
+        return None;
+    }
+    Some(remote_herdr.clone().with_shell_path(shell_quote(path)))
+}
+
+fn is_mise_shim_path(path: &str) -> bool {
+    path.ends_with("/mise/shims/herdr")
+}
+
 fn remote_binary_on_path_any(
     target: &SshTarget,
     remote_herdr: &RemoteHerdr,
@@ -1273,12 +1388,9 @@ fn remote_herdr_from_path_probe_any(
     remote_herdr: &RemoteHerdr,
     stdout: &str,
 ) -> Option<RemoteHerdr> {
-    let mut lines = stdout.lines();
-    let path = lines.next()?;
-    if !path.starts_with('/') {
-        return None;
-    }
-    Some(remote_herdr.clone().with_shell_path(shell_quote(path)))
+    stdout
+        .lines()
+        .find_map(|path| remote_herdr_from_path(remote_herdr, path))
 }
 
 fn remote_herdr_from_current_exe_name(platform: &RemotePlatform) -> Option<RemoteHerdr> {
@@ -1719,6 +1831,7 @@ enum RemoteServerStatus {
         version: Option<String>,
         protocol: Option<u32>,
         live_handoff: bool,
+        detached_server_daemon: bool,
     },
     NotRunning,
 }
@@ -1726,6 +1839,7 @@ enum RemoteServerStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteServerRestartReason {
     ProtocolMismatch,
+    DaemonDetachMissing,
     BinaryUpdated,
     VersionMismatch,
 }
@@ -1742,14 +1856,18 @@ fn ensure_remote_server_ready(
         version,
         protocol,
         live_handoff,
+        detached_server_daemon,
     } = status
     else {
         return Ok(());
     };
 
-    let Some(reason) =
-        remote_server_restart_reason(version.as_deref(), protocol, remote_binary_changed)
-    else {
+    let Some(reason) = remote_server_restart_reason(
+        version.as_deref(),
+        protocol,
+        detached_server_daemon,
+        remote_binary_changed,
+    ) else {
         return Ok(());
     };
 
@@ -1821,16 +1939,20 @@ fn ensure_remote_server_ready(
 fn remote_server_restart_reason(
     version: Option<&str>,
     protocol: Option<u32>,
+    detached_server_daemon: bool,
     remote_binary_changed: bool,
 ) -> Option<RemoteServerRestartReason> {
     if protocol != Some(CURRENT_PROTOCOL) {
         return Some(RemoteServerRestartReason::ProtocolMismatch);
     }
-    if remote_binary_changed {
-        return Some(RemoteServerRestartReason::BinaryUpdated);
+    if !detached_server_daemon {
+        return Some(RemoteServerRestartReason::DaemonDetachMissing);
     }
     if version != Some(CURRENT_VERSION) {
         return Some(RemoteServerRestartReason::VersionMismatch);
+    }
+    if remote_binary_changed {
+        return Some(RemoteServerRestartReason::BinaryUpdated);
     }
     None
 }
@@ -1862,9 +1984,12 @@ fn non_interactive_server_action(
                 NonInteractiveServerAction::ProtocolStuck
             }
         }
-        // Protocol is compatible: prefer a pane-preserving handoff to pick up the new binary, but
-        // attaching to the running server is always a safe fallback (no hard restart).
-        RemoteServerRestartReason::BinaryUpdated | RemoteServerRestartReason::VersionMismatch => {
+        // Protocol is compatible: prefer a pane-preserving handoff to pick up the new binary or
+        // a detach-capable daemon, but attaching to the running server is always a safe fallback
+        // (no hard restart).
+        RemoteServerRestartReason::DaemonDetachMissing
+        | RemoteServerRestartReason::BinaryUpdated
+        | RemoteServerRestartReason::VersionMismatch => {
             if can_handoff {
                 NonInteractiveServerAction::LiveHandoff
             } else {
@@ -1916,6 +2041,9 @@ fn confirm_remote_install_with_running_server(
         version,
         protocol,
         live_handoff,
+        // Install-time approval only cares that a server is running; whether it must restart
+        // for daemon detach is decided later in `ensure_remote_server_ready`.
+        detached_server_daemon: _,
     } = status
     else {
         return Ok(());
@@ -1988,6 +2116,8 @@ struct RemoteServerStatusJson {
 #[derive(Debug, Deserialize)]
 struct RemoteServerCapabilitiesJson {
     live_handoff: bool,
+    #[serde(default)]
+    detached_server_daemon: bool,
 }
 
 fn parse_client_status_json(status: &str) -> Option<RemoteClientStatusJson> {
@@ -2004,12 +2134,17 @@ fn parse_remote_server_status_json(status: &str) -> io::Result<RemoteServerStatu
         return Ok(RemoteServerStatus::NotRunning);
     }
 
+    let capabilities = parsed.capabilities;
+
     Ok(RemoteServerStatus::Running {
         version: parsed.version,
         protocol: parsed.protocol,
-        live_handoff: parsed
-            .capabilities
+        live_handoff: capabilities
+            .as_ref()
             .is_some_and(|capabilities| capabilities.live_handoff),
+        detached_server_daemon: capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.detached_server_daemon),
     })
 }
 
@@ -2047,6 +2182,11 @@ fn confirm_remote_server_stop(
         RemoteServerRestartReason::ProtocolMismatch => {
             eprintln!(
                 "the remote server protocol does not match this client. the remote server must be stopped before attaching."
+            );
+        }
+        RemoteServerRestartReason::DaemonDetachMissing => {
+            eprintln!(
+                "the remote server was started by a herdr build that may not survive SSH connection loss. restart it so network drops disconnect only this client."
             );
         }
         RemoteServerRestartReason::BinaryUpdated => {
@@ -2119,6 +2259,11 @@ fn confirm_remote_server_handoff(
         RemoteServerRestartReason::ProtocolMismatch => {
             eprintln!(
                 "the remote server protocol does not match this client. herdr will try to hand off live pane processes to the prepared remote server before the old server exits."
+            );
+        }
+        RemoteServerRestartReason::DaemonDetachMissing => {
+            eprintln!(
+                "the remote server was started by a herdr build that may not survive SSH connection loss. herdr will try to hand off live pane processes to a detach-capable server."
             );
         }
         RemoteServerRestartReason::BinaryUpdated => {
@@ -5801,6 +5946,73 @@ mod tests {
     }
 
     #[test]
+    fn remote_path_discovery_reads_multiple_absolute_paths() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let candidates = remote_herdrs_from_path_discovery(
+            &remote_herdr,
+            "/usr/bin/herdr\nbin/herdr\n /opt/herdr bin/herdr\n",
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].shell_path, "/usr/bin/herdr");
+        assert_eq!(candidates[1].shell_path, "'/opt/herdr bin/herdr'");
+    }
+
+    #[test]
+    fn remote_path_discovery_ignores_mise_shims() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let candidates = remote_herdrs_from_path_discovery(
+            &remote_herdr,
+            "/home/can/.local/share/mise/shims/herdr\n/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr\n",
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].shell_path,
+            "/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr"
+        );
+    }
+
+    #[test]
+    fn known_remote_binary_candidate_script_includes_mise_and_nix_paths() {
+        let script = known_remote_binary_candidate_script(&RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+
+        assert!(script.contains("emit \"$home/.local/bin/herdr\""));
+        assert!(!script.contains("mise/shims/herdr"));
+        assert!(script.contains(&format!("version={}", shell_quote(CURRENT_VERSION))));
+        // mx mise installs are ubi-backend with a backend-derived tool dir, so the script
+        // globs every tool directory instead of naming upstream's.
+        assert!(script.contains(r#"/.local/share/mise/installs/*/"$version"/bin/herdr"#));
+        assert!(script.contains(r#"/.local/share/mise/installs/*/"$version"/herdr"#));
+        assert!(script.contains("emit \"$home/.nix-profile/bin/herdr\""));
+        assert!(script.contains("emit \"/etc/profiles/per-user/$user/bin/herdr\""));
+        assert!(script.contains("emit \"/run/current-system/sw/bin/herdr\""));
+        assert!(script.contains("emit \"/home/linuxbrew/.linuxbrew/bin/herdr\""));
+        assert!(!script.contains("emit \"/opt/homebrew/bin/herdr\""));
+    }
+
+    #[test]
+    fn known_remote_binary_candidate_script_includes_macos_homebrew_paths() {
+        let script = known_remote_binary_candidate_script(&RemotePlatform {
+            os: "macos",
+            arch: "aarch64",
+        });
+
+        assert!(script.contains("emit \"/opt/homebrew/bin/herdr\""));
+        assert!(script.contains("emit \"/usr/local/bin/herdr\""));
+        assert!(!script.contains("emit \"/home/linuxbrew/.linuxbrew/bin/herdr\""));
+    }
+
+    #[test]
     fn parse_client_status_json_reads_protocol() {
         assert_eq!(
             parse_client_status_json(r#"{"version":"x","protocol":8,"binary":"/bin/herdr"}"#)
@@ -5814,19 +6026,20 @@ mod tests {
     fn parse_remote_server_status_json_reads_running_server() {
         assert_eq!(
             parse_remote_server_status_json(
-                r#"{"status":"running","running":true,"version":"0.6.0","protocol":8,"capabilities":{"live_handoff":true}}"#
+                r#"{"status":"running","running":true,"version":"0.6.0","protocol":8,"capabilities":{"live_handoff":true,"detached_server_daemon":true}}"#
             )
             .unwrap(),
             RemoteServerStatus::Running {
                 version: Some("0.6.0".into()),
                 protocol: Some(8),
-                live_handoff: true
+                live_handoff: true,
+                detached_server_daemon: true
             }
         );
     }
 
     #[test]
-    fn parse_remote_server_status_json_treats_missing_capability_as_no_handoff() {
+    fn parse_remote_server_status_json_treats_missing_capability_as_old_server() {
         assert_eq!(
             parse_remote_server_status_json(
                 r#"{"status":"running","running":true,"version":"0.6.0","protocol":8}"#
@@ -5835,7 +6048,8 @@ mod tests {
             RemoteServerStatus::Running {
                 version: Some("0.6.0".into()),
                 protocol: Some(8),
-                live_handoff: false
+                live_handoff: false,
+                detached_server_daemon: false
             }
         );
     }
@@ -6094,15 +6308,28 @@ mod tests {
     #[test]
     fn remote_server_restart_reason_requires_stop_for_protocol_mismatch() {
         assert_eq!(
-            remote_server_restart_reason(Some(CURRENT_VERSION), Some(0), false),
+            remote_server_restart_reason(Some(CURRENT_VERSION), Some(0), true, false),
             Some(RemoteServerRestartReason::ProtocolMismatch)
+        );
+    }
+
+    #[test]
+    fn remote_server_restart_reason_requires_restart_for_old_daemon() {
+        assert_eq!(
+            remote_server_restart_reason(
+                Some(CURRENT_VERSION),
+                Some(CURRENT_PROTOCOL),
+                false,
+                false
+            ),
+            Some(RemoteServerRestartReason::DaemonDetachMissing)
         );
     }
 
     #[test]
     fn remote_server_restart_reason_offers_restart_after_binary_update() {
         assert_eq!(
-            remote_server_restart_reason(Some(CURRENT_VERSION), Some(CURRENT_PROTOCOL), true),
+            remote_server_restart_reason(Some(CURRENT_VERSION), Some(CURRENT_PROTOCOL), true, true),
             Some(RemoteServerRestartReason::BinaryUpdated)
         );
     }
@@ -6110,11 +6337,11 @@ mod tests {
     #[test]
     fn remote_server_restart_reason_offers_restart_for_version_mismatch() {
         assert_eq!(
-            remote_server_restart_reason(Some("0.0.0"), Some(CURRENT_PROTOCOL), false),
+            remote_server_restart_reason(Some("0.0.0"), Some(CURRENT_PROTOCOL), true, false),
             Some(RemoteServerRestartReason::VersionMismatch)
         );
         assert_eq!(
-            remote_server_restart_reason(None, Some(CURRENT_PROTOCOL), false),
+            remote_server_restart_reason(None, Some(CURRENT_PROTOCOL), true, false),
             Some(RemoteServerRestartReason::VersionMismatch)
         );
     }
@@ -6122,7 +6349,12 @@ mod tests {
     #[test]
     fn remote_server_restart_reason_allows_current_server() {
         assert_eq!(
-            remote_server_restart_reason(Some(CURRENT_VERSION), Some(CURRENT_PROTOCOL), false),
+            remote_server_restart_reason(
+                Some(CURRENT_VERSION),
+                Some(CURRENT_PROTOCOL),
+                true,
+                false
+            ),
             None
         );
     }

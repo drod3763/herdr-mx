@@ -9,6 +9,7 @@ mod panes;
 pub(crate) mod plugins;
 mod remotes;
 mod responses;
+mod session;
 mod tabs;
 mod workspaces;
 mod worktrees;
@@ -17,6 +18,8 @@ use super::{api_helpers::pane_agent_status, App, Mode, OverlayPaneState, ToastKi
 use crate::events::AppEvent;
 
 const API_NOTIFICATION_RATE_LIMIT: Duration = Duration::from_secs(1);
+#[cfg(windows)]
+const WINDOWS_POWERSHELL_AGENT_EXIT_RESPAWN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeExitAction {
@@ -25,6 +28,36 @@ enum RuntimeExitAction {
 }
 
 impl App {
+    pub(crate) fn dispatch_api_request(
+        &mut self,
+        id: &'static str,
+        method: crate::api::schema::Method,
+    ) -> String {
+        self.handle_api_request(crate::api::schema::Request {
+            id: id.to_string(),
+            method,
+        })
+    }
+
+    pub(crate) fn dispatch_deferred_api_request(
+        &mut self,
+        id: &'static str,
+        method: crate::api::schema::Method,
+    ) -> Option<String> {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        if !self.handle_deferred_worktree_api_request(
+            crate::api::schema::Request {
+                id: id.to_string(),
+                method,
+            },
+            respond_to,
+        ) {
+            return None;
+        }
+
+        response_rx.try_recv().ok()
+    }
+
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
         if let AppEvent::ClipboardWrite { content } = ev {
             #[cfg(not(test))]
@@ -32,6 +65,22 @@ impl App {
             #[cfg(test)]
             let _ = content;
             self.show_clipboard_feedback();
+            return;
+        }
+
+        if let AppEvent::PrefixInputSource { active } = ev {
+            // Monolithic path applies the switch here. Server mode forwards it to the foreground
+            // client instead (see HeadlessServer::handle_internal_event_with_forwarding); should an
+            // App-internal drain consume the event before the forwarding drain, the flag keeps the
+            // switch out of the headless server process.
+            if !self.local_input_source_switch {
+                return;
+            }
+            if active {
+                self.prefix_input_source.switch_to_ascii();
+            } else {
+                self.prefix_input_source.restore();
+            }
             return;
         }
 
@@ -156,6 +205,13 @@ impl App {
                 }
             }
         }
+        let pane_exit_layout_target = if let AppEvent::PaneDied { pane_id } = &ev {
+            self.find_pane(*pane_id).and_then(|(ws_idx, _)| {
+                self.layout_update_target_after_pane_removal(ws_idx, *pane_id)
+            })
+        } else {
+            None
+        };
 
         let released_agent = if let AppEvent::HookAgentReleased {
             pane_id,
@@ -205,6 +261,8 @@ impl App {
         self.sync_full_lifecycle_authority_detection_pauses();
         if terminal_cwd_reported {
             self.mark_git_status_refresh_due(Instant::now());
+            self.render_dirty.store(true, Ordering::Release);
+            self.render_notify.notify_one();
         }
         for update in &pane_updates {
             self.refresh_new_herdr_toast_context_for_update(update, &previous_toast);
@@ -224,6 +282,9 @@ impl App {
                 was_overlay_focused_in_tab,
                 tab_zoomed_before_exit,
             );
+        }
+        if let Some((ws_idx, tab_idx)) = pane_exit_layout_target {
+            self.emit_layout_updated_event(ws_idx, tab_idx);
         }
 
         if self.local_terminal_notifications
@@ -395,10 +456,36 @@ impl App {
             return RuntimeExitAction::ClosePane;
         };
 
-        if terminal.respawn_shell_on_exit {
+        if terminal.respawn_shell_on_exit || self.should_respawn_shell_after_agent_exit(terminal) {
             RuntimeExitAction::RespawnShell
         } else {
             RuntimeExitAction::ClosePane
+        }
+    }
+
+    fn should_respawn_shell_after_agent_exit(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+    ) -> bool {
+        #[cfg(not(windows))]
+        {
+            let _ = terminal;
+            false
+        }
+
+        #[cfg(windows)]
+        {
+            if !terminal.agent_process_exited_within(
+                Instant::now(),
+                WINDOWS_POWERSHELL_AGENT_EXIT_RESPAWN_GRACE,
+            ) {
+                return false;
+            }
+
+            crate::pane::uses_windows_powershell_pane_shell(crate::pane::PaneShellConfig::new(
+                &self.state.default_shell,
+                self.state.shell_mode,
+            ))
         }
     }
 
@@ -826,6 +913,7 @@ impl App {
                     },
                 );
             }
+            Method::SessionSnapshot(_) => return self.handle_session_snapshot(request.id),
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
@@ -836,6 +924,9 @@ impl App {
             }
             Method::WorkspaceRename(params) => {
                 return self.handle_workspace_rename(request.id, params);
+            }
+            Method::WorkspaceMove(params) => {
+                return self.handle_workspace_move(request.id, params);
             }
             Method::WorkspaceClose(target) => {
                 return self.handle_workspace_close(request.id, target)
@@ -866,6 +957,7 @@ impl App {
             Method::TabCreate(params) => return self.handle_tab_create(request.id, params),
             Method::TabFocus(target) => return self.handle_tab_focus(request.id, target),
             Method::TabRename(params) => return self.handle_tab_rename(request.id, params),
+            Method::TabMove(params) => return self.handle_tab_move(request.id, params),
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
             Method::AgentList(_) => return self.handle_agent_list(request.id),
             Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
@@ -885,6 +977,9 @@ impl App {
             }
             Method::LayoutExport(params) => return self.handle_layout_export(request.id, params),
             Method::LayoutApply(params) => return self.handle_layout_apply(request.id, params),
+            Method::LayoutSetSplitRatio(params) => {
+                return self.handle_layout_set_split_ratio(request.id, params);
+            }
             Method::PaneNeighbor(params) => return self.handle_pane_neighbor(request.id, params),
             Method::PaneEdges(params) => return self.handle_pane_edges(request.id, params),
             Method::PaneFocusDirection(params) => {
@@ -894,6 +989,7 @@ impl App {
             Method::PaneList(params) => return self.handle_pane_list(request.id, params),
             Method::PaneCurrent(params) => return self.handle_pane_current(request.id, params),
             Method::PaneGet(target) => return self.handle_pane_get(request.id, target),
+            Method::PaneFocus(target) => return self.handle_pane_focus(request.id, target),
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
             Method::PaneReportAgent(params) => {
@@ -1130,6 +1226,27 @@ fn agent_manifest_info(
         remote_update_error: remote.as_ref().and_then(|status| status.last_error.clone()),
         remote_last_checked_unix: remote.and_then(|status| status.last_checked_unix),
         warning: summary.warning,
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    pub(crate) fn exiting_test_command() -> &'static str {
+        #[cfg(windows)]
+        {
+            "C:\\Windows\\System32\\whoami.exe"
+        }
+        #[cfg(not(windows))]
+        {
+            "/usr/bin/true"
+        }
+    }
+
+    pub(crate) fn shutdown_test_runtimes(app: &mut crate::app::App) {
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
     }
 }
 
@@ -1682,6 +1799,90 @@ mod tests {
     }
 
     #[test]
+    fn pane_exit_emits_layout_updated_when_tab_survives() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let mut workspace = crate::workspace::Workspace::test_new("pane-exit-layout");
+        let dead_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let tab_id = app.public_tab_id(0, 0).unwrap();
+
+        app.handle_internal_event(AppEvent::PaneDied { pane_id: dead_pane });
+
+        let events = event_hub.events_after(0);
+        let pane_exited = events
+            .iter()
+            .position(|(_, event)| event.event == crate::api::schema::EventKind::PaneExited)
+            .expect("pane.exited should be emitted");
+        let layout_updated = events
+            .iter()
+            .position(|(_, event)| event.event == crate::api::schema::EventKind::LayoutUpdated)
+            .expect("layout.updated should be emitted");
+        assert!(pane_exited < layout_updated);
+        assert!(matches!(
+            &events[layout_updated].1.data,
+            crate::api::schema::EventData::LayoutUpdated { layout }
+                if layout.tab_id == tab_id && layout.panes.len() == 1
+        ));
+    }
+
+    #[test]
+    fn overlay_exit_layout_updated_uses_restored_zoom_state() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let mut workspace = crate::workspace::Workspace::test_new("overlay-layout");
+        let previous_focus = workspace.tabs[0].root_pane;
+        let overlay_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(previous_focus);
+        workspace.tabs[0].zoomed = true;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.mode = Mode::Terminal;
+        let tab_id = app.public_tab_id(0, 0).unwrap();
+        app.overlay_panes.insert(
+            overlay_pane,
+            OverlayPaneState {
+                ws_idx: 0,
+                tab_idx: 0,
+                previous_focus,
+                previous_zoomed: false,
+                temp_files: Vec::new(),
+            },
+        );
+
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: overlay_pane,
+        });
+
+        let events = event_hub.events_after(0);
+        let layout_updated = events
+            .iter()
+            .rposition(|(_, event)| event.event == crate::api::schema::EventKind::LayoutUpdated)
+            .expect("layout.updated should be emitted");
+        assert!(matches!(
+            &events[layout_updated].1.data,
+            crate::api::schema::EventData::LayoutUpdated { layout }
+                if layout.tab_id == tab_id && layout.zoomed
+        ));
+    }
+
+    #[test]
     fn overlay_exit_preserves_same_tab_focus_changed_before_exit() {
         let mut workspace = crate::workspace::Workspace::test_new("overlay");
         let previous_focus = workspace.tabs[0].root_pane;
@@ -1767,6 +1968,64 @@ mod tests {
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_exit_after_agent_process_exit_respawns_shell() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("powershell");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.default_shell = "powershell.exe".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::OpenCode),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(
+            app.runtime_exit_action(pane_id),
+            RuntimeExitAction::RespawnShell
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_exit_without_recent_agent_process_exit_closes_pane() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("powershell");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.default_shell = "powershell.exe".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+
+        assert_eq!(
+            app.runtime_exit_action(pane_id),
+            RuntimeExitAction::ClosePane
+        );
     }
 
     #[test]
