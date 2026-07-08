@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, ResponseResult, TabCreateParams, TabListParams,
-    TabRenameParams, TabTarget,
+    TabMoveParams, TabRenameParams, TabTarget,
 };
 use crate::app::{App, Mode};
 
@@ -14,12 +14,10 @@ impl App {
             let Some(ws_idx) = self.parse_workspace_id(&workspace_id) else {
                 return workspace_not_found(id, &workspace_id);
             };
-            let Some(ws) = self.state.workspaces.get(ws_idx) else {
+            let Some(_) = self.state.workspaces.get(ws_idx) else {
                 return workspace_not_found(id, &workspace_id);
             };
-            (0..ws.tabs.len())
-                .filter_map(|tab_idx| self.tab_info(ws_idx, tab_idx))
-                .collect()
+            self.tab_list_info(ws_idx)
         } else {
             let mut tabs = Vec::new();
             for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
@@ -65,11 +63,7 @@ impl App {
             return encode_error(id, "workspace_not_found", "no active workspace");
         };
         let cwd = cwd.map(PathBuf::from).unwrap_or_else(|| {
-            let follow_cwd = self
-                .state
-                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
-                .and_then(|rt| rt.cwd());
-            self.resolve_new_terminal_cwd(follow_cwd)
+            self.resolve_new_terminal_cwd(self.focused_pane_cwd_in_workspace(ws_idx))
         });
         let (rows, cols) = self.state.estimate_pane_size();
         let default_shell = self.state.default_shell.clone();
@@ -175,6 +169,52 @@ impl App {
         encode_success(id, ResponseResult::TabInfo { tab })
     }
 
+    pub(super) fn handle_tab_move(&mut self, id: String, params: TabMoveParams) -> String {
+        let Some((ws_idx, tab_idx)) = self.parse_tab_id(&params.tab_id) else {
+            return tab_not_found(id, &params.tab_id);
+        };
+        let Some(ws) = self.state.workspaces.get(ws_idx) else {
+            return tab_not_found(id, &params.tab_id);
+        };
+        if params.insert_index > ws.tabs.len() {
+            return encode_error(
+                id,
+                "tab_move_failed",
+                format!("insert_index {} is out of bounds", params.insert_index),
+            );
+        }
+
+        let tab_id = self
+            .public_tab_id(ws_idx, tab_idx)
+            .unwrap_or_else(|| crate::workspace::public_tab_id_for_number(&ws.id, tab_idx + 1));
+        let workspace_id = self.public_workspace_id(ws_idx);
+        let insert_index = params.insert_index;
+        let moved = self
+            .state
+            .workspaces
+            .get_mut(ws_idx)
+            .is_some_and(|ws| ws.move_tab(tab_idx, insert_index));
+        let tabs = self.tab_list_info(ws_idx);
+        if moved {
+            self.schedule_session_save();
+            if self.state.active == Some(ws_idx) {
+                self.state.tab_scroll_follow_active = true;
+                self.state.refresh_tab_bar_view();
+            }
+            self.emit_event(EventEnvelope {
+                event: EventKind::TabMoved,
+                data: EventData::TabMoved {
+                    tab_id,
+                    workspace_id,
+                    insert_index,
+                    tabs: tabs.clone(),
+                },
+            });
+        }
+
+        encode_success(id, ResponseResult::TabList { tabs })
+    }
+
     pub(super) fn handle_tab_close(&mut self, id: String, target: TabTarget) -> String {
         let Some((ws_idx, tab_idx)) = self.parse_tab_id(&target.tab_id) else {
             return tab_not_found(id, &target.tab_id);
@@ -208,9 +248,7 @@ impl App {
                 format!("tab {} could not be closed", target.tab_id),
             );
         }
-        for pane_id in pane_ids {
-            self.state.plugin_panes.remove(&pane_id);
-        }
+        self.state.remove_plugin_pane_records(pane_ids);
         self.state.remove_unattached_terminal_ids(terminal_ids);
         self.shutdown_detached_terminal_runtimes();
         self.schedule_session_save();
@@ -224,6 +262,18 @@ impl App {
 
         encode_success(id, ResponseResult::Ok {})
     }
+
+    fn tab_list_info(&self, ws_idx: usize) -> Vec<crate::api::schema::TabInfo> {
+        self.state
+            .workspaces
+            .get(ws_idx)
+            .map(|ws| {
+                (0..ws.tabs.len())
+                    .filter_map(|idx| self.tab_info(ws_idx, idx))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 fn workspace_not_found(id: String, workspace_id: &str) -> String {
@@ -236,4 +286,102 @@ fn workspace_not_found(id: String, workspace_id: &str) -> String {
 
 fn tab_not_found(id: String, tab_id: &str) -> String {
     encode_error(id, "tab_not_found", format!("tab {tab_id} not found"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{exiting_test_command, shutdown_test_runtimes};
+    use super::*;
+    use crate::{
+        api::schema::SuccessResponse,
+        config::{Config, ShellModeConfig},
+        workspace::Workspace,
+    };
+
+    #[test]
+    fn api_tab_move_reorders_tabs_in_target_workspace() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut workspace = Workspace::test_new("tabs");
+        workspace.test_add_tab(Some("two"));
+        workspace.test_add_tab(Some("three"));
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let moved_root = app.state.workspaces[0].tabs[0].root_pane;
+        let moved_id = app.public_tab_id(0, 0).unwrap();
+
+        let response = app.handle_tab_move(
+            "req".into(),
+            TabMoveParams {
+                tab_id: moved_id.clone(),
+                insert_index: 3,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::TabList { tabs } = success.result else {
+            panic!("expected tab list");
+        };
+        assert_eq!(app.state.workspaces[0].tabs[2].root_pane, moved_root);
+        assert_eq!(tabs[2].tab_id, app.public_tab_id(0, 2).unwrap());
+        let events = event_hub.events_after(0);
+        assert!(events.iter().any(|(_, event)| {
+            matches!(
+                &event.data,
+                EventData::TabMoved {
+                    tab_id,
+                    workspace_id,
+                    insert_index: 3,
+                    tabs,
+                } if tab_id == &moved_id
+                    && workspace_id == &app.public_workspace_id(0)
+                    && tabs[2].tab_id == moved_id
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn tab_create_follows_cached_focused_pane_cwd_without_runtime() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub);
+        app.state.default_shell = exiting_test_command().into();
+        app.state.shell_mode = ShellModeConfig::NonLogin;
+        let workspace = Workspace::test_new("tabs");
+        let focused_pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        let cached_cwd = std::env::temp_dir();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(focused_pane)
+            .cloned()
+            .unwrap();
+        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = cached_cwd.clone();
+
+        let response = app.handle_tab_create(
+            "req".into(),
+            TabCreateParams {
+                workspace_id: None,
+                cwd: None,
+                focus: false,
+                label: None,
+                env: Default::default(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::TabCreated { .. }));
+        let created = &app.state.workspaces[0].tabs[1];
+        let created_terminal_id = created.terminal_id(created.root_pane).unwrap();
+        let created_cwd = &app.state.terminals.get(created_terminal_id).unwrap().cwd;
+        assert_eq!(
+            crate::worktree::canonical_or_original(created_cwd),
+            crate::worktree::canonical_or_original(&cached_cwd)
+        );
+        shutdown_test_runtimes(&mut app);
+    }
 }

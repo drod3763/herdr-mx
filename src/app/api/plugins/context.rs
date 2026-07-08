@@ -63,6 +63,7 @@ impl App {
                         })
                 }),
             EventData::WorkspaceRenamed { workspace_id, .. }
+            | EventData::WorkspaceMoved { workspace_id, .. }
             | EventData::WorkspaceFocused { workspace_id } => self
                 .plugin_context_for_workspace_id(workspace_id, correlation_id)
                 .unwrap_or_else(|| {
@@ -103,6 +104,11 @@ impl App {
                 workspace_id,
                 ..
             }
+            | EventData::TabMoved {
+                tab_id,
+                workspace_id,
+                ..
+            }
             | EventData::TabFocused {
                 tab_id,
                 workspace_id,
@@ -113,6 +119,17 @@ impl App {
                     let mut context = empty_plugin_context(correlation_id);
                     context.workspace_id = Some(workspace_id.clone());
                     context.tab_id = Some(tab_id.clone());
+                    context
+                }),
+            EventData::LayoutUpdated { layout } => self
+                .plugin_context_for_tab_id(&layout.tab_id, correlation_id)
+                .or_else(|| {
+                    self.plugin_context_for_workspace_id(&layout.workspace_id, correlation_id)
+                })
+                .unwrap_or_else(|| {
+                    let mut context = empty_plugin_context(correlation_id);
+                    context.workspace_id = Some(layout.workspace_id.clone());
+                    context.tab_id = Some(layout.tab_id.clone());
                     context
                 }),
             EventData::PaneCreated { pane } => {

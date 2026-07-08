@@ -65,7 +65,7 @@ const MAX_TOTAL_PAYLOAD_BYTES: usize = 1 << 20;
 ///
 /// Doubles as the `remote.ssh_config_hosts` wire payload (referenced from `ResponseResult`), so it
 /// derives serde directly — the unset display fields stay off the wire via `skip_serializing_if`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SshConfigHost {
     /// The concrete `Host` alias (the destination herdr would hand to `ssh`).
     pub alias: String,

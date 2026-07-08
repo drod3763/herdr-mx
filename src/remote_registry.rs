@@ -6,7 +6,7 @@ pub struct RemoteRegistrySnapshot {
     pub remotes: Vec<RemoteDefinitionSnapshot>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteDefinitionSnapshot {
     pub id: String,
     pub name: String,
@@ -33,7 +33,7 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteTargetSnapshot {
     Ssh {
@@ -54,7 +54,9 @@ pub enum RemoteTargetSnapshot {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteKeybindingsSnapshot {
     #[default]

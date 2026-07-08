@@ -304,7 +304,9 @@ fn ping_over_socket_returns_version() {
     assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
-    assert_eq!(value["result"]["protocol"], 14);
+    // mx protocol = 1000 + upstream version (1016 = upstream v16 + mx wire variants);
+    // see src/protocol/wire.rs::PROTOCOL_VERSION.
+    assert_eq!(value["result"]["protocol"], 1016);
 
     cleanup_spawned_herdr(child, base);
 }

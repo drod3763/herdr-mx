@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
-    unregister_spawned_herdr_pid,
+    unregister_spawned_herdr_pid, CURRENT_PROTOCOL,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -694,7 +694,7 @@ fn frame_from_message(
             *baseline = Some(frame.clone());
             Some(frame)
         }
-        10 => {
+        11 => {
             let delta = decode_frame_delta_payload(payload).ok()?;
             let base = baseline
                 .take()
@@ -703,7 +703,7 @@ fn frame_from_message(
             *baseline = Some(frame.clone());
             Some(frame)
         }
-        12 => {
+        13 => {
             let (compressed, _): (Vec<u8>, usize) =
                 bincode::serde::decode_from_slice(payload, bincode::config::standard()).ok()?;
             let raw = miniz_oxide::inflate::decompress_to_vec(&compressed).ok()?;
@@ -719,7 +719,7 @@ fn wait_for_frame_matching(
     timeout: Duration,
     predicate: impl Fn(&FrameWire) -> bool,
 ) -> io::Result<bool> {
-    // issue #13: frames arrive as Frame (1), FrameDelta (10), or deflate-wrapped Compressed (12).
+    // issue #13: frames arrive as Frame (1), FrameDelta (11), or deflate-wrapped Compressed (13).
     // Track a baseline and reconstruct full frames before testing the predicate, like the client.
     let mut baseline: Option<FrameWire> = None;
     let deadline = Instant::now() + timeout;
@@ -750,8 +750,8 @@ fn wait_for_frame(stream: &mut UnixStream, timeout: Duration) -> bool {
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(80));
         match read_server_variant(stream, slice) {
-            // Frame (1), FrameDelta (10), or Compressed frame (12) — issue #13.
-            Ok(1) | Ok(10) | Ok(12) => return true,
+            // Frame (1), FrameDelta (11), or Compressed frame (13) — issue #13.
+            Ok(1) | Ok(11) | Ok(13) => return true,
             Ok(_) => {}
             Err(err) if is_timeout(&err) => {}
             Err(_) => return false,
@@ -790,7 +790,7 @@ fn cross_area_detach_and_reattach_preserves_state() {
 
     // Local attach (client A).
     let mut client_a = UnixStream::connect(&client_socket).expect("client A should connect");
-    client_handshake(&mut client_a, 14, 100, 30);
+    client_handshake(&mut client_a, CURRENT_PROTOCOL, 100, 30);
     assert!(wait_for_frame(&mut client_a, Duration::from_secs(2)));
 
     // Use herdr: create a workspace and write output into its pane.
@@ -827,7 +827,7 @@ fn cross_area_detach_and_reattach_preserves_state() {
 
     // Reattach from another terminal/session (client B).
     let mut client_b = UnixStream::connect(&client_socket).expect("client B should connect");
-    client_handshake(&mut client_b, 14, 80, 24);
+    client_handshake(&mut client_b, CURRENT_PROTOCOL, 80, 24);
     assert!(
         wait_for_frame(&mut client_b, Duration::from_secs(5)),
         "reattached client should receive frame"
@@ -883,7 +883,7 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
     let mut client_a = UnixStream::connect(&client_socket).expect("client A should connect");
-    client_handshake(&mut client_a, 14, 100, 30);
+    client_handshake(&mut client_a, CURRENT_PROTOCOL, 100, 30);
     assert!(wait_for_frame(&mut client_a, Duration::from_secs(2)));
 
     let created = workspace_create(&api_socket, "agent-persist");
@@ -936,7 +936,7 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
 
     // Reattach and ensure client-side state reflects the persisted working status.
     let mut client_b = UnixStream::connect(&client_socket).expect("client B should connect");
-    client_handshake(&mut client_b, 14, 80, 24);
+    client_handshake(&mut client_b, CURRENT_PROTOCOL, 80, 24);
     let saw_working_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
             frame_contains_text(frame, "working")
@@ -981,7 +981,7 @@ fn cross_area_client_and_api_workspace_views_are_consistent() {
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
     let mut client = UnixStream::connect(&client_socket).expect("client should connect");
-    client_handshake(&mut client, 14, 100, 30);
+    client_handshake(&mut client, CURRENT_PROTOCOL, 100, 30);
     assert!(wait_for_frame(&mut client, Duration::from_secs(2)));
     drain_server_messages(&mut client, Duration::from_millis(300));
 
@@ -1044,9 +1044,9 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
     let mut client_a = UnixStream::connect(&client_socket).expect("client A should connect");
-    client_handshake(&mut client_a, 14, 110, 30);
+    client_handshake(&mut client_a, CURRENT_PROTOCOL, 110, 30);
     let mut client_b = UnixStream::connect(&client_socket).expect("client B should connect");
-    client_handshake(&mut client_b, 14, 100, 30);
+    client_handshake(&mut client_b, CURRENT_PROTOCOL, 100, 30);
 
     assert!(wait_for_frame(&mut client_a, Duration::from_secs(2)));
     assert!(wait_for_frame(&mut client_b, Duration::from_secs(2)));
@@ -1218,7 +1218,7 @@ fn cross_area_server_kill_then_restart_and_reconnect() {
 
     let mut reconnect_client =
         UnixStream::connect(&client_socket).expect("new client should connect after restart");
-    client_handshake(&mut reconnect_client, 14, 80, 24);
+    client_handshake(&mut reconnect_client, CURRENT_PROTOCOL, 80, 24);
     assert!(
         wait_for_frame(&mut reconnect_client, Duration::from_secs(5)),
         "new client should receive frame after restart"

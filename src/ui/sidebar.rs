@@ -10,6 +10,7 @@ use ratatui::{
 
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{agent_icon, state_dot, state_label, state_label_color};
+use super::text::display_width_u16;
 use crate::app::state::{
     ordered_sidebar_space_items, AgentPanelSort, Palette, SidebarAgentItem, SidebarLine,
     SidebarSpaceItem,
@@ -105,7 +106,7 @@ pub(crate) fn agent_panel_toggle_rect(area: Rect, sort: AgentPanelSort) -> Rect 
     }
 
     let label = agent_panel_sort_label(sort);
-    let width = label.chars().count() as u16;
+    let width = display_width_u16(label);
     Rect::new(
         area.x + area.width.saturating_sub(width),
         area.y + 1,
@@ -838,7 +839,11 @@ pub(crate) fn workspace_parent_group_state(
     })
 }
 
-fn grouped_child_display_label(label: &str, branch: Option<&str>, has_custom_name: bool) -> String {
+pub(crate) fn grouped_child_display_label(
+    label: &str,
+    branch: Option<&str>,
+    has_custom_name: bool,
+) -> String {
     if has_custom_name {
         return label.to_string();
     }
@@ -865,7 +870,7 @@ pub(crate) struct HostBannerArea {
     pub rect: Rect,
 }
 
-fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) -> bool {
+pub(crate) fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) -> bool {
     matches!(
         entries.get(idx.saturating_add(1)),
         Some(WorkspaceListEntry::Workspace { indented: true, .. })
@@ -888,6 +893,17 @@ pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested:
 }
 
 pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> {
+    workspace_list_entries_inner(app, false)
+}
+
+/// Like [`workspace_list_entries`] but always expands worktree groups, ignoring
+/// `collapsed_space_keys`. The mobile switcher has no collapse affordance and
+/// always shows the full worktree tree.
+pub(crate) fn workspace_list_entries_expanded(app: &AppState) -> Vec<WorkspaceListEntry> {
+    workspace_list_entries_inner(app, true)
+}
+
+fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<WorkspaceListEntry> {
     let mut members_by_key = HashMap::<String, Vec<usize>>::new();
     for (ws_idx, ws) in app.workspaces.iter().enumerate() {
         if let Some(space) = ws.worktree_space() {
@@ -956,7 +972,7 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
             });
             continue;
         };
-        let collapsed = app.collapsed_space_keys.contains(&space.key);
+        let collapsed = !force_expanded && app.collapsed_space_keys.contains(&space.key);
         entries.push(WorkspaceListEntry::Workspace {
             ws_idx: parent_idx,
             indented: false,
@@ -1367,6 +1383,10 @@ pub(crate) fn collapsed_sidebar_sections(area: Rect) -> (Rect, Option<u16>, Rect
 // gate on it (it previously always called the EXPANDED `render_sidebar`, so the collapsed client
 // view was the expanded layout clipped to the mini width — diverging from `collapsed_hit_test`).
 pub(crate) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
     let is_navigating = matches!(app.mode, Mode::Navigate);
 
     let p = &app.palette;

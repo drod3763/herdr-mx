@@ -611,6 +611,7 @@ impl App {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn emit_worktree_opened_for_workspace(&mut self, ws_idx: usize, already_open: bool) {
         let Some(worktree) = self.worktree_info_for_workspace(ws_idx) else {
             return;
@@ -942,11 +943,12 @@ mod tests {
             1
         );
         assert_eq!(
-            &kinds[kinds.len() - 4..],
+            &kinds[kinds.len() - 5..],
             &[
                 EventKind::WorkspaceCreated,
                 EventKind::TabCreated,
                 EventKind::PaneCreated,
+                EventKind::LayoutUpdated,
                 EventKind::WorktreeCreated,
             ]
         );
@@ -1010,11 +1012,12 @@ mod tests {
             .map(|(_, event)| event.event)
             .collect::<Vec<_>>();
         assert_eq!(
-            &event_kinds[event_kinds.len() - 4..],
+            &event_kinds[event_kinds.len() - 5..],
             &[
                 EventKind::WorkspaceCreated,
                 EventKind::TabCreated,
                 EventKind::PaneCreated,
+                EventKind::LayoutUpdated,
                 EventKind::WorktreeCreated,
             ]
         );

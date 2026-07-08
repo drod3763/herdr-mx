@@ -1,12 +1,14 @@
 use std::{
     fs, io,
     io::Write,
-    process::{Command, Stdio},
+    process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyCode;
+#[cfg(test)]
+use crossterm::event::KeyEvent;
 use ratatui::layout::Direction;
 
 use crate::{
@@ -34,11 +36,20 @@ pub(crate) enum ActionContext {
 }
 
 impl App {
+    fn cancel_copy_mode_if_active(&mut self) {
+        if self.state.copy_mode.is_some() {
+            self.state.cancel_copy_mode(&self.terminal_runtimes);
+        }
+    }
+
     pub(crate) fn handle_prefix_key(&mut self, raw_key: TerminalKey) {
         let key = raw_key.as_key_event();
         self.state.update_dismissed = true;
 
         if self.state.is_prefix_key(raw_key) {
+            if self.state.copy_mode_pane_is_focused() {
+                self.state.cancel_copy_mode(&self.terminal_runtimes);
+            }
             if !self.pass_through_key_to_focused_pane(raw_key) {
                 leave_command_mode(&mut self.state);
             }
@@ -53,21 +64,27 @@ impl App {
         if let Some(action) = action_for_key(&self.state, raw_key, BindingDispatch::Prefix) {
             if action == NavigateAction::EditScrollback {
                 let previous_mode = self.state.mode;
+                self.cancel_copy_mode_if_active();
                 self.launch_focused_scrollback_editor();
                 finish_action_context(&mut self.state, ActionContext::Prefix, previous_mode);
+            } else if action == NavigateAction::CopyMode {
+                self.cancel_copy_mode_if_active();
+                self.execute_tui_navigate_action(action, ActionContext::Prefix);
+            } else if copy_mode_survives_prefix_action(action) {
+                self.execute_tui_navigate_action(action, ActionContext::Prefix);
+                if self.state.copy_mode.is_some() {
+                    self.state.sync_copy_mode_with_focus();
+                }
             } else {
-                execute_navigate_action_in_context(
-                    &mut self.state,
-                    &mut self.terminal_runtimes,
-                    action,
-                    ActionContext::Prefix,
-                );
+                self.cancel_copy_mode_if_active();
+                self.execute_tui_navigate_action(action, ActionContext::Prefix);
             }
             self.selection_autoscroll_deadline = None;
             return;
         }
 
         if let Some(binding) = command_for_key(&self.state, raw_key, BindingDispatch::Prefix) {
+            self.cancel_copy_mode_if_active();
             self.launch_custom_command(binding, ActionContext::Prefix);
             return;
         }
@@ -84,7 +101,29 @@ impl App {
             return;
         }
 
-        if handle_navigate_reserved_key(&mut self.state, raw_key) {
+        if self
+            .state
+            .keybinds
+            .navigate
+            .workspace_up
+            .matches_direct_key(raw_key)
+        {
+            self.state.move_selected_workspace_by_visible_delta(-1);
+            return;
+        }
+        if self
+            .state
+            .keybinds
+            .navigate
+            .workspace_down
+            .matches_direct_key(raw_key)
+        {
+            self.state.move_selected_workspace_by_visible_delta(1);
+            return;
+        }
+
+        if let Some(action) = navigate_reserved_action_for_key(&self.state, raw_key) {
+            self.execute_tui_navigate_action(action, ActionContext::Navigate);
             return;
         }
 
@@ -92,12 +131,7 @@ impl App {
             if action == NavigateAction::EditScrollback {
                 self.launch_focused_scrollback_editor();
             } else {
-                execute_navigate_action_in_context(
-                    &mut self.state,
-                    &mut self.terminal_runtimes,
-                    action,
-                    ActionContext::Navigate,
-                );
+                self.execute_tui_navigate_action(action, ActionContext::Navigate);
             }
             self.selection_autoscroll_deadline = None;
             return;
@@ -106,6 +140,576 @@ impl App {
         if let Some(binding) = command_for_key(&self.state, raw_key, BindingDispatch::Prefix) {
             self.launch_custom_command(binding, ActionContext::Navigate);
         }
+    }
+
+    pub(super) fn execute_tui_navigate_action(
+        &mut self,
+        action: NavigateAction,
+        context: ActionContext,
+    ) {
+        let previous_mode = self.state.mode;
+        match action {
+            NavigateAction::NewWorkspace => {
+                self.runtime_workspace_create(
+                    "tui.key.workspace.create",
+                    crate::api::schema::WorkspaceCreateParams {
+                        cwd: None,
+                        focus: true,
+                        label: None,
+                        env: Default::default(),
+                    },
+                );
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::NewWorktree => {
+                if let Some(ws_idx) = workspace_action_target(&self.state, context).filter(|idx| {
+                    workspace_can_start_worktree_action(&self.state, &self.terminal_runtimes, *idx)
+                }) {
+                    self.state.request_new_linked_worktree = Some(ws_idx);
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::OpenWorktree => {
+                if let Some(ws_idx) = workspace_action_target(&self.state, context).filter(|idx| {
+                    workspace_can_start_worktree_action(&self.state, &self.terminal_runtimes, *idx)
+                }) {
+                    self.state.request_open_existing_worktree = Some(ws_idx);
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::RemoveWorktree => {
+                if let Some(ws_idx) = workspace_action_target(&self.state, context) {
+                    self.state.request_remove_linked_worktree = Some(ws_idx);
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::RenameWorkspace => {
+                if let Some(ws_idx) = workspace_action_target(&self.state, context) {
+                    super::modal::open_rename_workspace(
+                        &mut self.state,
+                        &self.terminal_runtimes,
+                        ws_idx,
+                    );
+                }
+            }
+            NavigateAction::CloseWorkspace => {
+                if let Some(ws_idx) = workspace_action_target(&self.state, context) {
+                    self.state.selected = ws_idx;
+                    if self.state.confirm_close {
+                        super::modal::open_confirm_close(&mut self.state);
+                    } else {
+                        self.close_workspace_idx_via_api(ws_idx);
+                        leave_navigate_mode(&mut self.state);
+                    }
+                }
+            }
+            NavigateAction::SwitchWorkspace(idx) => {
+                if let Some(ws_idx) = self.state.workspace_at_visible_position(idx) {
+                    self.focus_workspace_idx_via_api(ws_idx);
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::SwitchTab(idx) => {
+                if self
+                    .state
+                    .active
+                    .and_then(|ws_idx| self.state.workspaces.get(ws_idx))
+                    .is_some_and(|ws| idx < ws.tabs.len())
+                {
+                    self.focus_tab_idx_via_api(idx);
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::FocusAgent(idx) => {
+                if let Some((ws_idx, pane_id)) = self.agent_entry_target(idx) {
+                    self.focus_pane_internal_via_api(ws_idx, pane_id);
+                    self.state.ensure_agent_panel_entry_visible(idx);
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::WorkspacePicker => {
+                self.state.mobile_switcher_scroll = 0;
+                self.state.mode = Mode::Navigate;
+            }
+            NavigateAction::PreviousWorkspace => {
+                if let Some(ws_idx) = self.relative_visible_workspace(-1) {
+                    self.focus_workspace_idx_via_api(ws_idx);
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::NextWorkspace => {
+                if let Some(ws_idx) = self.relative_visible_workspace(1) {
+                    self.focus_workspace_idx_via_api(ws_idx);
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::PreviousAgent => {
+                if let Some((idx, ws_idx, pane_id)) = self.relative_agent_entry(false) {
+                    self.focus_pane_internal_via_api(ws_idx, pane_id);
+                    self.state.ensure_agent_panel_entry_visible(idx);
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::NextAgent => {
+                if let Some((idx, ws_idx, pane_id)) = self.relative_agent_entry(true) {
+                    self.focus_pane_internal_via_api(ws_idx, pane_id);
+                    self.state.ensure_agent_panel_entry_visible(idx);
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::NewTab => {
+                if self.state.active.is_some() {
+                    if self.state.prompt_new_tab_name {
+                        super::modal::open_new_tab_dialog(&mut self.state);
+                    } else {
+                        self.runtime_tab_create(
+                            "tui.key.tab.create",
+                            crate::api::schema::TabCreateParams {
+                                workspace_id: None,
+                                cwd: None,
+                                focus: true,
+                                label: None,
+                                env: Default::default(),
+                            },
+                        );
+                        leave_navigate_mode(&mut self.state);
+                    }
+                }
+            }
+            NavigateAction::RenameTab => {
+                super::modal::open_rename_active_tab(&mut self.state, false)
+            }
+            NavigateAction::PreviousTab => {
+                if let Some(tab_idx) = self.relative_tab(-1) {
+                    self.focus_tab_idx_via_api(tab_idx);
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::NextTab => {
+                if let Some(tab_idx) = self.relative_tab(1) {
+                    self.focus_tab_idx_via_api(tab_idx);
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::CloseTab => {
+                if !self.close_active_tab_via_api_requires_confirmation() {
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::RenamePane => {
+                if let Some(pane_id) = self
+                    .state
+                    .active
+                    .and_then(|ws_idx| self.state.workspaces.get(ws_idx))
+                    .and_then(|ws| ws.focused_pane_id())
+                {
+                    super::modal::open_rename_pane(&mut self.state, pane_id);
+                }
+            }
+            NavigateAction::FocusPaneLeft => self.focus_pane_direction_via_api(NavDirection::Left),
+            NavigateAction::FocusPaneDown => self.focus_pane_direction_via_api(NavDirection::Down),
+            NavigateAction::FocusPaneUp => self.focus_pane_direction_via_api(NavDirection::Up),
+            NavigateAction::FocusPaneRight => {
+                self.focus_pane_direction_via_api(NavDirection::Right)
+            }
+            NavigateAction::SwapPaneLeft => {
+                self.swap_pane_direction_via_api(NavDirection::Left);
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::SwapPaneDown => {
+                self.swap_pane_direction_via_api(NavDirection::Down);
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::SwapPaneUp => {
+                self.swap_pane_direction_via_api(NavDirection::Up);
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::SwapPaneRight => {
+                self.swap_pane_direction_via_api(NavDirection::Right);
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::SplitVertical => {
+                self.split_focused_pane_via_api(crate::api::schema::SplitDirection::Right);
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::SplitHorizontal => {
+                self.split_focused_pane_via_api(crate::api::schema::SplitDirection::Down);
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::ClosePane => {
+                if !self.close_focused_pane_via_api_requires_confirmation() {
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::EditScrollback => {}
+            NavigateAction::CopyMode => self.state.enter_copy_mode(&self.terminal_runtimes),
+            NavigateAction::Zoom => {
+                self.zoom_focused_pane_via_api();
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::EnterResizeMode => self.state.mode = Mode::Resize,
+            NavigateAction::ToggleSidebar => {
+                self.state.sidebar_collapsed = !self.state.sidebar_collapsed;
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::CyclePaneNext => {
+                self.cycle_pane_via_api(false);
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::CyclePanePrevious => {
+                self.cycle_pane_via_api(true);
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::LastPane => {
+                self.last_pane_via_api();
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::Help => super::modal::open_keybind_help(&mut self.state),
+            NavigateAction::Settings => super::settings::open_settings(&mut self.state),
+            NavigateAction::ReloadConfig => {
+                self.runtime_server_reload_config("tui.server.reload_config");
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::OpenNotificationTarget => {
+                self.focus_toast_target_via_api();
+                if self.state.mode == Mode::Navigate {
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::Detach => {
+                super::modal::request_detach(&mut self.state);
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::OpenNavigator => {
+                self.state.open_navigator_from(&self.terminal_runtimes)
+            }
+        }
+
+        finish_action_context(&mut self.state, context, previous_mode);
+    }
+
+    pub(crate) fn focus_workspace_idx_via_api(&mut self, ws_idx: usize) {
+        let workspace_id = self.public_workspace_id(ws_idx);
+        self.runtime_workspace_focus("tui.workspace.focus", workspace_id);
+    }
+
+    pub(crate) fn close_workspace_idx_via_api(&mut self, ws_idx: usize) {
+        let workspace_id = self.public_workspace_id(ws_idx);
+        self.runtime_workspace_close("tui.workspace.close", workspace_id);
+    }
+
+    pub(crate) fn move_workspace_via_api(&mut self, source_ws_idx: usize, insert_idx: usize) {
+        let workspace_id = self.public_workspace_id(source_ws_idx);
+        self.runtime_workspace_move(
+            "tui.workspace.move",
+            crate::api::schema::WorkspaceMoveParams {
+                workspace_id,
+                insert_index: insert_idx,
+            },
+        );
+    }
+
+    pub(crate) fn focus_tab_idx_via_api(&mut self, tab_idx: usize) {
+        let Some(ws_idx) = self.state.active else {
+            return;
+        };
+        let Some(tab_id) = self.public_tab_id(ws_idx, tab_idx) else {
+            return;
+        };
+        self.runtime_tab_focus("tui.tab.focus", tab_id);
+    }
+
+    pub(crate) fn close_active_tab_via_api_requires_confirmation(&mut self) -> bool {
+        let Some(ws_idx) = self.state.active else {
+            return false;
+        };
+        if self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .is_some_and(|ws| ws.tabs.len() <= 1)
+        {
+            if self.state.confirm_implicit_worktree_group_close(ws_idx) {
+                return true;
+            }
+            self.close_workspace_idx_via_api(ws_idx);
+            return false;
+        }
+        let tab_idx = self.state.workspaces[ws_idx].active_tab_index();
+        let Some(tab_id) = self.public_tab_id(ws_idx, tab_idx) else {
+            return false;
+        };
+        self.runtime_tab_close("tui.tab.close", tab_id);
+        false
+    }
+
+    pub(crate) fn move_tab_via_api(
+        &mut self,
+        ws_idx: usize,
+        source_tab_idx: usize,
+        insert_idx: usize,
+    ) {
+        let Some(tab_id) = self.public_tab_id(ws_idx, source_tab_idx) else {
+            return;
+        };
+        self.runtime_tab_move(
+            "tui.tab.move",
+            crate::api::schema::TabMoveParams {
+                tab_id,
+                insert_index: insert_idx,
+            },
+        );
+    }
+
+    pub(crate) fn focus_pane_internal_via_api(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) {
+        let Some(pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return;
+        };
+        self.runtime_pane_focus("tui.pane.focus", pane_id);
+    }
+
+    pub(crate) fn focus_pane_direction_via_api(&mut self, direction: NavDirection) {
+        if let Some((ws_idx, target)) = self.directional_pane_target_from_view(direction) {
+            self.focus_pane_internal_via_api(ws_idx, target);
+            return;
+        }
+        self.runtime_pane_focus_direction(
+            "tui.pane.focus_direction",
+            crate::api::schema::PaneFocusDirectionParams {
+                pane_id: None,
+                direction: api_pane_direction(direction),
+            },
+        );
+    }
+
+    pub(crate) fn swap_pane_direction_via_api(&mut self, direction: NavDirection) {
+        if let Some((ws_idx, source, target)) = self.directional_pane_swap_from_view(direction) {
+            let source_pane_id = self.public_pane_id(ws_idx, source);
+            let target_pane_id = self.public_pane_id(ws_idx, target);
+            if let (Some(source_pane_id), Some(target_pane_id)) = (source_pane_id, target_pane_id) {
+                self.runtime_pane_swap(
+                    "tui.pane.swap_exact",
+                    crate::api::schema::PaneSwapParams {
+                        pane_id: None,
+                        direction: None,
+                        source_pane_id: Some(source_pane_id),
+                        target_pane_id: Some(target_pane_id),
+                    },
+                );
+                return;
+            }
+        }
+        self.runtime_pane_swap(
+            "tui.pane.swap",
+            crate::api::schema::PaneSwapParams {
+                pane_id: None,
+                direction: Some(api_pane_direction(direction)),
+                source_pane_id: None,
+                target_pane_id: None,
+            },
+        );
+    }
+
+    pub(crate) fn split_focused_pane_via_api(
+        &mut self,
+        direction: crate::api::schema::SplitDirection,
+    ) {
+        self.runtime_pane_split(
+            "tui.pane.split",
+            crate::api::schema::PaneSplitParams {
+                workspace_id: None,
+                target_pane_id: None,
+                direction,
+                ratio: None,
+                cwd: None,
+                focus: true,
+                env: Default::default(),
+            },
+        );
+    }
+
+    pub(crate) fn close_focused_pane_via_api_requires_confirmation(&mut self) -> bool {
+        let Some((ws_idx, pane_id)) = self.focused_pane_target() else {
+            return false;
+        };
+        let Some(pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return false;
+        };
+        self.runtime_pane_close("tui.pane.close", pane_id);
+        self.state.mode == Mode::ConfirmClose
+    }
+
+    pub(crate) fn zoom_focused_pane_via_api(&mut self) {
+        self.runtime_pane_zoom(
+            "tui.pane.zoom",
+            crate::api::schema::PaneZoomParams {
+                pane_id: None,
+                mode: crate::api::schema::PaneZoomMode::Toggle,
+            },
+        );
+    }
+
+    pub(crate) fn set_split_ratio_via_api(&mut self, path: Vec<bool>, ratio: f32) {
+        self.runtime_layout_set_split_ratio(
+            "tui.layout.set_split_ratio",
+            crate::api::schema::LayoutSetSplitRatioParams {
+                tab_id: None,
+                pane_id: None,
+                path,
+                ratio,
+            },
+        );
+    }
+
+    pub(crate) fn cycle_pane_via_api(&mut self, reverse: bool) {
+        let Some((ws_idx, pane_id)) = self.focused_pane_target() else {
+            return;
+        };
+        let Some(tab) = self.state.workspaces[ws_idx].active_tab() else {
+            return;
+        };
+        let ids = tab.layout.pane_ids();
+        let Some(pos) = ids.iter().position(|id| *id == pane_id) else {
+            return;
+        };
+        let target = if reverse {
+            ids[(pos + ids.len() - 1) % ids.len()]
+        } else {
+            ids[(pos + 1) % ids.len()]
+        };
+        self.focus_pane_internal_via_api(ws_idx, target);
+    }
+
+    pub(crate) fn last_pane_via_api(&mut self) {
+        let Some(target) = self.state.previous_pane_focus.clone() else {
+            return;
+        };
+        let Some((ws_idx, _tab_idx)) = self.state.pane_focus_target_indices(&target) else {
+            self.state.previous_pane_focus = None;
+            return;
+        };
+        if self.state.current_pane_focus_target().as_ref() == Some(&target) {
+            self.state.previous_pane_focus = None;
+            return;
+        }
+        self.focus_pane_internal_via_api(ws_idx, target.pane_id);
+    }
+
+    pub(crate) fn focus_toast_target_via_api(&mut self) {
+        let Some(target) = self
+            .state
+            .toast
+            .as_ref()
+            .and_then(|toast| toast.target.clone())
+        else {
+            return;
+        };
+        let Some(ws_idx) = self
+            .state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == target.workspace_id)
+        else {
+            return;
+        };
+        self.focus_pane_internal_via_api(ws_idx, target.pane_id);
+        self.state.toast = None;
+        self.state.mode = Mode::Terminal;
+    }
+
+    fn focused_pane_target(&self) -> Option<(usize, crate::layout::PaneId)> {
+        let ws_idx = self.state.active?;
+        let pane_id = self.state.workspaces.get(ws_idx)?.focused_pane_id()?;
+        Some((ws_idx, pane_id))
+    }
+
+    fn directional_pane_target_from_view(
+        &self,
+        direction: NavDirection,
+    ) -> Option<(usize, crate::layout::PaneId)> {
+        let ws_idx = self.state.active?;
+        let focused = self
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|pane| pane.is_focused)?;
+        let target =
+            crate::layout::find_in_direction(focused, direction, &self.state.view.pane_infos)?;
+        Some((ws_idx, target))
+    }
+
+    fn directional_pane_swap_from_view(
+        &self,
+        direction: NavDirection,
+    ) -> Option<(usize, crate::layout::PaneId, crate::layout::PaneId)> {
+        let ws_idx = self.state.active?;
+        let focused = self
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|pane| pane.is_focused)?;
+        let target =
+            crate::layout::find_in_direction(focused, direction, &self.state.view.pane_infos)?;
+        Some((ws_idx, focused.id, target))
+    }
+
+    fn relative_visible_workspace(&self, delta: isize) -> Option<usize> {
+        let order = self.state.visible_workspace_order();
+        if order.is_empty() {
+            return None;
+        }
+        let current = self.state.active.unwrap_or(self.state.selected);
+        let current_pos = order.iter().position(|idx| *idx == current).unwrap_or(0);
+        let next = (current_pos as isize + delta).rem_euclid(order.len() as isize) as usize;
+        order.get(next).copied()
+    }
+
+    fn relative_tab(&self, delta: isize) -> Option<usize> {
+        let ws = self
+            .state
+            .active
+            .and_then(|ws_idx| self.state.workspaces.get(ws_idx))?;
+        if ws.tabs.is_empty() {
+            return None;
+        }
+        Some((ws.active_tab as isize + delta).rem_euclid(ws.tabs.len() as isize) as usize)
+    }
+
+    fn agent_entry_target(&self, idx: usize) -> Option<(usize, crate::layout::PaneId)> {
+        let entries = crate::ui::agent_panel_entries(&self.state);
+        let target = entries.get(idx)?;
+        Some((target.ws_idx, target.pane_id))
+    }
+
+    fn relative_agent_entry(&self, forward: bool) -> Option<(usize, usize, crate::layout::PaneId)> {
+        let entries = crate::ui::agent_panel_entries(&self.state);
+        if entries.is_empty() {
+            return None;
+        }
+        let focused = self
+            .state
+            .active
+            .and_then(|idx| self.state.workspaces.get(idx))
+            .and_then(crate::workspace::Workspace::focused_pane_id);
+        let current_idx = entries
+            .iter()
+            .position(|entry| Some(entry.pane_id) == focused)
+            .unwrap_or(0);
+        let next_idx = if forward {
+            (current_idx + 1) % entries.len()
+        } else if current_idx == 0 {
+            entries.len() - 1
+        } else {
+            current_idx - 1
+        };
+        let target = entries.get(next_idx)?;
+        Some((next_idx, target.ws_idx, target.pane_id))
     }
 
     fn pass_through_key_to_focused_pane(&mut self, key: TerminalKey) -> bool {
@@ -208,10 +812,8 @@ impl App {
         &self,
         binding: &crate::config::CustomCommandKeybind,
     ) -> std::io::Result<()> {
-        let mut command = Command::new("/bin/sh");
+        let mut command = crate::platform::detached_custom_command_process(&binding.command);
         command
-            .arg("-lc")
-            .arg(&binding.command)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -262,14 +864,27 @@ impl App {
 
         let path = write_scrollback_temp_file(&scrollback)?;
 
-        let quoted_path = shell_quote(&path.display().to_string());
-        let command = format!(
-            r#"scrollback_file={quoted_path}; eval "${{EDITOR:-vi}} \"\$scrollback_file\""; status=$?; rm -f "$scrollback_file"; exit $status"#
-        );
-        if let Err(err) = self.spawn_pane_command(&command, vec![path.clone()]) {
-            let _ = fs::remove_file(&path);
-            return Err(err);
-        }
+        let argv = match crate::platform::scrollback_editor_argv(&path) {
+            Ok(argv) => argv,
+            Err(err) => {
+                let _ = fs::remove_file(&path);
+                return Err(err);
+            }
+        };
+        let (env, _) = self.custom_command_env();
+        let new_pane = match self.spawn_overlay_argv_command(&argv, None, env, vec![path.clone()]) {
+            Ok((_, new_pane)) => new_pane,
+            Err(err) => {
+                let _ = fs::remove_file(&path);
+                return Err(err);
+            }
+        };
+        let terminal_id = new_pane.terminal.id.clone();
+        self.terminal_runtimes
+            .insert(terminal_id.clone(), new_pane.runtime);
+        self.state
+            .remove_alias_shadowed_by_new_pane(new_pane.pane_id);
+        self.state.terminals.insert(terminal_id, new_pane.terminal);
 
         if let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) {
             self.state.toast = Some(crate::app::state::ToastNotification {
@@ -468,6 +1083,7 @@ pub(crate) fn command_for_key(
         .cloned()
 }
 
+#[cfg(test)]
 pub(super) fn handle_navigate_reserved_key(state: &mut AppState, key: TerminalKey) -> bool {
     let (code, modifiers) = crate::config::normalize_key_combo((key.code, key.modifiers));
     if modifiers.is_empty() {
@@ -540,7 +1156,67 @@ pub(super) fn handle_navigate_reserved_key(state: &mut AppState, key: TerminalKe
     false
 }
 
-#[allow(dead_code)] // exercised in input unit tests; production uses App::handle_navigate_key
+fn navigate_reserved_action_for_key(state: &AppState, key: TerminalKey) -> Option<NavigateAction> {
+    let (code, modifiers) = crate::config::normalize_key_combo((key.code, key.modifiers));
+    if modifiers.is_empty() {
+        match code {
+            KeyCode::Enter => {
+                return (!state.workspaces.is_empty()).then_some(NavigateAction::SwitchWorkspace(
+                    state
+                        .visible_workspace_order()
+                        .iter()
+                        .position(|idx| *idx == state.selected)
+                        .unwrap_or(state.selected),
+                ));
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                return Some(NavigateAction::SwitchWorkspace(
+                    (c as usize) - ('1' as usize),
+                ));
+            }
+            KeyCode::Tab => return Some(NavigateAction::CyclePaneNext),
+            KeyCode::BackTab => return Some(NavigateAction::CyclePanePrevious),
+            KeyCode::Left => return Some(NavigateAction::FocusPaneLeft),
+            KeyCode::Right => return Some(NavigateAction::FocusPaneRight),
+            _ => {}
+        }
+    }
+
+    if state.keybinds.navigate.workspace_up.matches_direct_key(key)
+        || state
+            .keybinds
+            .navigate
+            .workspace_down
+            .matches_direct_key(key)
+    {
+        return None;
+    }
+    if state.keybinds.navigate.pane_left.matches_direct_key(key) {
+        return Some(NavigateAction::FocusPaneLeft);
+    }
+    if state.keybinds.navigate.pane_down.matches_direct_key(key) {
+        return Some(NavigateAction::FocusPaneDown);
+    }
+    if state.keybinds.navigate.pane_up.matches_direct_key(key) {
+        return Some(NavigateAction::FocusPaneUp);
+    }
+    if state.keybinds.navigate.pane_right.matches_direct_key(key) {
+        return Some(NavigateAction::FocusPaneRight);
+    }
+
+    None
+}
+
+pub(super) fn api_pane_direction(direction: NavDirection) -> crate::api::schema::PaneDirection {
+    match direction {
+        NavDirection::Left => crate::api::schema::PaneDirection::Left,
+        NavDirection::Right => crate::api::schema::PaneDirection::Right,
+        NavDirection::Up => crate::api::schema::PaneDirection::Up,
+        NavDirection::Down => crate::api::schema::PaneDirection::Down,
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn handle_navigate_key(state: &mut AppState, key: KeyEvent) {
     let mut terminal_runtimes = TerminalRuntimeRegistry::new();
     state.update_dismissed = true;
@@ -612,6 +1288,29 @@ pub(crate) enum NavigateAction {
     OpenNotificationTarget,
     Detach,
     OpenNavigator,
+}
+
+fn copy_mode_survives_prefix_action(action: NavigateAction) -> bool {
+    matches!(
+        action,
+        NavigateAction::SwitchWorkspace(_)
+            | NavigateAction::SwitchTab(_)
+            | NavigateAction::FocusAgent(_)
+            | NavigateAction::PreviousWorkspace
+            | NavigateAction::NextWorkspace
+            | NavigateAction::PreviousAgent
+            | NavigateAction::NextAgent
+            | NavigateAction::PreviousTab
+            | NavigateAction::NextTab
+            | NavigateAction::FocusPaneLeft
+            | NavigateAction::FocusPaneDown
+            | NavigateAction::FocusPaneUp
+            | NavigateAction::FocusPaneRight
+            | NavigateAction::CyclePaneNext
+            | NavigateAction::CyclePanePrevious
+            | NavigateAction::LastPane
+            | NavigateAction::OpenNotificationTarget
+    )
 }
 
 fn indexed_navigation_action(
@@ -750,6 +1449,7 @@ pub(super) fn execute_navigate_action(state: &mut AppState, action: NavigateActi
     );
 }
 
+#[cfg(test)]
 pub(super) fn execute_navigate_action_in_context(
     state: &mut AppState,
     terminal_runtimes: &mut TerminalRuntimeRegistry,
@@ -1009,10 +1709,12 @@ fn finish_custom_command_context(
 }
 
 fn leave_command_mode(state: &mut AppState) {
-    state.mode = if state.active.is_some() {
-        Mode::Terminal
+    if state.copy_mode_pane_is_focused() {
+        state.mode = Mode::Copy;
+    } else if state.active.is_some() {
+        state.mode = Mode::Terminal;
     } else {
-        Mode::Navigate
+        state.mode = Mode::Navigate;
     };
 }
 
@@ -1059,22 +1761,6 @@ fn unique_scrollback_path(attempt: u32) -> std::path::PathBuf {
     ))
 }
 
-fn shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value.chars().all(|ch| {
-            ch.is_ascii_alphanumeric()
-                || matches!(
-                    ch,
-                    '@' | '%' | '_' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
-                )
-        })
-    {
-        return value.to_string();
-    }
-
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -1099,6 +1785,22 @@ mod tests {
             checkout_path: format!("/repo/worktree-{ws_idx}").into(),
             is_linked_worktree: ws_idx != 0,
         });
+    }
+
+    fn app_with_test_workspaces(names: &[&str]) -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = names.iter().map(|name| Workspace::test_new(name)).collect();
+        app.state.ensure_test_terminals();
+        app.state.active = (!app.state.workspaces.is_empty()).then_some(0);
+        app.state.selected = 0;
+        app
     }
 
     #[test]
@@ -1698,7 +2400,7 @@ last_pane = "prefix+tab"
 
         app.handle_navigate_key(TerminalKey::new(KeyCode::Char('n'), KeyModifiers::SHIFT));
 
-        assert!(app.state.request_new_workspace);
+        assert_eq!(app.state.workspaces.len(), 2);
         assert_eq!(app.state.mode, Mode::Terminal);
     }
 
@@ -1719,7 +2421,7 @@ last_pane = "prefix+tab"
 
         app.handle_navigate_key(TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty()));
 
-        assert!(app.state.request_new_workspace);
+        assert_eq!(app.state.workspaces.len(), 2);
         assert_eq!(app.state.mode, Mode::Terminal);
     }
 
@@ -1760,7 +2462,7 @@ last_pane = "prefix+tab"
 
         app.handle_navigate_key(TerminalKey::new(KeyCode::Char('R'), KeyModifiers::empty()));
 
-        assert!(app.state.request_reload_config);
+        assert!(!app.state.request_reload_config);
         assert_eq!(app.state.mode, Mode::Terminal);
     }
 
@@ -1782,6 +2484,37 @@ last_pane = "prefix+tab"
         app.handle_navigate_key(TerminalKey::new(KeyCode::Char('P'), KeyModifiers::empty()));
 
         assert_eq!(app.state.mode, Mode::RenamePane);
+    }
+
+    #[test]
+    fn app_navigate_mode_workspace_down_moves_selection() {
+        let mut app = app_with_test_workspaces(&["one", "two"]);
+        app.state.mode = Mode::Navigate;
+
+        app.handle_navigate_key(TerminalKey::new(KeyCode::Down, KeyModifiers::empty()));
+
+        assert_eq!(app.state.selected, 1);
+        assert_eq!(app.state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn app_navigate_mode_workspace_keys_are_configurable() {
+        let mut app = app_with_test_workspaces(&["one", "two"]);
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+navigate_workspace_down = "j"
+navigate_pane_down = "ctrl+j"
+"#,
+        )
+        .unwrap();
+        app.state.keybinds = config.keybinds();
+        app.state.mode = Mode::Navigate;
+
+        app.handle_navigate_key(TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty()));
+
+        assert_eq!(app.state.selected, 1);
+        assert_eq!(app.state.mode, Mode::Navigate);
     }
 
     #[tokio::test]
@@ -1989,6 +2722,38 @@ last_pane = "prefix+tab"
         assert_eq!(state.workspaces.len(), 2);
     }
 
+    #[test]
+    fn tui_close_tab_last_parent_group_workspace_opens_confirmation_via_api() {
+        let mut app = app_with_test_workspaces(&["main", "issue"]);
+        mark_worktree_space_member(&mut app.state, 0, "repo-key");
+        mark_worktree_space_member(&mut app.state, 1, "repo-key");
+        app.state.active = Some(0);
+        app.state.selected = 1;
+        app.state.mode = Mode::Navigate;
+
+        app.execute_tui_navigate_action(NavigateAction::CloseTab, ActionContext::Navigate);
+
+        assert_eq!(app.state.selected, 0);
+        assert_eq!(app.state.mode, Mode::ConfirmClose);
+        assert_eq!(app.state.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn tui_close_pane_last_parent_group_pane_opens_confirmation_via_api() {
+        let mut app = app_with_test_workspaces(&["main", "issue"]);
+        mark_worktree_space_member(&mut app.state, 0, "repo-key");
+        mark_worktree_space_member(&mut app.state, 1, "repo-key");
+        app.state.active = Some(0);
+        app.state.selected = 1;
+        app.state.mode = Mode::Navigate;
+
+        app.execute_tui_navigate_action(NavigateAction::ClosePane, ActionContext::Navigate);
+
+        assert_eq!(app.state.selected, 0);
+        assert_eq!(app.state.mode, Mode::ConfirmClose);
+        assert_eq!(app.state.workspaces.len(), 2);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn custom_command_runs_from_prefix_key_in_navigate_mode() {
@@ -2179,6 +2944,13 @@ last_pane = "prefix+tab"
         assert!(content.contains("alpha"));
         assert!(content.contains("beta"));
         assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(
+            app.state.terminals.values().any(|terminal| terminal
+                .launch_argv
+                .as_ref()
+                .is_some_and(|argv| argv.first().is_some_and(|program| program == "/bin/sh"))),
+            "scrollback editor should launch through argv overlay path"
+        );
 
         let _ = std::fs::remove_file(output_path);
     }
