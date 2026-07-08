@@ -562,11 +562,26 @@ fn write_ime_anchor_cursor_state(writer: &mut impl Write, cursor: HostCursorStat
 fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
     let mut active_hyperlink = None;
     for row in 0..frame.height {
+        // Erase the row before painting it. Every column is repainted below, so
+        // the only position this clears that the paint loop does not is the
+        // continuation cell of a wide grapheme, which is intentionally skipped.
+        // Some terminals do not reliably clear the trailing cell when printing a
+        // wide grapheme (ratatui works around this for VS16/U+FE0F emoji in its own
+        // diff, `buffer.rs`), so without the removed `CSI 2J` a stale glyph could
+        // survive under that skipped cell. Clearing per row closes that hole while
+        // — unlike a whole-screen `CSI 2J` — never blanking the whole viewport:
+        // already-painted rows stay, unreached rows keep their old content, so a
+        // remote repaint reads as a top-to-bottom refresh rather than a flash.
+        // Reset style first so the erase uses the default background, not whatever
+        // color the previous row's last cell left active.
+        let _ = write!(writer, "\x1b[{};1H", row + 1);
+        let _ = writer.write_all(b"\x1b[0m\x1b[K");
         let mut to_skip = 0usize;
         for col in 0..frame.width {
             if to_skip > 0 {
                 // Continuation cell of a wide grapheme: the lead glyph already
-                // covers this position. Painting it would corrupt the row.
+                // covers this position, and the per-row erase above cleared any
+                // stale glyph underneath it. Painting it would corrupt the row.
                 to_skip -= 1;
                 continue;
             }
@@ -1591,6 +1606,49 @@ mod tests {
         assert!(output_str.contains("\x1b[1;1H"));
         assert!(!output_str.contains("\x1b[1;2H"));
         assert!(output_str.contains("\x1b[1;3H"));
+        // The trailing cell is skipped, so a per-row erase must clear it first —
+        // otherwise a terminal that fails to clear a wide grapheme's trailing cell
+        // (e.g. VS16 emoji) would leave a stale glyph there once `CSI 2J` is gone.
+        assert!(
+            output_str.contains("\x1b[K"),
+            "full redraw must erase each row so skipped wide-grapheme trailing cells cannot keep stale glyphs"
+        );
+    }
+
+    #[test]
+    fn full_redraw_erases_before_painting_each_row() {
+        // A full redraw drops `CSI 2J` to avoid the remote flicker flash, but every
+        // row must still be cleared before it is painted so no skipped position
+        // (wide-grapheme continuation cells) can retain a previous frame's glyph.
+        // The erase is per row (`CSI K`), not whole-screen (`CSI 2J`): rows are
+        // cleared and repainted top to bottom, so the viewport is never fully blank.
+        let frame = make_frame(
+            2,
+            2,
+            vec![
+                make_cell("a", 0, 0, 0),
+                make_cell("b", 0, 0, 0),
+                make_cell("c", 0, 0, 0),
+                make_cell("d", 0, 0, 0),
+            ],
+        );
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &frame, None);
+        let output_str = String::from_utf8(output).unwrap();
+
+        assert!(
+            !output_str.contains("\x1b[2J"),
+            "full redraw must not erase the whole screen (that is the remote flicker flash)"
+        );
+        // One erase-to-end-of-line per row, each preceded by a move to that row.
+        assert_eq!(
+            output_str.matches("\x1b[K").count(),
+            2,
+            "each of the 2 rows must be erased before it is painted"
+        );
+        assert!(output_str.contains("\x1b[1;1H"), "row 1 must be addressed");
+        assert!(output_str.contains("\x1b[2;1H"), "row 2 must be addressed");
     }
 
     #[test]
