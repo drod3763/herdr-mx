@@ -35,7 +35,6 @@ const NIX_UPDATE_COMMAND: &str = "update through Nix";
 // herdr that lacks the multi-remote client.
 const MX_BUILD_CHANNEL: &str = "mx";
 const MX_HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr-mx";
-const MX_HOMEBREW_PREVIEW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr-mx-preview";
 // mx mise installs use a ubi backend (`mise use -g "ubi:drod3763/herdr-mx[exe=herdr]"`). The
 // in-app updater does NOT auto-generate a `mise upgrade <tool>` command for them: the valid
 // upgrade selector is the configured tool id, which cannot be recovered from the binary path
@@ -1958,16 +1957,15 @@ pub(crate) fn update_install_command() -> &'static str {
 
 /// mx self-update is disabled, so route mx installs to the package manager that owns the
 /// running binary. `homebrew_formula` is the Cellar formula directory name when the binary is a
-/// Homebrew keg, so preview installs (`herdr-mx-preview`) upgrade their own formula rather than
-/// the stable one. Everything else (including mise installs, whose exact upgrade selector cannot
-/// be reliably recovered) falls back to the always-correct manual GitHub releases install.
+/// Homebrew keg (`herdr-mx`), so those upgrade in place. Everything else (including mise installs,
+/// whose exact upgrade selector cannot be reliably recovered) falls back to the always-correct
+/// manual GitHub releases install.
 ///
 /// Split out from [`update_install_command`] so it can be tested: `build_info::channel()`
 /// is compile-time, so the live `mx` path is otherwise unreachable from a stable test build.
 fn select_mx_update_command(homebrew_formula: Option<&str>) -> &'static str {
     match homebrew_formula {
         Some("herdr-mx") => MX_HOMEBREW_UPDATE_COMMAND,
-        Some("herdr-mx-preview") => MX_HOMEBREW_PREVIEW_UPDATE_COMMAND,
         // Unknown formula or no Homebrew keg → the always-correct manual releases install,
         // rather than guessing the stable `herdr-mx` upgrade for an unexpected formula.
         _ => MX_RELEASES_UPDATE_COMMAND,
@@ -2006,11 +2004,10 @@ fn is_homebrew_managed_install() -> bool {
     is_homebrew_managed_exe_path_following_links(&current_exe)
 }
 
-/// The mx Homebrew formula (`herdr-mx` or `herdr-mx-preview`) that owns the running binary,
-/// or `None` when it is not a Homebrew keg. mx installs under those formulae rather than
-/// `herdr`, and preview vs stable must route to different `brew upgrade` targets — so this
-/// returns the formula name, not a bool. mise installs are handled separately (they fall back
-/// to the manual releases instruction — see the mx-mise note above the consts).
+/// The mx Homebrew formula (`herdr-mx`) that owns the running binary, or `None` when it is not a
+/// Homebrew keg. mx installs under that formula rather than `herdr`, so this returns the formula
+/// name, not a bool. mise installs are handled separately (they fall back to the manual releases
+/// instruction — see the mx-mise note above the consts).
 fn mx_homebrew_formula_for_current_install() -> Option<String> {
     let current_exe = env::current_exe().ok()?;
     mx_homebrew_formula_name(&current_exe).or_else(|| {
@@ -2190,9 +2187,9 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
     homebrew_cellar_keg_root_impl(path, false)
 }
 
-/// `allow_mx_formulae` additionally accepts the mx Cellar formula names (`herdr-mx`,
-/// `herdr-mx-preview`) produced by `brew install drod3763/tap/herdr-mx`. The binary itself
-/// is still installed as `herdr`, so the keg shape is `Cellar/<formula>/<version>/bin/herdr`.
+/// `allow_mx_formulae` additionally accepts the mx Cellar formula name (`herdr-mx`) produced by
+/// `brew install drod3763/tap/herdr-mx`. The binary itself is still installed as `herdr`, so the
+/// keg shape is `Cellar/<formula>/<version>/bin/herdr`.
 fn homebrew_cellar_keg_root_impl(path: &Path, allow_mx_formulae: bool) -> Option<PathBuf> {
     if path.file_name()? != "herdr" {
         return None;
@@ -2204,9 +2201,8 @@ fn homebrew_cellar_keg_root_impl(path: &Path, allow_mx_formulae: bool) -> Option
     let version_dir = bin_dir.parent()?;
     let formula_dir = version_dir.parent()?;
     let formula_name = formula_dir.file_name()?;
-    let formula_matches = formula_name == "herdr"
-        || (allow_mx_formulae
-            && (formula_name == "herdr-mx" || formula_name == "herdr-mx-preview"));
+    let formula_matches =
+        formula_name == "herdr" || (allow_mx_formulae && formula_name == "herdr-mx");
     if !formula_matches {
         return None;
     }
@@ -2224,9 +2220,9 @@ fn homebrew_cellar_keg_root_impl(path: &Path, allow_mx_formulae: bool) -> Option
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     if crate::build_info::channel() == MX_BUILD_CHANNEL {
-        // Share the formula-aware routing so a preview Homebrew install is told to upgrade the
-        // preview formula, not the stable one. For an unmanaged install this resolves to the
-        // releases instruction, so avoid repeating it.
+        // Share the formula-aware routing so a Homebrew install is told to upgrade the herdr-mx
+        // formula. For an unmanaged install this resolves to the releases instruction, so avoid
+        // repeating it.
         let command = update_install_command();
         if command == MX_RELEASES_UPDATE_COMMAND {
             return Err(format!(
@@ -2556,15 +2552,15 @@ mod tests {
             select_mx_update_command(Some("herdr-mx")),
             MX_HOMEBREW_UPDATE_COMMAND
         );
-        // Preview Homebrew formula → its own formula, not the stable one.
-        assert_eq!(
-            select_mx_update_command(Some("herdr-mx-preview")),
-            MX_HOMEBREW_PREVIEW_UPDATE_COMMAND
-        );
-        // An unexpected formula name (e.g. a plain `herdr` keg) must not be assumed to be the
-        // stable mx formula; it falls back to the releases install.
+        // herdr-mx has no preview formula. An unexpected formula name (a plain `herdr` keg, or a
+        // stale `herdr-mx-preview`) must not be assumed to be the stable mx formula; it falls back
+        // to the releases install.
         assert_eq!(
             select_mx_update_command(Some("herdr")),
+            MX_RELEASES_UPDATE_COMMAND
+        );
+        assert_eq!(
+            select_mx_update_command(Some("herdr-mx-preview")),
             MX_RELEASES_UPDATE_COMMAND
         );
         // Anything else (including mise installs, whose exact upgrade selector cannot be
@@ -2830,22 +2826,19 @@ mod tests {
 
     #[test]
     fn mx_homebrew_cellar_path_resolves_formula() {
-        // `brew install drod3763/tap/herdr-mx` installs under the `herdr-mx` formula
-        // (preview under `herdr-mx-preview`); the binary is still `herdr`.
+        // `brew install drod3763/tap/herdr-mx` installs under the `herdr-mx` formula; the binary
+        // is still `herdr`. herdr-mx is stable-only, so there is no preview formula to resolve.
         let stable = Path::new("/opt/homebrew/Cellar/herdr-mx/0.7.1/bin/herdr");
         let preview = Path::new("/opt/homebrew/Cellar/herdr-mx-preview/0.7.1/bin/herdr");
         // The strict (upstream-formula) detector requires a `herdr` formula and misses these.
         assert!(!is_homebrew_managed_exe_path(stable));
         assert!(!is_homebrew_managed_exe_path(preview));
-        // The relaxed mx resolver returns the exact formula so routing stays formula-specific.
+        // The relaxed mx resolver returns the stable formula; a stale preview keg is not recognized.
         assert_eq!(
             mx_homebrew_formula_name(stable).as_deref(),
             Some("herdr-mx")
         );
-        assert_eq!(
-            mx_homebrew_formula_name(preview).as_deref(),
-            Some("herdr-mx-preview")
-        );
+        assert_eq!(mx_homebrew_formula_name(preview), None);
     }
 
     #[test]
