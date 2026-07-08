@@ -471,3 +471,34 @@ jobs:
           fi
           curl -fsS -X POST "$DEPLOY_HOOK" > /dev/null
           echo "Triggered Cloudflare Pages production deploy"
+
+  # herdr-mx: dispatch the Homebrew tap's update workflow the moment an mx release is
+  # published so the formula PR opens within minutes instead of waiting for the tap's
+  # daily cron. The tap workflow (drod3763/homebrew-tap update-herdr-mx.yml) downloads
+  # the four release assets, verifies their minisig signatures, pins SHA256, and opens
+  # the bump PR; passing the explicit tag pins THIS release rather than re-resolving
+  # "latest". Only mx tags feed the herdr-mx tap (the tap workflow rejects non-mx tags).
+  trigger-homebrew-tap:
+    needs: release
+    if: ${{ contains(github.ref_name, '-mx.') }}
+    runs-on: ubuntu-latest
+    # A dispatch hiccup must not fail the published release; the tap's daily cron backstops it.
+    continue-on-error: true
+    permissions:
+      contents: read
+
+    steps:
+      - name: Dispatch tap formula update
+        env:
+          # Cross-repo dispatch: GITHUB_TOKEN cannot reach another repo. Fine-grained PAT
+          # scoped to drod3763/homebrew-tap with Actions: read/write.
+          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::TAP_DISPATCH_TOKEN secret is not set; skipping Homebrew tap dispatch. Add the secret to enable release-time bumps; the tap's daily cron updates the formula in the meantime."
+            exit 0
+          fi
+          gh workflow run update-herdr-mx.yml \
+            --repo drod3763/homebrew-tap \
+            --field version="$TAG"
