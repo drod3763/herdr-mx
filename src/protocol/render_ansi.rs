@@ -411,8 +411,14 @@ fn blit_frame_to_with_cursor_memory_and_policy(
     let _ = writer.write_all(b"\x1b]8;;\x1b\\");
 
     if full_redraw {
-        // Clear the screen and write all cells.
-        let _ = writer.write_all(b"\x1b[2J\x1b[H");
+        // Overwrite every cell in place instead of clearing first. A whole-screen
+        // erase (`CSI 2J`) blanks the screen before any repaint byte lands; over a
+        // remote link — or on any terminal that ignores the surrounding DEC 2026
+        // synchronized-output block — that blank window is visible as a flash.
+        // `write_all_cells` paints every column (blanks included), so the old frame
+        // is replaced cell-by-cell with no intermediate blank state. Home the cursor
+        // so painting starts from a known position.
+        let _ = writer.write_all(b"\x1b[H");
         write_all_cells(&mut writer, frame);
     } else {
         // Diff-based update: only write changed cells.
@@ -556,19 +562,38 @@ fn write_ime_anchor_cursor_state(writer: &mut impl Write, cursor: HostCursorStat
 fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
     let mut active_hyperlink = None;
     for row in 0..frame.height {
+        // Erase the row before painting it. Every column is repainted below, so
+        // the only position this clears that the paint loop does not is the
+        // continuation cell of a wide grapheme, which is intentionally skipped.
+        // Some terminals do not reliably clear the trailing cell when printing a
+        // wide grapheme (ratatui works around this for VS16/U+FE0F emoji in its own
+        // diff, `buffer.rs`), so without the removed `CSI 2J` a stale glyph could
+        // survive under that skipped cell. Clearing per row closes that hole while
+        // — unlike a whole-screen `CSI 2J` — never blanking the whole viewport:
+        // already-painted rows stay, unreached rows keep their old content, so a
+        // remote repaint reads as a top-to-bottom refresh rather than a flash.
+        // Reset style first so the erase uses the default background, not whatever
+        // color the previous row's last cell left active. Close any OSC 8 hyperlink
+        // left open by the previous row too: `\x1b[0m` resets SGR but not the active
+        // link, and on terminals that apply current attributes to erased cells the
+        // erase would tag this row's blank/skipped cells with the stale URI, leaving
+        // wrong click targets under a skipped wide-grapheme continuation cell. The
+        // paint loop re-opens the link on the first cell that needs it.
+        close_hyperlink(writer, &mut active_hyperlink);
+        let _ = write!(writer, "\x1b[{};1H", row + 1);
+        let _ = writer.write_all(b"\x1b[0m\x1b[K");
         let mut to_skip = 0usize;
         for col in 0..frame.width {
             if to_skip > 0 {
+                // Continuation cell of a wide grapheme: the lead glyph already
+                // covers this position, and the per-row erase above cleared any
+                // stale glyph underneath it. Painting it would corrupt the row.
                 to_skip -= 1;
                 continue;
             }
 
             let idx = (row as usize) * (frame.width as usize) + (col as usize);
             let cell = &frame.cells[idx];
-
-            if cell.skip {
-                continue;
-            }
 
             // Move cursor to position (1-based).
             let _ = write!(writer, "\x1b[{};{}H", row + 1, col + 1);
@@ -583,8 +608,21 @@ fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
                 cell_hyperlink_uri(frame, cell),
             );
 
-            // Write the symbol.
-            let _ = writer.write_all(cell.symbol.as_bytes());
+            // A full redraw no longer clears the screen first (that blank window
+            // flickers over remote links), so every cell must paint something to
+            // overwrite whatever occupied this position in the previous frame.
+            // `cell.skip` is ratatui's "don't emit this cell during diffing" hint.
+            // Its wide-grapheme-continuation case is already consumed by `to_skip`
+            // above, so a skip cell reaching here is a blank/graphics placeholder;
+            // paint a space so no stale glyph survives. Any graphics are spliced in
+            // after these cell writes and overlay the space. An empty symbol (a cell
+            // that carries no grapheme) is covered the same way.
+            let symbol = if cell.skip || cell.symbol.is_empty() {
+                " "
+            } else {
+                cell.symbol.as_str()
+            };
+            let _ = writer.write_all(symbol.as_bytes());
             to_skip = cell_width(cell).saturating_sub(1);
         }
     }
@@ -1184,13 +1222,23 @@ mod tests {
         blit_frame_to(&mut output, &frame, None);
 
         let output_str = String::from_utf8(output).unwrap();
-        // Full redraw should start with clear screen.
+        // A full redraw overwrites every cell in place rather than clearing the
+        // screen first: the `CSI 2J` erase blanks the screen before any repaint
+        // lands, which flickers over remote links. It homes the cursor instead.
         assert!(
-            output_str.contains("\x1b[2J"),
-            "full redraw should clear screen"
+            !output_str.contains("\x1b[2J"),
+            "full redraw must not clear the screen"
         );
         assert!(
-            output_str.contains('H') || output_str.contains('i'),
+            output_str.contains("\x1b[H"),
+            "full redraw should home the cursor"
+        );
+        // Assert on cell symbols that never appear in escape sequences. 'H' would
+        // be a false positive: the homing `\x1b[H` and every CUP end in 'H', so it
+        // is present regardless of whether any cell content was written. 'i' and
+        // '!' only come from the frame's cells.
+        assert!(
+            output_str.contains('i') && output_str.contains('!'),
             "should contain cell content"
         );
     }
@@ -1243,9 +1291,19 @@ mod tests {
         blit_frame_to(&mut output, &curr, Some(&prev));
 
         let output_str = String::from_utf8(output).unwrap();
+        // A size change still forces a full redraw, but the full redraw now homes
+        // the cursor and overwrites every cell instead of erasing with `CSI 2J`.
         assert!(
-            output_str.contains("\x1b[2J"),
-            "size change should trigger full redraw"
+            !output_str.contains("\x1b[2J"),
+            "full redraw must not clear the screen"
+        );
+        assert!(
+            output_str.contains("\x1b[H"),
+            "size change should trigger a full redraw (homes the cursor)"
+        );
+        assert!(
+            output_str.matches('B').count() == 6,
+            "full redraw should repaint every cell of the resized frame"
         );
     }
 
@@ -1554,6 +1612,135 @@ mod tests {
         assert!(output_str.contains("\x1b[1;1H"));
         assert!(!output_str.contains("\x1b[1;2H"));
         assert!(output_str.contains("\x1b[1;3H"));
+        // The trailing cell is skipped, so a per-row erase must clear it first —
+        // otherwise a terminal that fails to clear a wide grapheme's trailing cell
+        // (e.g. VS16 emoji) would leave a stale glyph there once `CSI 2J` is gone.
+        assert!(
+            output_str.contains("\x1b[K"),
+            "full redraw must erase each row so skipped wide-grapheme trailing cells cannot keep stale glyphs"
+        );
+    }
+
+    #[test]
+    fn full_redraw_closes_hyperlink_before_each_row_erase() {
+        // A row ending inside an OSC 8 hyperlink must not leave that link active
+        // across the next row's erase: `CSI K` on a terminal that applies current
+        // attributes to erased cells would tag this row's blank/skipped cells with
+        // the stale URI, and a skipped wide-grapheme continuation cell would keep it.
+        // Row 0 is fully linked; row 1 leads with a wide grapheme (its trailing cell
+        // is skipped), so the link must be closed before row 1's erase.
+        let frame = FrameData {
+            cells: vec![
+                linked_cell("L", 0),
+                linked_cell("K", 0),
+                make_cell(WIDE_GRAPHEME, 0, 0, 0),
+                make_cell(" ", 0, 0, 0),
+            ],
+            width: 2,
+            height: 2,
+            cursor: None,
+            hyperlinks: vec!["http://example.test".to_owned()],
+            graphics: Vec::new(),
+        };
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &frame, None);
+        let output_str = String::from_utf8(output).unwrap();
+
+        // The OSC 8 close must be emitted immediately before row 1's move+erase.
+        assert!(
+            output_str.contains("\x1b]8;;\x1b\\\x1b[2;1H"),
+            "the active hyperlink must be closed before the next row's erase"
+        );
+    }
+
+    #[test]
+    fn full_redraw_erases_before_painting_each_row() {
+        // A full redraw drops `CSI 2J` to avoid the remote flicker flash, but every
+        // row must still be cleared before it is painted so no skipped position
+        // (wide-grapheme continuation cells) can retain a previous frame's glyph.
+        // The erase is per row (`CSI K`), not whole-screen (`CSI 2J`): rows are
+        // cleared and repainted top to bottom, so the viewport is never fully blank.
+        let frame = make_frame(
+            2,
+            2,
+            vec![
+                make_cell("a", 0, 0, 0),
+                make_cell("b", 0, 0, 0),
+                make_cell("c", 0, 0, 0),
+                make_cell("d", 0, 0, 0),
+            ],
+        );
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &frame, None);
+        let output_str = String::from_utf8(output).unwrap();
+
+        assert!(
+            !output_str.contains("\x1b[2J"),
+            "full redraw must not erase the whole screen (that is the remote flicker flash)"
+        );
+        // One erase-to-end-of-line per row, each preceded by a move to that row.
+        assert_eq!(
+            output_str.matches("\x1b[K").count(),
+            2,
+            "each of the 2 rows must be erased before it is painted"
+        );
+        assert!(output_str.contains("\x1b[1;1H"), "row 1 must be addressed");
+        assert!(output_str.contains("\x1b[2;1H"), "row 2 must be addressed");
+    }
+
+    #[test]
+    fn full_redraw_overwrites_skip_and_empty_cells_with_a_space() {
+        // A `skip` cell (ratatui draws it itself — blank/graphics placeholder) and
+        // an empty-symbol cell must still be painted so the removed `CSI 2J` clear
+        // leaves no stale glyph from the previous frame at those positions.
+        let mut skip_cell = make_cell("", 0, 0, 0);
+        skip_cell.skip = true;
+        let frame = FrameData {
+            cells: vec![make_cell("A", 0, 0, 0), skip_cell, make_cell("", 0, 0, 0)],
+            width: 3,
+            height: 1,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &frame, None);
+        let output_str = String::from_utf8(output).unwrap();
+
+        // Every non-wide position must be addressed AND have its glyph actually
+        // written, so nothing from a prior frame can survive underneath. Asserting
+        // only the CUP would still pass if the cursor moved but no glyph was emitted
+        // — the exact regression this test guards against. A style (SGR) sequence
+        // sits between each CUP and its glyph, but the CUP (`ESC [ … H`) and SGR
+        // (`ESC [ … m`) bytes are only ESC, '[', digits, ';', 'H', and 'm' — none of
+        // which is a space or 'A'. So the painted glyph ('A' or a space) is the sole
+        // such byte between one position's CUP and the next.
+        let p1 = output_str
+            .find("\x1b[1;1H")
+            .expect("lead cell must be addressed");
+        let p2 = output_str
+            .find("\x1b[1;2H")
+            .expect("skip cell must be addressed");
+        let p3 = output_str
+            .find("\x1b[1;3H")
+            .expect("empty cell must be addressed");
+        assert!(p1 < p2 && p2 < p3, "cells must be painted left to right");
+        assert!(output_str[p1..p2].contains('A'), "lead cell must paint 'A'");
+        assert!(
+            output_str[p2..p3].contains(' '),
+            "skip cell must paint a space, not just move the cursor"
+        );
+        assert!(
+            output_str[p3..].contains(' '),
+            "empty cell must paint a space, not just move the cursor"
+        );
+        assert!(
+            !output_str.contains("\x1b[2J"),
+            "full redraw must not clear the screen"
+        );
     }
 
     #[test]
