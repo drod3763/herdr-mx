@@ -573,7 +573,13 @@ fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
         // already-painted rows stay, unreached rows keep their old content, so a
         // remote repaint reads as a top-to-bottom refresh rather than a flash.
         // Reset style first so the erase uses the default background, not whatever
-        // color the previous row's last cell left active.
+        // color the previous row's last cell left active. Close any OSC 8 hyperlink
+        // left open by the previous row too: `\x1b[0m` resets SGR but not the active
+        // link, and on terminals that apply current attributes to erased cells the
+        // erase would tag this row's blank/skipped cells with the stale URI, leaving
+        // wrong click targets under a skipped wide-grapheme continuation cell. The
+        // paint loop re-opens the link on the first cell that needs it.
+        close_hyperlink(writer, &mut active_hyperlink);
         let _ = write!(writer, "\x1b[{};1H", row + 1);
         let _ = writer.write_all(b"\x1b[0m\x1b[K");
         let mut to_skip = 0usize;
@@ -1612,6 +1618,39 @@ mod tests {
         assert!(
             output_str.contains("\x1b[K"),
             "full redraw must erase each row so skipped wide-grapheme trailing cells cannot keep stale glyphs"
+        );
+    }
+
+    #[test]
+    fn full_redraw_closes_hyperlink_before_each_row_erase() {
+        // A row ending inside an OSC 8 hyperlink must not leave that link active
+        // across the next row's erase: `CSI K` on a terminal that applies current
+        // attributes to erased cells would tag this row's blank/skipped cells with
+        // the stale URI, and a skipped wide-grapheme continuation cell would keep it.
+        // Row 0 is fully linked; row 1 leads with a wide grapheme (its trailing cell
+        // is skipped), so the link must be closed before row 1's erase.
+        let frame = FrameData {
+            cells: vec![
+                linked_cell("L", 0),
+                linked_cell("K", 0),
+                make_cell(WIDE_GRAPHEME, 0, 0, 0),
+                make_cell(" ", 0, 0, 0),
+            ],
+            width: 2,
+            height: 2,
+            cursor: None,
+            hyperlinks: vec!["http://example.test".to_owned()],
+            graphics: Vec::new(),
+        };
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &frame, None);
+        let output_str = String::from_utf8(output).unwrap();
+
+        // The OSC 8 close must be emitted immediately before row 1's move+erase.
+        assert!(
+            output_str.contains("\x1b]8;;\x1b\\\x1b[2;1H"),
+            "the active hyperlink must be closed before the next row's erase"
         );
     }
 
