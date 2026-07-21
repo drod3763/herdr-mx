@@ -598,6 +598,7 @@ fn worktree_request_and_response_round_trip() {
                 agent_status: AgentStatus::Unknown,
                 branch: None,
                 git: None,
+                tokens: HashMap::new(),
                 worktree: Some(WorkspaceWorktreeInfo {
                     repo_key: "/repo/herdr/.git".into(),
                     repo_name: "herdr".into(),
@@ -626,10 +627,12 @@ fn worktree_request_and_response_round_trip() {
                 label: None,
                 agent: None,
                 title: None,
+                terminal_title: None,
+                terminal_title_stripped: None,
                 display_agent: None,
                 agent_status: AgentStatus::Unknown,
-                custom_status: None,
                 state_labels: HashMap::new(),
+                tokens: HashMap::new(),
                 agent_session: None,
                 scroll: None,
                 revision: 0,
@@ -683,6 +686,7 @@ fn worktree_lifecycle_events_round_trip() {
         agent_status: AgentStatus::Unknown,
         branch: None,
         git: None,
+        tokens: HashMap::new(),
         worktree: Some(WorkspaceWorktreeInfo {
             repo_key: "/repo/herdr/.git".into(),
             repo_name: "herdr".into(),
@@ -814,6 +818,8 @@ fn plugin_link_list_unlink_round_trip() {
             description: None,
             platforms: None,
             placement: PluginPanePlacement::Overlay,
+            width: None,
+            height: None,
             command: vec!["bun".into(), "run".into(), "board.ts".into()],
         }],
         link_handlers: vec![PluginManifestLinkHandler {
@@ -1036,10 +1042,12 @@ fn create_response_round_trips_with_root_pane() {
                 label: None,
                 agent: None,
                 title: None,
+                terminal_title: None,
+                terminal_title_stripped: None,
                 display_agent: None,
                 agent_status: AgentStatus::Unknown,
-                custom_status: None,
                 state_labels: HashMap::new(),
+                tokens: HashMap::new(),
                 agent_session: None,
                 scroll: None,
                 revision: 0,
@@ -1150,10 +1158,12 @@ fn plugin_pane_open_request_round_trips() {
         method: Method::PluginPaneOpen(PluginPaneOpenParams {
             plugin_id: "example.board".into(),
             entrypoint: "board".into(),
-            placement: Some(PluginPanePlacement::Zoomed),
+            placement: Some(PluginPanePlacement::Popup),
+            width: Some(crate::popup_size::PopupSize::Cells(90)),
+            height: Some(crate::popup_size::PopupSize::Percent(80)),
             workspace_id: None,
-            target_pane_id: Some("1-1".into()),
-            direction: Some(SplitDirection::Right),
+            target_pane_id: None,
+            direction: None,
             cwd: Some("/tmp".into()),
             focus: true,
             env: [("HERDR_ROLE".to_string(), "board".to_string())].into(),
@@ -1162,6 +1172,9 @@ fn plugin_pane_open_request_round_trips() {
 
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["method"], "plugin.pane.open");
+    assert_eq!(json["params"]["placement"], "popup");
+    assert_eq!(json["params"]["width"], 90);
+    assert_eq!(json["params"]["height"], "80%");
     assert_eq!(json["params"]["env"]["HERDR_ROLE"], "board");
     let restored: Request = serde_json::from_value(json).unwrap();
     assert_eq!(restored, request);
@@ -1179,4 +1192,17 @@ fn only_ssh_config_hosts_runs_discovery_off_loop() {
     assert!(!Method::RemoteList(EmptyParams::default()).runs_ssh_config_discovery_off_loop());
     assert!(!Method::WorktreeCreate(WorktreeCreateParams::default())
         .runs_ssh_config_discovery_off_loop());
+}
+
+#[test]
+fn popup_close_request_round_trips() {
+    let request = Request {
+        id: "popup-close".into(),
+        method: Method::PopupClose(EmptyParams::default()),
+    };
+
+    let json = serde_json::to_value(request).unwrap();
+
+    assert_eq!(json["method"], "popup.close");
+    assert_eq!(json["params"], serde_json::json!({}));
 }

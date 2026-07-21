@@ -283,7 +283,6 @@ fn sidebar_agent_field_name(field: SidebarAgentItem) -> &'static str {
         SidebarAgentField::SpaceName => "space_name",
         SidebarAgentField::Status => "status",
         SidebarAgentField::Time => "time",
-        SidebarAgentField::CustomStatus => "custom_status",
         SidebarAgentField::AgentName => "agent_name",
         SidebarAgentField::RightAlignment => "right_alignment",
     }

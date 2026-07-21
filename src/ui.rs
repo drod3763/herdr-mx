@@ -38,7 +38,10 @@ use self::mobile::{
 use self::navigator::render_navigator_overlay;
 pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
-use self::panes::{compute_pane_infos, render_panes, resize_tab_panes};
+pub(crate) use self::panes::popup_pane_rects;
+use self::panes::{
+    compute_pane_infos, render_panes, render_popup_pane, resize_popup_pane, resize_tab_panes,
+};
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, release_notes_close_button_rect,
     release_notes_display_lines, release_notes_wrapped_line_count, PRODUCT_ANNOUNCEMENT_MODAL_SIZE,
@@ -396,6 +399,7 @@ fn compute_view_internal(
     );
     if resize_panes {
         resize_background_tab_panes_for_desktop(app, terminal_runtimes, main_area, cell_size);
+        resize_popup_pane(app, terminal_runtimes, terminal_area, cell_size);
     }
 
     let toast_hit_area = app
@@ -429,6 +433,7 @@ fn compute_view_internal(
         pane_infos,
         split_borders,
     };
+    app.sync_copy_mode_search_geometry();
 }
 
 fn compute_mobile_view(
@@ -474,6 +479,7 @@ fn compute_mobile_view(
     );
     if resize_panes {
         resize_background_tab_panes_to_area(app, terminal_runtimes, terminal_area, cell_size);
+        resize_popup_pane(app, terminal_runtimes, terminal_area, cell_size);
     }
     let header_hits = compute_mobile_header_hit_areas(app, header_rect);
 
@@ -501,6 +507,7 @@ fn compute_mobile_view(
         pane_infos,
         split_borders,
     };
+    app.sync_copy_mode_search_geometry();
 }
 
 /// Render the UI — reads AppState but does not mutate it.
@@ -554,6 +561,7 @@ fn render_content_and_overlays(
 
     // Ambient notifications sit above panes, but below interactive overlays.
     render_notifications(app, frame, terminal_area);
+    render_popup_pane(app, terminal_runtimes, frame, terminal_area);
 
     match app.mode {
         Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
@@ -592,7 +600,12 @@ fn render_content_and_overlays(
 fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
     let has_config_diagnostic = app.config_diagnostic.is_some();
     if let Some(message) = &app.config_diagnostic {
-        render_config_diagnostic(frame, terminal_area, message, &app.palette);
+        let diagnostic_area = if app.view.layout == ViewLayout::Mobile {
+            terminal_area
+        } else {
+            frame.area()
+        };
+        render_config_diagnostic(frame, diagnostic_area, message, &app.palette);
     }
     let mut copy_feedback_offset = u16::from(has_config_diagnostic);
     let mut toast_rect = None;
@@ -812,6 +825,25 @@ mod tests {
             app.view.mobile_menu_hit_area.x + app.view.mobile_menu_hit_area.width,
             44
         );
+    }
+
+    #[test]
+    fn mobile_config_diagnostic_keeps_command_visible() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.config_diagnostic = Some("config.toml:100:10; herdr config check".into());
+
+        let area = Rect::new(0, 0, 44, 20);
+        compute_view(&mut app, area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let row = buffer_row_text(terminal.backend().buffer(), area, app.view.terminal_area.y);
+
+        assert!(row.contains("config.toml:100:10"), "{row}");
+        assert!(row.contains("herdr config check"), "{row}");
     }
 
     #[test]
@@ -1543,6 +1575,8 @@ mod tests {
                 command: "lazygit".to_string(),
                 action: crate::config::CustomCommandAction::Pane,
                 description: Some("open lazygit".to_string()),
+                width: None,
+                height: None,
             },
             crate::config::CustomCommandKeybind {
                 bindings: crate::config::ActionKeybinds::prefix("alt+h"),
@@ -1550,6 +1584,8 @@ mod tests {
                 command: "echo hello".to_string(),
                 action: crate::config::CustomCommandAction::Shell,
                 description: None,
+                width: None,
+                height: None,
             },
         ];
 

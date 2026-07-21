@@ -35,7 +35,6 @@ pub(crate) struct AgentPanelEntry {
     pub state: AgentState,
     pub seen: bool,
     pub last_agent_state_change_seq: Option<u64>,
-    pub custom_status: Option<String>,
     pub state_labels: HashMap<String, String>,
     pub working_duration: Option<WorkingDuration>,
 }
@@ -148,20 +147,27 @@ fn agent_panel_entries_with_runtimes(
             let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);
             ws.pane_details(&app.terminals)
                 .into_iter()
-                .map(move |detail| AgentPanelEntry {
-                    ws_idx,
-                    tab_idx: detail.tab_idx,
-                    pane_id: detail.pane_id,
-                    pane_label: detail.pane_label,
-                    primary_label: workspace_label.clone(),
-                    primary_tab_label: multi_tab.then_some(detail.tab_label),
-                    agent_label: Some(detail.agent_label),
-                    state: detail.state,
-                    seen: detail.seen,
-                    last_agent_state_change_seq: detail.last_agent_state_change_seq,
-                    custom_status: detail.custom_status,
-                    state_labels: detail.state_labels,
-                    working_duration: detail.working_duration,
+                .map(move |detail| {
+                    // upstream #1369: keep renamed single tabs visible in the agents panel
+                    let show_tab = multi_tab
+                        || ws
+                            .tabs
+                            .get(detail.tab_idx)
+                            .is_some_and(|tab| !tab.is_auto_named());
+                    AgentPanelEntry {
+                        ws_idx,
+                        tab_idx: detail.tab_idx,
+                        pane_id: detail.pane_id,
+                        pane_label: detail.pane_label,
+                        primary_label: workspace_label.clone(),
+                        primary_tab_label: show_tab.then_some(detail.tab_label),
+                        agent_label: Some(detail.agent_label),
+                        state: detail.state,
+                        seen: detail.seen,
+                        last_agent_state_change_seq: detail.last_agent_state_change_seq,
+                        state_labels: detail.state_labels,
+                        working_duration: detail.working_duration,
+                    }
                 })
         })
         .collect();
@@ -2055,10 +2061,6 @@ fn sidebar_agent_item_spans(
         SidebarAgentItem::Time => entry
             .working_duration
             .map(|duration| duration_value_spans(duration, p)),
-        SidebarAgentItem::CustomStatus => entry
-            .custom_status
-            .as_ref()
-            .map(|status| vec![Span::styled(status.clone(), agent_style)]),
         SidebarAgentItem::AgentName => entry
             .agent_label
             .as_ref()
@@ -2487,7 +2489,6 @@ pub(crate) fn settings_sidebar_agent_demo_lines(app: &AppState, width: u16) -> V
             state: AgentState::Working,
             seen: true,
             last_agent_state_change_seq: None,
-            custom_status: Some("planning".into()),
             state_labels: HashMap::new(),
             working_duration: Some(WorkingDuration {
                 elapsed: Duration::from_secs(92),
@@ -2505,7 +2506,6 @@ pub(crate) fn settings_sidebar_agent_demo_lines(app: &AppState, width: u16) -> V
             state: AgentState::Idle,
             seen: true,
             last_agent_state_change_seq: None,
-            custom_status: Some("ready".into()),
             state_labels: HashMap::new(),
             working_duration: Some(WorkingDuration {
                 elapsed: Duration::from_secs(8),
@@ -2778,13 +2778,6 @@ mod tests {
             .collect::<String>()
     }
 
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
-
     fn compact_duration_text(duration: Duration) -> String {
         compact_duration_parts(duration)
             .into_iter()
@@ -2863,7 +2856,6 @@ mod tests {
             state: AgentState::Idle,
             seen: true,
             last_agent_state_change_seq: None,
-            custom_status: None,
             state_labels: HashMap::new(),
             working_duration: None,
         };
@@ -3101,90 +3093,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_agent_demo_does_not_render_custom_status_outside_configured_fields() {
-        let mut app = crate::app::state::AppState::test_new();
-        for item in crate::app::state::SIDEBAR_AGENT_ITEMS {
-            item.set_enabled(&mut app.sidebar_agent, false);
-        }
-        crate::app::state::SidebarAgentItem::Status.set_enabled(&mut app.sidebar_agent, true);
-        crate::app::state::SidebarAgentItem::AgentName.set_enabled(&mut app.sidebar_agent, true);
-        crate::app::state::SidebarAgentItem::RightAlignment
-            .set_enabled(&mut app.sidebar_agent, false);
-
-        let rendered = settings_sidebar_agent_demo_lines(&app, 32)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(rendered.contains("working · claude"), "{rendered:?}");
-        assert!(rendered.contains("idle · codex"), "{rendered:?}");
-        assert!(!rendered.contains("planning"), "{rendered:?}");
-        assert!(!rendered.contains("ready"), "{rendered:?}");
-    }
-
-    #[test]
-    fn sidebar_agent_custom_status_follows_right_alignment_marker() {
-        let mut app = crate::app::state::AppState::test_new();
-        let config: crate::config::Config = toml::from_str(
-            r#"
-[ui.sidebar.agents]
-lines = [
-  [
-    { field = "agent_status", show = false },
-    { field = "pane_name", show = false },
-    { field = "tab_name", show = false },
-    { field = "space_name", show = false },
-    { field = "status", show = true },
-    { field = "time", show = false },
-    { field = "right_alignment", show = true },
-    { field = "custom_status", show = true },
-    { field = "agent_name", show = true },
-  ],
-]
-"#,
-        )
-        .unwrap();
-        app.sidebar_agent = config.ui.sidebar.agents;
-        let workspace = Workspace::test_new("herdr");
-        let pane = workspace.tabs[0].root_pane;
-
-        app.workspaces = vec![workspace];
-        app.ensure_test_terminals();
-        let terminal_id = app.workspaces[0].tabs[0].panes[&pane]
-            .attached_terminal_id
-            .clone();
-        app.terminals
-            .get_mut(&terminal_id)
-            .unwrap()
-            .set_hook_authority_with_custom_status(
-                "test".into(),
-                "codex".into(),
-                AgentState::Working,
-                None,
-                Some("planning".into()),
-                None,
-            );
-
-        let backend = ratatui::backend::TestBackend::new(42, 8);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                render_agent_detail(
-                    &app,
-                    &TerminalRuntimeRegistry::new(),
-                    frame,
-                    Rect::new(0, 0, 42, 8),
-                )
-            })
-            .unwrap();
-        let row = agent_entry_row_text(terminal.backend().buffer(), 3, 42);
-
-        assert!(row.contains(" working"), "row: {row:?}");
-        assert!(row.ends_with("planning · codex"), "row: {row:?}");
-    }
-
-    #[test]
     fn sidebar_agent_color_preset_overrides_configured_item_color() {
         let mut app = crate::app::state::AppState::test_new();
         crate::app::state::SidebarAgentItem::AgentName.set_color(
@@ -3202,14 +3110,7 @@ lines = [
         app.terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_hook_authority_with_custom_status(
-                "test".into(),
-                "codex".into(),
-                AgentState::Idle,
-                None,
-                None,
-                None,
-            );
+            .set_hook_authority("test".into(), "codex".into(), AgentState::Idle, None, None);
 
         let backend = ratatui::backend::TestBackend::new(42, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -3248,7 +3149,6 @@ lines = [
             state: AgentState::Idle,
             seen: true,
             last_agent_state_change_seq: None,
-            custom_status: None,
             state_labels: HashMap::new(),
             working_duration: None,
         };

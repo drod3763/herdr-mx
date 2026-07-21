@@ -786,6 +786,8 @@ pub struct UiConfig {
     pub mobile_width_threshold: u16,
     /// Capture mouse input for Herdr's mouse UI. Default: true.
     pub mouse_capture: bool,
+    /// Copy text selected with the mouse. Default: true.
+    pub copy_on_select: bool,
     /// Host cursor policy. Default: auto.
     pub host_cursor: HostCursorModeConfig,
     /// Modifier that lets right-click gestures pass through to pane apps. Empty disables it.
@@ -1050,7 +1052,6 @@ pub enum SidebarAgentField {
     SpaceName,
     Status,
     Time,
-    CustomStatus,
     AgentName,
     RightAlignment,
 }
@@ -1097,11 +1098,22 @@ impl SidebarColorPreset {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SidebarSpacesConfig {
     pub lines: Vec<Vec<SidebarItem<SidebarSpaceField>>>,
+    /// Upstream `[ui.sidebar.spaces]` row/token layout (`rows`, `row_gap`). Accepted and
+    /// exposed on the API surface, but the mx segment renderer does not consume it yet.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub row_layout: crate::config::sidebar::SpacesSidebarConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SidebarAgentsConfig {
     pub lines: Vec<Vec<SidebarItem<SidebarAgentField>>>,
+    /// Upstream `[ui.sidebar.agents]` row/token layout (`rows`, `rows_by_agent`, `row_gap`).
+    /// Accepted and exposed on the API surface, but the mx segment renderer does not consume
+    /// it yet.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub row_layout: crate::config::sidebar::AgentsSidebarConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1187,7 +1199,6 @@ fn parse_sidebar_agent_field(value: &str) -> Option<SidebarAgentField> {
         "space_name" => Some(SidebarAgentField::SpaceName),
         "status" => Some(SidebarAgentField::Status),
         "time" => Some(SidebarAgentField::Time),
-        "custom_status" => Some(SidebarAgentField::CustomStatus),
         "agent_name" => Some(SidebarAgentField::AgentName),
         "right_alignment" => Some(SidebarAgentField::RightAlignment),
         _ => None,
@@ -1198,12 +1209,16 @@ fn parse_sidebar_agent_field(value: &str) -> Option<SidebarAgentField> {
 #[serde(default)]
 struct RawSidebarSpacesConfig {
     lines: Option<Vec<Vec<RawSidebarItem>>>,
+    #[serde(flatten)]
+    row_layout: crate::config::sidebar::SpacesSidebarConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct RawSidebarAgentsConfig {
     lines: Option<Vec<Vec<RawSidebarItem>>>,
+    #[serde(flatten)]
+    row_layout: crate::config::sidebar::AgentsSidebarConfig,
 }
 
 impl<'de> Deserialize<'de> for SidebarSpacesConfig {
@@ -1228,27 +1243,37 @@ impl<'de> Deserialize<'de> for SidebarAgentsConfig {
 
 impl RawSidebarSpacesConfig {
     fn into_config(self) -> SidebarSpacesConfig {
-        self.lines
-            .map(|lines| SidebarSpacesConfig {
-                lines: normalize_sidebar_space_lines(raw_sidebar_lines(
-                    lines,
-                    parse_sidebar_space_field,
-                )),
-            })
-            .unwrap_or_default()
+        let row_layout = self.row_layout;
+        SidebarSpacesConfig {
+            lines: self
+                .lines
+                .map(|lines| {
+                    normalize_sidebar_space_lines(raw_sidebar_lines(
+                        lines,
+                        parse_sidebar_space_field,
+                    ))
+                })
+                .unwrap_or_else(|| SidebarSpacesConfig::default().lines),
+            row_layout,
+        }
     }
 }
 
 impl RawSidebarAgentsConfig {
     fn into_config(self) -> SidebarAgentsConfig {
-        self.lines
-            .map(|lines| SidebarAgentsConfig {
-                lines: normalize_sidebar_agent_lines(raw_sidebar_lines(
-                    lines,
-                    parse_sidebar_agent_field,
-                )),
-            })
-            .unwrap_or_default()
+        let row_layout = self.row_layout;
+        SidebarAgentsConfig {
+            lines: self
+                .lines
+                .map(|lines| {
+                    normalize_sidebar_agent_lines(raw_sidebar_lines(
+                        lines,
+                        parse_sidebar_agent_field,
+                    ))
+                })
+                .unwrap_or_else(|| SidebarAgentsConfig::default().lines),
+            row_layout,
+        }
     }
 }
 
@@ -1414,7 +1439,7 @@ pub struct ExperimentalConfig {
     /// if the list contains no valid names, the reveal does not apply.
     /// Accepted names: pi, claude, codex, gemini, cursor, devin, cline,
     /// opencode, copilot, kimi, kiro, droid, amp, grok, hermes, kilo,
-    /// qodercli, qoder.
+    /// qodercli, qoder, maki.
     /// Default: empty.
     pub cjk_ime_agents: Vec<String>,
     /// Cursor shape rendered for the IME anchor when
@@ -1508,6 +1533,7 @@ impl Default for UiConfig {
             sidebar_collapsed_mode: SidebarCollapsedModeConfig::Compact,
             mobile_width_threshold: DEFAULT_MOBILE_WIDTH_THRESHOLD,
             mouse_capture: true,
+            copy_on_select: true,
             host_cursor: HostCursorModeConfig::Auto,
             right_click_passthrough_modifier: RightClickPassthroughModifierConfig::default(),
             redraw_on_focus_gained: true,
@@ -1531,6 +1557,7 @@ impl Default for UiConfig {
 impl Default for SidebarSpacesConfig {
     fn default() -> Self {
         Self {
+            row_layout: Default::default(),
             lines: vec![
                 vec![
                     SidebarItem::visible(SidebarSpaceField::Status),
@@ -1548,6 +1575,7 @@ impl Default for SidebarSpacesConfig {
 impl Default for SidebarAgentsConfig {
     fn default() -> Self {
         Self {
+            row_layout: Default::default(),
             lines: vec![
                 vec![
                     SidebarItem::visible(SidebarAgentField::AgentStatus),
@@ -1558,7 +1586,6 @@ impl Default for SidebarAgentsConfig {
                 vec![
                     SidebarItem::visible(SidebarAgentField::Status),
                     SidebarItem::visible(SidebarAgentField::Time),
-                    SidebarItem::visible(SidebarAgentField::CustomStatus),
                     SidebarItem::visible(SidebarAgentField::RightAlignment),
                     SidebarItem::visible(SidebarAgentField::AgentName),
                 ],
@@ -1674,6 +1701,24 @@ manifest_check = false
         assert_eq!(config.update.channel.as_str(), "preview");
         assert!(!config.update.version_check);
         assert!(!config.update.manifest_check);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_config_defaults_to_preview() {
+        let empty: Config = toml::from_str("").unwrap();
+        let without_update_channel: Config =
+            toml::from_str("[update]\nversion_check = false").unwrap();
+
+        assert_eq!(
+            Config::default().update.channel,
+            UpdateChannelConfig::Preview
+        );
+        assert_eq!(empty.update.channel, UpdateChannelConfig::Preview);
+        assert_eq!(
+            without_update_channel.update.channel,
+            UpdateChannelConfig::Preview
+        );
     }
 
     #[test]
@@ -1931,6 +1976,19 @@ mouse_capture = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.mouse_capture);
+    }
+
+    #[test]
+    fn copy_on_select_default_on_and_parse() {
+        let default_config = Config::default();
+        assert!(default_config.ui.copy_on_select);
+
+        let toml = r#"
+[ui]
+copy_on_select = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ui.copy_on_select);
     }
 
     #[test]
@@ -2202,7 +2260,6 @@ pane_history = true
                 vec![
                     SidebarItem::visible(SidebarAgentField::Status),
                     SidebarItem::visible(SidebarAgentField::Time),
-                    SidebarItem::visible(SidebarAgentField::CustomStatus),
                     SidebarItem::visible(SidebarAgentField::RightAlignment),
                     SidebarItem::visible(SidebarAgentField::AgentName),
                 ],
@@ -2265,11 +2322,6 @@ lines = [
                 SidebarItem::visible(SidebarAgentField::SpaceName),
                 SidebarItem::new(SidebarAgentField::Status, false),
                 SidebarItem::new(SidebarAgentField::Time, false),
-                SidebarItem {
-                    field: SidebarAgentField::CustomStatus,
-                    show: false,
-                    color: SidebarColorPreset::Warm,
-                },
                 SidebarItem::visible(SidebarAgentField::RightAlignment),
                 SidebarItem::visible(SidebarAgentField::AgentName),
             ],]
@@ -2446,7 +2498,6 @@ lines = [
                 SidebarItem::visible(SidebarAgentField::SpaceName),
                 SidebarItem::visible(SidebarAgentField::Status),
                 SidebarItem::visible(SidebarAgentField::Time),
-                SidebarItem::visible(SidebarAgentField::CustomStatus),
                 SidebarItem::visible(SidebarAgentField::RightAlignment),
                 SidebarItem::visible(SidebarAgentField::AgentName),
             ],]

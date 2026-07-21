@@ -4359,6 +4359,7 @@ mod tests {
             agent_status: crate::api::schema::AgentStatus::Idle,
             worktree: None,
             git: None,
+            tokens: std::collections::HashMap::new(),
         }
     }
 
@@ -4376,12 +4377,14 @@ mod tests {
             agent: None,
             title: None,
             tab_label: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
             display_agent: None,
             agent_status: status,
             screen_detection_skipped: false,
             foreground_is_remote_client: false,
-            custom_status: None,
             state_labels: std::collections::HashMap::new(),
+            tokens: std::collections::HashMap::new(),
             agent_session: None,
             workspace_id: workspace_id.into(),
             tab_id: "tab-1".into(),

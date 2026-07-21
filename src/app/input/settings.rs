@@ -1395,7 +1395,7 @@ mod tests {
             &mut state,
             KeyEvent::new(KeyCode::Right, KeyModifiers::empty()),
         );
-        state.settings.list.selected = 8;
+        state.settings.list.selected = 7;
 
         update_settings_state(
             &mut state,
@@ -1663,7 +1663,7 @@ mod tests {
         let action = app.state.handle_settings_mouse(mouse(
             MouseEventKind::Down(crossterm::event::MouseButton::Left),
             area.x + 2,
-            area.y + 12,
+            area.y + 11,
         ));
 
         assert_eq!(
@@ -1674,7 +1674,7 @@ mod tests {
             })
         );
         assert_eq!(app.state.sidebar_agent, expected);
-        assert_eq!(app.state.settings.list.selected, 7);
+        assert_eq!(app.state.settings.list.selected, 6);
     }
 
     #[test]
