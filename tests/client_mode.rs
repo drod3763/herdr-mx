@@ -273,9 +273,9 @@ fn read_next_frame_payload(stream: &mut UnixStream, timeout: Duration) -> Result
     Err("timed out waiting for Frame message".into())
 }
 
-fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
+fn frame_text(frame: &FrameWire) -> String {
     if frame.cells.is_empty() {
-        return false;
+        return String::new();
     }
 
     let width = frame.width.max(1) as usize;
@@ -292,7 +292,7 @@ fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
         let _ = (cursor.x, cursor.y, cursor.visible, cursor.shape);
     }
 
-    text.contains(needle)
+    text
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +398,7 @@ fn client_sees_headless_startup_config_diagnostic() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut found_diagnostic = false;
+    let mut last_frame_text = String::new();
     while Instant::now() < deadline {
         match read_server_message(&mut stream) {
             Ok((variant, payload)) => {
@@ -405,7 +406,10 @@ fn client_sees_headless_startup_config_diagnostic() {
                 let (variant, payload) = support::inflate_compressed_frame(variant, &payload);
                 if variant == 1 {
                     let frame = decode_frame_payload(&payload).expect("decode frame");
-                    if frame_contains_text(&frame, "config parse error") {
+                    last_frame_text = frame_text(&frame);
+                    if last_frame_text.contains("config.toml")
+                        && last_frame_text.contains("herdr config check")
+                    {
                         found_diagnostic = true;
                         break;
                     }
@@ -417,7 +421,7 @@ fn client_sees_headless_startup_config_diagnostic() {
 
     assert!(
         found_diagnostic,
-        "attached client should see startup config parse diagnostic"
+        "attached client should see startup config parse diagnostic; last frame:\n{last_frame_text}"
     );
 
     cleanup_spawned_herdr(spawned, base);

@@ -884,7 +884,6 @@ mod tests {
         assert!(rendered.contains("2nd line"));
         assert!(rendered.contains("[✓] status text"));
         assert!(rendered.contains("[✓] agent time"));
-        assert!(rendered.contains("[✓] custom status"));
         assert!(rendered.contains("[ ] right-alignment"));
         assert!(rendered.contains("[✓] agent name"));
         assert!(rendered.contains("3rd line"));

@@ -20,7 +20,6 @@ pub struct PaneDetail {
     pub state: AgentState,
     pub seen: bool,
     pub last_agent_state_change_seq: Option<u64>,
-    pub custom_status: Option<String>,
     pub state_labels: HashMap<String, String>,
     pub working_duration: Option<WorkingDuration>,
 }
@@ -67,7 +66,6 @@ impl Tab {
                     state: terminal.state,
                     seen: pane.seen,
                     last_agent_state_change_seq: terminal.last_agent_state_change_seq,
-                    custom_status: presentation.custom_status,
                     state_labels: presentation.state_labels,
                     working_duration: terminal.working_duration_at(now),
                 })
