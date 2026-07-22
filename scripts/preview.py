@@ -20,6 +20,9 @@ HIDDEN_SUBJECTS = (
     "docs: update preview manifest",
     "chore: approve contributor",
     "chore: approve merged contributor",
+    # herdr-mx: upstream merges land as real merge commits; their subjects are not
+    # release notes and the merged-in upstream work is documented by its release entry.
+    "merge ",
 )
 TYPE_HEADINGS = {
     "feat": "Added",
