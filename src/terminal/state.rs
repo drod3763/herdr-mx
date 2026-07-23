@@ -2416,13 +2416,17 @@ mod tests {
         let mut terminal = test_terminal();
         let session_path = test_session_path("pi.jsonl");
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
-        terminal.set_hook_authority_with_session_ref(
+        // Pin every event to an explicit clock: the wrapper's internal Instant::now()
+        // can land before `now + 1ms` on a fast runner, making the "late" hook not
+        // late at all and flaking this test.
+        terminal.set_hook_authority_at(
             "herdr:pi".into(),
             "pi".into(),
             AgentState::Working,
             None,
             crate::agent_resume::AgentSessionRef::path(session_path.clone()),
             Some(20),
+            now,
         );
 
         terminal.set_detected_state_with_screen_signals_at(
@@ -2434,13 +2438,14 @@ mod tests {
             true,
             now + Duration::from_millis(1),
         );
-        let late = terminal.set_hook_authority_with_session_ref(
+        let late = terminal.set_hook_authority_at(
             "herdr:pi".into(),
             "pi".into(),
             AgentState::Working,
             None,
             crate::agent_resume::AgentSessionRef::path(session_path),
             Some(21),
+            now + Duration::from_millis(2),
         );
 
         assert!(late.is_none());
