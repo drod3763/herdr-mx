@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.7.4-mx.1] - 2026-07-23
+
 herdr-mx rebased onto upstream herdr 0.7.4 (see the [0.7.4] entry for upstream changes), keeping the multi-remote client, configurable remote transport, and sidebar.
 
 ### Changed
