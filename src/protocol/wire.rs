@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 /// (`Ping`/`RequestFullFrame`, `FrameDelta`/`Compressed`/`Pong`) after upstream's, so an mx peer
 /// and a stock herdr peer at the same upstream version have different message shapes. The offset
 /// makes that pairing fail cleanly at the version handshake instead of decoding garbage.
-/// 1016 = upstream v16 (observe/control terminal streams, prefix input source) + mx additions.
-pub const PROTOCOL_VERSION: u32 = 1016;
+/// 1017 = upstream v17 + mx additions.
+pub const PROTOCOL_VERSION: u32 = 1017;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.

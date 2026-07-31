@@ -16,7 +16,7 @@ static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".herdr-test-owner-pid";
 // mx protocol = 1000 + upstream version; see src/protocol/wire.rs::PROTOCOL_VERSION.
-pub const CURRENT_PROTOCOL: u32 = 1016;
+pub const CURRENT_PROTOCOL: u32 = 1017;
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
