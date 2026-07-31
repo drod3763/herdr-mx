@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## [0.7.4-mx.1] - 2026-07-23
+
+herdr-mx rebased onto upstream herdr 0.7.4 (see the [0.7.4] entry for upstream changes), keeping the multi-remote client, configurable remote transport, and sidebar.
+
+### Changed
+- Upstream's `[ui.sidebar.*]` token-row settings (`rows`, `rows_by_agent`, `row_gap`) and pane/workspace metadata reporting are accepted and served over the socket API, but the mx sidebar still renders its own segment layout; upstream row settings do not change the mx sidebar yet.
+- The `custom_status` sidebar segment was retired with upstream's removal of the custom-status report; integration-reported labels now render through the status segment. Existing configs listing `custom_status` keep working; the item is ignored.
+
 ## [0.7.4] - 2026-07-15
 
 ### Added
