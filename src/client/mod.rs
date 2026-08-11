@@ -34,6 +34,7 @@ use crossterm::event::{
 #[cfg(not(windows))]
 use crossterm::event::{PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use crossterm::execute;
+use crossterm::terminal::{DisableLineWrap, EnableLineWrap};
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
 use tracing::{debug, info, warn};
@@ -2310,6 +2311,8 @@ fn setup_terminal_with_capabilities(
         io::stdout().flush()?;
     }
 
+    execute!(io::stdout(), DisableLineWrap)?;
+
     // Enable host color-scheme reports last, after every other fallible setup write, and undo it
     // if its own write fails partway. Combined, an error anywhere in setup can never leave mode
     // 2031 dangling before a TerminalGuard exists to restore it.
@@ -2465,6 +2468,7 @@ fn restore_terminal_state(reset_modify_other_keys: bool, disable_host_color_sche
     }
     let _ = execute!(
         io::stdout(),
+        EnableLineWrap,
         DisableFocusChange,
         DisableBracketedPaste,
         DisableMouseCapture

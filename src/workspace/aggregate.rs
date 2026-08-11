@@ -15,12 +15,14 @@ pub struct PaneDetail {
     pub pane_label: Option<String>,
     pub label: String,
     pub agent_label: String,
+    pub agent_kind_label: Option<String>,
     #[allow(dead_code)]
     pub agent: Option<Agent>,
     pub state: AgentState,
     pub seen: bool,
     pub last_agent_state_change_seq: Option<u64>,
     pub state_labels: HashMap<String, String>,
+    pub tokens: HashMap<String, String>,
     pub working_duration: Option<WorkingDuration>,
 }
 
@@ -46,10 +48,11 @@ impl Tab {
             .filter_map(|id| {
                 let pane = self.panes.get(id)?;
                 let terminal = terminals.get(&pane.attached_terminal_id)?;
+                let agent_kind_label = terminal.effective_agent_label().map(str::to_string);
                 let fallback_agent_label = terminal
                     .agent_name
                     .as_deref()
-                    .or_else(|| terminal.effective_agent_label())?
+                    .or(agent_kind_label.as_deref())?
                     .to_string();
                 let agent_label = terminal
                     .effective_display_agent()
@@ -62,11 +65,13 @@ impl Tab {
                     pane_label: terminal.manual_label.clone(),
                     label: agent_label.clone(),
                     agent_label,
+                    agent_kind_label,
                     agent: terminal.effective_known_agent(),
                     state: terminal.state,
                     seen: pane.seen,
                     last_agent_state_change_seq: terminal.last_agent_state_change_seq,
                     state_labels: presentation.state_labels,
+                    tokens: terminal.metadata_tokens.values(),
                     working_duration: terminal.working_duration_at(now),
                 })
             })

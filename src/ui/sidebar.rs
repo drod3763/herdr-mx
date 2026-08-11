@@ -32,10 +32,12 @@ pub(crate) struct AgentPanelEntry {
     pub primary_label: String,
     pub primary_tab_label: Option<String>,
     pub agent_label: Option<String>,
+    pub agent_kind_label: Option<String>,
     pub state: AgentState,
     pub seen: bool,
     pub last_agent_state_change_seq: Option<u64>,
     pub state_labels: HashMap<String, String>,
+    pub tokens: HashMap<String, String>,
     pub working_duration: Option<WorkingDuration>,
 }
 
@@ -100,12 +102,15 @@ fn agent_panel_sort_label(sort: AgentPanelSort) -> &'static str {
 }
 
 pub(crate) fn agent_panel_toggle_rect(area: Rect, sort: AgentPanelSort) -> Rect {
+    agent_panel_header_label_rect(area, agent_panel_sort_label(sort))
+}
+
+fn agent_panel_header_label_rect(area: Rect, label: &str) -> Rect {
     if area.width == 0 || area.height < 2 {
         return Rect::default();
     }
 
-    let label = agent_panel_sort_label(sort);
-    let width = display_width_u16(label);
+    let width = display_width_u16(label).min(area.width);
     Rect::new(
         area.x + area.width.saturating_sub(width),
         area.y + 1,
@@ -114,8 +119,18 @@ pub(crate) fn agent_panel_toggle_rect(area: Rect, sort: AgentPanelSort) -> Rect 
     )
 }
 
+fn active_agent_view_label(app: &AppState) -> Option<&str> {
+    app.agent_view_override
+        .as_ref()
+        .map(|view| view.label.as_deref().unwrap_or("filtered"))
+}
+
 pub(crate) fn agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     agent_panel_entries_with_runtimes(app, None)
+}
+
+pub(crate) fn all_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
+    collect_agent_panel_entries_with_runtimes(app, None)
 }
 
 pub(crate) fn agent_panel_entries_from(
@@ -129,6 +144,15 @@ fn agent_panel_entries_with_runtimes(
     app: &AppState,
     terminal_runtimes: Option<&TerminalRuntimeRegistry>,
 ) -> Vec<AgentPanelEntry> {
+    let mut entries = collect_agent_panel_entries_with_runtimes(app, terminal_runtimes);
+    crate::app::agent_view::apply_agent_view(app, &mut entries);
+    entries
+}
+
+fn collect_agent_panel_entries_with_runtimes(
+    app: &AppState,
+    terminal_runtimes: Option<&TerminalRuntimeRegistry>,
+) -> Vec<AgentPanelEntry> {
     let empty_runtimes;
     let terminal_runtimes = match terminal_runtimes {
         Some(terminal_runtimes) => terminal_runtimes,
@@ -138,8 +162,7 @@ fn agent_panel_entries_with_runtimes(
         }
     };
 
-    let mut entries: Vec<AgentPanelEntry> = app
-        .workspaces
+    app.workspaces
         .iter()
         .enumerate()
         .flat_map(|(ws_idx, ws)| {
@@ -162,6 +185,8 @@ fn agent_panel_entries_with_runtimes(
                         primary_label: workspace_label.clone(),
                         primary_tab_label: show_tab.then_some(detail.tab_label),
                         agent_label: Some(detail.agent_label),
+                        agent_kind_label: detail.agent_kind_label,
+                        tokens: detail.tokens,
                         state: detail.state,
                         seen: detail.seen,
                         last_agent_state_change_seq: detail.last_agent_state_change_seq,
@@ -170,18 +195,7 @@ fn agent_panel_entries_with_runtimes(
                     }
                 })
         })
-        .collect();
-
-    if matches!(app.agent_panel_sort, AgentPanelSort::Priority) {
-        entries.sort_by_key(|entry| {
-            (
-                std::cmp::Reverse(workspace_attention_priority(entry.state, entry.seen)),
-                std::cmp::Reverse(entry.last_agent_state_change_seq),
-            )
-        });
-    }
-
-    entries
+        .collect()
 }
 
 pub(super) fn agent_panel_status_key(state: AgentState, seen: bool) -> &'static str {
@@ -1457,9 +1471,14 @@ pub(crate) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
 
     if let Some(divider_y) = divider_y {
         let buf = frame.buffer_mut();
+        let divider_color = if app.agent_view_override.is_some() {
+            p.accent
+        } else {
+            p.surface_dim
+        };
         for x in ws_area.x..ws_area.x + ws_area.width {
             buf[(x, divider_y)].set_symbol("─");
-            buf[(x, divider_y)].set_style(Style::default().fg(p.surface_dim));
+            buf[(x, divider_y)].set_style(Style::default().fg(divider_color));
         }
     }
 
@@ -2486,6 +2505,8 @@ pub(crate) fn settings_sidebar_agent_demo_lines(app: &AppState, width: u16) -> V
             primary_label: "workspace-app".into(),
             primary_tab_label: Some("main".into()),
             agent_label: Some("claude".into()),
+            agent_kind_label: Some("claude".into()),
+            tokens: HashMap::new(),
             state: AgentState::Working,
             seen: true,
             last_agent_state_change_seq: None,
@@ -2503,6 +2524,8 @@ pub(crate) fn settings_sidebar_agent_demo_lines(app: &AppState, width: u16) -> V
             primary_label: "workspace-tests".into(),
             primary_tab_label: Some("review".into()),
             agent_label: Some("codex".into()),
+            agent_kind_label: Some("codex".into()),
+            tokens: HashMap::new(),
             state: AgentState::Idle,
             seen: true,
             last_agent_state_change_seq: None,
@@ -2572,19 +2595,24 @@ fn render_agent_detail(
         )])),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
-    let toggle_rect = agent_panel_toggle_rect(area, app.agent_panel_sort);
+    let control_label = active_agent_view_label(app)
+        .unwrap_or_else(|| agent_panel_sort_label(app.agent_panel_sort));
+    let toggle_rect = agent_panel_header_label_rect(area, control_label);
     if toggle_rect != Rect::default() {
         // item 7 (Area 4): sort-toggle hover lifts fg overlay0 → subtext0. Shared by the monolithic
         // host and the multi-remote client (both resolve the toggle to `SortToggle`).
+        // An active agent view tints the label accent; hover still wins.
         let toggle_fg =
             if app.sidebar_hover == Some(crate::app::state::SidebarHoverTarget::SortToggle) {
                 p.subtext0
+            } else if app.agent_view_override.is_some() {
+                p.accent
             } else {
                 p.overlay0
             };
         frame.render_widget(
             Paragraph::new(Span::styled(
-                agent_panel_sort_label(app.agent_panel_sort),
+                control_label,
                 Style::default().fg(toggle_fg).add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Right),
@@ -2599,15 +2627,24 @@ fn render_agent_detail(
     if body == Rect::default() {
         return;
     }
+    if details.is_empty() && app.agent_view_override.is_some() {
+        frame.render_widget(
+            Paragraph::new(" no matching agents")
+                .style(Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)),
+            Rect::new(body.x, body.y, body.width, 1),
+        );
+        return;
+    }
 
+    let scroll = app.agent_panel_scroll.min(metrics.max_offset_from_bottom);
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
     let render_lines = sidebar_agent_render_lines(app);
-    // item 7 (Area 4): `skip(agent_panel_scroll)` drops the leading entries, so recover the
-    // GLOBAL entry index (`agent_panel_scroll + offset`) to compare against the client
+    // item 7 (Area 4): `skip(scroll)` drops the leading entries, so recover the
+    // GLOBAL entry index (`scroll + offset`) to compare against the client
     // `AgentRoute { route_idx }` (route_idx is the flat global index, stable across recompose).
-    for (offset, detail) in details.iter().skip(app.agent_panel_scroll).enumerate() {
-        let global_idx = app.agent_panel_scroll.saturating_add(offset);
+    for (offset, detail) in details.iter().skip(scroll).enumerate() {
+        let global_idx = scroll.saturating_add(offset);
         let entry_rows = render_lines.len() as u16;
         if row_y.saturating_add(entry_rows) > body_bottom {
             break;
@@ -2853,6 +2890,8 @@ mod tests {
             primary_label: "공간".into(),
             primary_tab_label: Some("검토".into()),
             agent_label: Some("codex".into()),
+            agent_kind_label: Some("codex".into()),
+            tokens: HashMap::new(),
             state: AgentState::Idle,
             seen: true,
             last_agent_state_change_seq: None,
@@ -3146,6 +3185,8 @@ mod tests {
             primary_label: "agent-browser".into(),
             primary_tab_label: Some("test-escalation".into()),
             agent_label: Some("claude".into()),
+            agent_kind_label: Some("claude".into()),
+            tokens: HashMap::new(),
             state: AgentState::Idle,
             seen: true,
             last_agent_state_change_seq: None,

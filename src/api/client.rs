@@ -7,8 +7,7 @@ use interprocess::local_socket::traits::Stream as _;
 use serde::de::DeserializeOwned;
 
 use crate::api::schema::{
-    ErrorResponse, EventsSubscribeParams, Method, PingParams, Request, ResponseResult,
-    SubscriptionEventEnvelope, SuccessResponse,
+    ErrorResponse, Method, PingParams, Request, ResponseResult, SuccessResponse,
 };
 use crate::ipc::LocalStream;
 
@@ -88,21 +87,9 @@ impl ApiClient {
         read_json_line(&mut reader)
     }
 
-    #[allow(dead_code)] // Kept as the typed subscription API; CLI wait paths use subscribe_value to preserve raw ack errors.
-    pub fn subscribe(
-        &self,
-        id: impl Into<String>,
-        params: EventsSubscribeParams,
-        read_timeout: Option<Duration>,
-    ) -> Result<(SuccessResponse, EventStream), ApiClientError> {
-        let request = Request {
-            id: id.into(),
-            method: Method::EventsSubscribe(params),
-        };
-        let (ack, stream) = self.subscribe_value(&request, read_timeout)?;
-        Ok((parse_response_value(ack)?, stream))
-    }
-
+    /// herdr-mx: long-lived event subscription over the JSON socket. Upstream removed its
+    /// subscription client when CLI waits moved server-side; the multi-remote client still
+    /// streams workspace/agent summary events through this.
     pub fn subscribe_value(
         &self,
         request: &Request,
@@ -143,6 +130,17 @@ impl ApiClient {
     }
 }
 
+/// herdr-mx: streaming side of [`ApiClient::subscribe_value`].
+pub struct EventStream {
+    reader: BufReader<LocalStream>,
+}
+
+impl EventStream {
+    pub fn next_value(&mut self) -> Result<Option<serde_json::Value>, ApiClientError> {
+        read_optional_json_line(&mut self.reader)
+    }
+}
+
 enum TimeoutKind {
     Send,
     Recv,
@@ -162,23 +160,6 @@ fn set_timeout_best_effort(
         #[cfg(windows)]
         Err(err) if err.kind() == io::ErrorKind::Unsupported => Ok(()),
         Err(err) => Err(err),
-    }
-}
-
-pub struct EventStream {
-    reader: BufReader<LocalStream>,
-}
-
-impl EventStream {
-    pub fn next_value(&mut self) -> Result<Option<serde_json::Value>, ApiClientError> {
-        read_optional_json_line(&mut self.reader)
-    }
-
-    pub fn next_event(&mut self) -> Result<Option<SubscriptionEventEnvelope>, ApiClientError> {
-        self.next_value()?
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(ApiClientError::Json)
     }
 }
 
@@ -235,6 +216,7 @@ fn read_json_line<T: DeserializeOwned>(
     serde_json::from_str(&line).map_err(ApiClientError::Json)
 }
 
+/// herdr-mx: line-delimited read for [`EventStream`]; `None` means the server closed the stream.
 fn read_optional_json_line<T: DeserializeOwned>(
     reader: &mut BufReader<LocalStream>,
 ) -> Result<Option<T>, ApiClientError> {
