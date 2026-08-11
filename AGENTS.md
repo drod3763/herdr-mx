@@ -121,6 +121,8 @@ refs #82
 
 Do not use GitHub closing keywords like `fixes #<issue-number>`, `closes #<issue-number>`, or `resolves #<issue-number>` in normal commits. `master` contains unreleased work; release CI closes referenced issues after the GitHub Release is created.
 
+Always push with `git push --no-follow-tags`. The local git config sets `push.followTags = true`, and any `v*` tag reaching origin triggers the Release workflow — pushing a branch after fetching an upstream release tag once published a bogus stock-herdr `v0.7.5` release on this fork. Only `just release` pushes tags deliberately.
+
 ## Code Conventions
 
 - Rust: no `unwrap()` in production code. Use `tracing` for logging. Use `#[allow]` only with a comment explaining why.
