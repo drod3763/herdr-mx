@@ -199,6 +199,81 @@ release version:
     just release-prepare {{version}}
     just release-publish {{version}}
 
+# herdr-mx releases: Cargo.toml keeps the upstream base version (e.g. 0.7.5); the tag
+# carries the -mx.N suffix and release CI derives the build channel and id from it.
+# The changelog section for the full mx version is curated by hand in the release-prep
+# PR, so prepare validates instead of mutating.
+
+# Validate an mx release at HEAD without tagging (usage: just release-mx-prepare 0.7.5-mx.1)
+release-mx-prepare version:
+    @printf '%s\n' '{{version}}' | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-mx\.[0-9]+$' || { \
+        echo "error: version must look like 0.7.5-mx.1 without a v prefix"; \
+        exit 1; \
+    }
+    @if [ -n "$(git status --porcelain)" ]; then \
+        echo "error: commit your changes first"; \
+        exit 1; \
+    fi
+    @base='{{version}}'; base="${base%%-mx.*}"; \
+    cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"; \
+    if [ "$cargo_version" != "$base" ]; then \
+        echo "error: Cargo.toml version $cargo_version does not match upstream base $base"; \
+        exit 1; \
+    fi
+    python3 scripts/changelog.py extract --version {{version}} --output /tmp/herdr-mx-release-notes-check.md
+    @rm -f /tmp/herdr-mx-release-notes-check.md
+    just release-docs-check
+    just check
+    @echo "v{{version}} validated at HEAD. Land this commit on mx, then run: just release-mx-publish {{version}}"
+
+# Tag and push a validated mx release from mx HEAD (usage: just release-mx-publish 0.7.5-mx.1)
+release-mx-publish version:
+    @printf '%s\n' '{{version}}' | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-mx\.[0-9]+$' || { \
+        echo "error: version must look like 0.7.5-mx.1 without a v prefix"; \
+        exit 1; \
+    }
+    @if [ -n "$(git status --porcelain)" ]; then \
+        echo "error: working tree must be clean before publishing"; \
+        exit 1; \
+    fi
+    @branch="$(git branch --show-current)"; \
+    if [ "$branch" != "mx" ]; then \
+        echo "error: release-mx-publish must run from mx, got $branch"; \
+        exit 1; \
+    fi
+    @git fetch origin mx --no-tags
+    @if git rev-parse "v{{version}}" >/dev/null 2>&1; then \
+        echo "error: tag v{{version}} already exists locally"; \
+        exit 1; \
+    fi
+    @if [ -n "$(git ls-remote --tags origin "refs/tags/v{{version}}")" ]; then \
+        echo "error: tag v{{version}} already exists on origin"; \
+        exit 1; \
+    fi
+    @base='{{version}}'; base="${base%%-mx.*}"; \
+    cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"; \
+    if [ "$cargo_version" != "$base" ]; then \
+        echo "error: Cargo.toml version $cargo_version does not match upstream base $base"; \
+        exit 1; \
+    fi
+    # The changelog section must exist at the commit being tagged; tagging a commit
+    # without it is how the v0.7.4-mx.1 release run failed at notes extraction.
+    python3 scripts/changelog.py extract --version {{version}} --output /tmp/herdr-mx-release-notes-check.md
+    @rm -f /tmp/herdr-mx-release-notes-check.md
+    @local_head="$(git rev-parse HEAD)"; \
+    remote_head="$(git rev-parse origin/mx)"; \
+    if ! git merge-base --is-ancestor "$remote_head" "$local_head"; then \
+        echo "error: origin/mx is not an ancestor of HEAD; pull or rebase before publishing"; \
+        exit 1; \
+    fi; \
+    if [ "$local_head" != "$remote_head" ]; then \
+        echo "pushing release commit to origin/mx"; \
+        git push --no-follow-tags origin HEAD:mx; \
+    fi
+    git tag -a v{{version}} -m "v{{version}}"
+    git push origin refs/tags/v{{version}}
+    @echo "v{{version}} released — GitHub Actions building binaries and publishing the release"
+
 # Print default config
 default-config:
     cargo run --release --locked -- --default-config

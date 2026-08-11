@@ -151,14 +151,19 @@ herdr update
 
 Preview releases are GitHub prereleases produced by `.github/workflows/preview.yml` on manual dispatch and the Wednesday/Friday schedule. The workflow updates `website/preview.json`, which the website build publishes as `/preview.json`. Do not hand-edit `website/preview.json`; fix the workflow or `scripts/preview.py` and rerun Preview.
 
-Stable releases use:
+mx releases are versioned `<upstream-base>-mx.<n>` (e.g. `0.7.5-mx.1`). Cargo.toml keeps the upstream base version; the tag carries the `-mx.<n>` suffix and release CI derives the build channel and id from it. Do not use upstream's `just release`/`release-prepare`/`release-publish` — they reject mx version strings and require a `master` branch.
+
+Releasing an mx version:
 
 ```bash
-just check
-just release 0.x.y
+# in the release-prep PR (curated changelog section, finalized docs):
+just release-mx-prepare 0.7.5-mx.1
+
+# after the prep PR lands, from mx HEAD:
+just release-mx-publish 0.7.5-mx.1
 ```
 
-Before stable release, run `/pre-release-audit`, finalize `docs/next`, copy approved docs into the stable docs/root files, and let `just release-docs-check` verify the sync. `just release` prepares the release commit, tags it, pushes the tag, and GitHub Actions builds binaries, creates the GitHub release, closes released issues, and updates `website/latest.json`.
+Before release, run `/pre-release-audit`, finalize `docs/next`, copy approved docs into the stable docs/root files, and let `just release-docs-check` verify the sync. `release-mx-prepare` validates HEAD (version format, Cargo base match, changelog section exists, docs sync, `just check`) without mutating. `release-mx-publish` re-validates from `mx`, refuses existing tags, verifies the changelog section exists at the exact commit being tagged (a missing section is how the v0.7.4-mx.1 release run failed), then tags and pushes the tag; GitHub Actions builds binaries, creates the GitHub release, closes released issues, and updates `website/latest.json`.
 
 The release workflows must publish these four assets:
 
